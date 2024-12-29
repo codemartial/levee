@@ -23,7 +23,9 @@ Circuit breakers and concurrency limiters are essential components of any distri
 
 Most existing circuit breaker tuning and circuit breaking, however, is done unscientifically, based on heuristics and guesswork. This can lead to suboptimal performance, with the circuit breaker either being too aggressive (causing unnecessary service degradation) or too lenient (allowing cascading failures).
 
-Levee continuously monitors the RED metrics -- R: Requests per Second, E: Error Rate, D: Duration aka Response Time or Latency. It uses sophisticated statistical techniques to adjust its parameters based on the observed performance of the service. This means that Levee can adapt to changes in the service's behavior automatically, without the need for manual intervention.
+Levee continuously monitors the RED metrics -- R: Requests per Second, E: Error Rate, D: Duration aka Response Time or Latency -- as well as in-flight concurrents. It computes statistical properties like mean, deviation, first derivative and percentiles over these metrics at various time scales. It uses these properties to adjust its operating parameters dynamically, ensuring that the circuit breaker and concurrency limiter are always optimally tuned.
+
+Levee is also painstakingly designed to consume a fixed, small amount of memory, making it suitable for use in high-performance, low-latency services.
 
 ## How to use Levee?
 
@@ -70,9 +72,11 @@ func main() {
 Levee is still a work in progress. Here are some of the things that need to be done:
 1. Implement concurrent access
 2. Implement save state and restore state capability
-3. Implement state updates over channels
-4. Implement timeout enforcement (currently used as a FYI)
-5. Implement calling with context
-6. Implement system load monitoring
+3. Implement SLO revisions
+4. Implement state updates over channels
+5. Implement timeout enforcement (currently used as a FYI)
+6. Implement calling with context
+7. Convenience functions for HTTP response handlers
+8. Implement system load monitoring
 
 The last one is rather tricky. There is no standard way to access the environment load in Go. The best I may be able to do is to make it Linux specific. Even that is complicated being split between VM/BM and containers.
