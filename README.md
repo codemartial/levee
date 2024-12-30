@@ -70,7 +70,7 @@ func main() {
 
 ## TODO
 Levee is still a work in progress. Here are some of the things that need to be done:
-1. Implement concurrent access
+1. ~~Implement concurrent access~~ (done)
 2. Implement save state and restore state capability
 3. Implement SLO revisions
 4. Implement state updates over channels
