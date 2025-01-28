@@ -3,27 +3,32 @@
 > lev·ee /ˈlevi/ _noun_
 >
 > 1. An embankment built to prevent the overflow of a river or body of water; specifically: an artificial bank confining a river channel or limiting adjacent areas subject to flooding.
->    - "The Mississippi River levee system stretches for hundreds of miles"
 >
 > 2. A continuous dike or ridge (as of earth) for confining the irrigation areas of land to be flooded.
 
 ## What is Levee?
 
-Levee is a self-tuning circuit breaker and concurrency limiter for Go services.
+Levee is a self-tuning circuit breaker and concurrency based rate limiter for Go services.
 
-A circuit breaker is a mechanism that prevents a service from being taken down due to too many errors in its dependencies (upstreams), thereby preventing a cascading failure.
+- Always watching, always adapting
+- Fully self-contained, 100% in-process operation
+- No external dependencies
 
-A concurrency limiter is a mechanism that prevents a service from being overwhelmed by too many requests, thereby preventing a degradation of service under sudden load.
+Use a circuit breaker on outbound requests to prevent cascading failures from degraded or faulty dependencies. Use a rate limiter on incoming requests to prevent failure due to overload. 
 
-Levee combines these two mechanisms into a single, self-tuning, adaptive system that can adjust its behavior based on the observed performance of the service. This means that Levee can be used for both upstreams circuit breaking and downstream rate limiting.
+Levee is designed to be dead simple to integrate and take the guesswork out of configuring operational parameters.
+
+Inspired by Hystrix from Netflix.
 
 ## Why Levee?
 
-Circuit breakers and concurrency limiters are essential components of any distributed system. However, the operating parameters of services can change over time, both short term (e.g., due to a sudden spike in traffic) and long term (e.g., due to changes in the service's dependencies). This means that the parameters of the circuit breaker and concurrency limiter need to be adjusted dynamically to ensure optimal performance.
+Circuit breakers and concurrency limiters are essential components of any distributed system. However, the operating parameters of services can change over time, both short term (e.g., due to a sudden spike in traffic) and long term (e.g., due to changes in the service's dependencies).
 
-Most existing circuit breaker tuning and circuit breaking, however, is done unscientifically, based on heuristics and guesswork. This can lead to suboptimal performance, with the circuit breaker either being too aggressive (causing unnecessary service degradation) or too lenient (allowing cascading failures).
+This means that the parameters of the circuit breaker and concurrency limiter need to be adjusted frequently to ensure optimal performance, but they're rarely updated often enough. Besides, circuit breaker tuning is done unscientifically, based on heuristics and guesswork. 
 
-Levee continuously monitors the RED metrics -- R: Requests per Second, E: Error Rate, D: Duration aka Response Time or Latency -- as well as in-flight concurrents. It computes statistical properties like mean, deviation, first derivative and percentiles over these metrics at various time scales. It uses these properties to adjust its operating parameters dynamically, ensuring that the circuit breaker and concurrency limiter are always optimally tuned.
+This can lead to suboptimal performance, with the circuit breaker either being too aggressive (causing unnecessary service denial) or too lenient (allowing cascading failures).
+
+Levee continuously monitors the RED metrics -- R: Requests per Second, E: Error Rate, D: Duration aka Response Time or Latency -- as well as in-flight concurrents. It computes statistical properties of these signals to adjust its operating parameters dynamically, ensuring that the circuit breaker and concurrency limiter are always optimally tuned.
 
 Levee is also painstakingly designed to consume a fixed, small amount of memory, making it suitable for use in high-performance, low-latency services.
 
@@ -79,4 +84,4 @@ Levee is still a work in progress. Here are some of the things that need to be d
 7. Convenience functions for HTTP response handlers
 8. Implement system load monitoring
 
-The last one is rather tricky. There is no standard way to access the environment load in Go. The best I may be able to do is to make it Linux specific. Even that is complicated being split between VM/BM and containers.
+_The last one is rather tricky. There is no standard way to access the environment load in Go. The best I may be able to do is to make it Linux specific. Even that is complicated being split between VM/BM and containers._
