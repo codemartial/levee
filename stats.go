@@ -1,20 +1,19 @@
 package levee
 
 import (
-	"slices"
 	"sort"
 	"time"
 )
 
 const (
-	extLo = 300   // Roughly, 5 minutes
-	extHi = 90000 // Roughly, 1 day
+	memMid  = 300   // Roughly, 5 minutes
+	memLong = 90000 // Roughly, 1 day
 )
 
 type EWMA struct {
-	base   float64
-	ewmaLo float64
-	ewmaHi float64
+	base     float64
+	ewmaMid  float64
+	ewmaLong float64
 }
 
 type TimeSeries struct {
@@ -31,6 +30,21 @@ type TimeSeries struct {
 	derivative *EWMA
 
 	_size uint16
+}
+
+func (ma *EWMA) update(value, alphaLo, alphaHi float64) *EWMA {
+	if ma == nil { // EWMA never initialized
+		ma = &EWMA{
+			base:     value,
+			ewmaMid:  value,
+			ewmaLong: value,
+		}
+	} else {
+		ma.base = value
+		ma.ewmaMid = (1-alphaLo)*ma.ewmaMid + alphaLo*value
+		ma.ewmaLong = (1-alphaHi)*ma.ewmaLong + alphaHi*value
+	}
+	return ma
 }
 
 func (s *TimeSeries) Record(value float64, t time.Time) {
@@ -62,96 +76,72 @@ func (s *TimeSeries) ResetBase() {
 }
 
 func (s *TimeSeries) updateEWMAs() {
-	alphaLo := 1.0 / float64(s._size) / extLo
-	alphaHi := 1.0 / float64(s._size) / extHi
+	// Normalize alpha based on sample count and memory window
+	alphaLo := 1.0 / float64(s._size) / memMid
+	alphaHi := 1.0 / float64(s._size) / memLong
 
-	if s.value == nil { // EWMA never initialized
-		s.value = &EWMA{
-			base:   s.mean,
-			ewmaLo: s.mean,
-			ewmaHi: s.mean,
-		}
-	} else {
-		s.value.base = s.mean
-		s.value.ewmaLo = (1-alphaLo)*s.value.ewmaLo + alphaLo*s.mean
-		s.value.ewmaHi = (1-alphaHi)*s.value.ewmaHi + alphaHi*s.mean
-	}
+	s.value = s.value.update(s.mean, alphaLo, alphaHi)
 
-	sorted := slices.Clone(s.values)
-	sort.Float64s(sorted)
-	i_99 := int(float64(len(s.values)) * 0.99)
-	p99 := sorted[i_99]
+	sort.Float64s(s.values)
+	i_99 := len(s.values) * 99 / 100
+	p99 := s.values[i_99]
+	s.p99 = s.p99.update(p99, alphaLo, alphaHi)
 
-	if s.p99 == nil {
-		s.p99 = &EWMA{
-			base:   p99,
-			ewmaLo: p99,
-			ewmaHi: p99,
-		}
-	} else {
-		s.p99.base = p99
-		s.p99.ewmaLo = (1-alphaLo)*s.p99.ewmaLo + alphaLo*p99
-		s.p99.ewmaHi = (1-alphaHi)*s.p99.ewmaHi + alphaHi*p99
-	}
+	deviation := s.sumAD / float64(len(s.values))
+	s.deviation = s.deviation.update(deviation, alphaLo, alphaHi)
 
-	if s.deviation == nil {
-		s.deviation = &EWMA{
-			base:   s.sumAD / float64(len(s.values)),
-			ewmaLo: s.sumAD / float64(len(s.values)),
-			ewmaHi: s.sumAD / float64(len(s.values)),
-		}
-	} else {
-		s.deviation.base = s.sumAD / float64(len(s.values))
-		s.deviation.ewmaLo = (1-alphaLo)*s.deviation.ewmaLo + alphaLo*s.sumAD/float64(len(s.values))
-		s.deviation.ewmaHi = (1-alphaHi)*s.deviation.ewmaHi + alphaHi*s.sumAD/float64(len(s.values))
-	}
-
-	derivative := s.Derivative()
-
-	if s.derivative == nil {
-		s.derivative = &EWMA{
-			base:   derivative,
-			ewmaLo: derivative,
-			ewmaHi: derivative,
-		}
-	} else {
-		s.derivative.base = derivative
-		s.derivative.ewmaLo = (1-alphaLo)*s.derivative.ewmaLo + alphaLo*derivative
-		s.derivative.ewmaHi = (1-alphaHi)*s.derivative.ewmaHi + alphaHi*derivative
-	}
+	derivative := s.sumTT / s.sumVT // Least squares method
+	s.derivative = s.derivative.update(derivative, alphaLo, alphaHi)
 }
 
-func (s *TimeSeries) FillRate() float64 {
-	return float64(len(s.values)) / float64(cap(s.values))
+func (s *TimeSeries) RawValueCount() int {
+	return len(s.values)
 }
 
-// Use the least squares method to calculate the derivative of the series
-func (s *TimeSeries) Derivative() float64 {
-	sumXX := s.sumTT
-	sumXY := s.sumVT
+type StatType uint8
 
-	return sumXY / sumXX
-}
+const (
+	Derivative StatType = iota
+	Mean
+	P99
+	Deviation
+)
 
-func (s *TimeSeries) DerivativeBase() float64 {
-	if s.derivative == nil {
+type StatRange uint8
+
+const (
+	Raw StatRange = iota
+	Mid
+	Long
+)
+
+func (s *TimeSeries) Stat(st StatType, sr StatRange) float64 {
+	var stat *EWMA
+	switch st {
+	case Derivative:
+		stat = s.derivative
+	case Mean:
+		stat = s.value
+	case P99:
+		stat = s.p99
+	case Deviation:
+		stat = s.deviation
+	}
+
+	if stat == nil {
 		return 0
 	}
-	return s.derivative.base
-}
 
-func (s *TimeSeries) DerivativeMid() float64 {
-	if s.derivative == nil {
+	switch sr {
+	case Raw:
+		return stat.base
+	case Mid:
+		return stat.ewmaMid
+	case Long:
+		return stat.ewmaLong
+	default:
 		return 0
 	}
-	return s.derivative.ewmaLo
-}
-
-func (s *TimeSeries) DerivativeLong() float64 {
-	if s.derivative == nil {
-		return 0
-	}
-	return s.derivative.ewmaHi
 }
 
 func (s *TimeSeries) Mean() float64 {
@@ -176,74 +166,11 @@ func (s *TimeSeries) Mean() float64 {
 	return bestGuess
 }
 
-func (s *TimeSeries) MeanBase() float64 {
-	if s.value == nil {
-		return 0
-	}
-	return s.value.base
-}
-
-func (s *TimeSeries) MeanMid() float64 {
-	if s.value == nil {
-		return 0
-	}
-	return s.value.ewmaLo
-}
-
-func (s *TimeSeries) MeanLong() float64 {
-	if s.value == nil {
-		return 0
-	}
-	return s.value.ewmaHi
-}
-
-func (s *TimeSeries) P99Base() float64 {
-	if s.p99 == nil {
-		return 0
-	}
-	return s.p99.base
-}
-
-func (s *TimeSeries) P99Mid() float64 {
-	if s.p99 == nil {
-		return 0
-	}
-	return s.p99.ewmaLo
-}
-
-func (s *TimeSeries) P99Long() float64 {
-	if s.p99 == nil {
-		return 0
-	}
-	return s.p99.ewmaHi
-}
-
 func (s *TimeSeries) Deviation() float64 {
 	if len(s.values) == 0 {
 		return 0
 	}
 	return s.sumAD / float64(len(s.values))
-}
-
-func (s *TimeSeries) DeviationBase() float64 {
-	if s.deviation == nil {
-		return 0
-	}
-	return s.deviation.base
-}
-
-func (s *TimeSeries) DeviationMid() float64 {
-	if s.deviation == nil {
-		return 0
-	}
-	return s.deviation.ewmaLo
-}
-
-func (s *TimeSeries) DeviationLong() float64 {
-	if s.deviation == nil {
-		return 0
-	}
-	return s.deviation.ewmaHi
 }
 
 type metrics struct {

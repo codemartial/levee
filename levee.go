@@ -46,11 +46,12 @@ func (l *Levee) Call(f func() error) (State, error) {
 		wu := l.cb.(*WarmupCB)
 		s, err := wu.Call(f)
 		if s == CLOSED {
+			// Figure out sample count based on SLO and detected RPS
 			rps := float64(wu.reqCount) / (wu.end.Sub(wu.start).Seconds() - wu.stated_slo.Warmup.Seconds())
 			sloBasedSamples := 10 / (1 - wu.stated_slo.SuccessRate)
-			rps = max(rps, 100, sloBasedSamples)
-			rps = min(rps, 1<<16-1)
-			l.cb = NewCircuitBreaker(wu.stated_slo, uint16(rps))
+			samples := max(rps, 100, sloBasedSamples)
+			samples = min(samples, 1<<16-1)
+			l.cb = NewCircuitBreaker(wu.stated_slo, uint16(samples))
 			l.ready = true
 		}
 		return s, err

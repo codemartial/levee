@@ -211,11 +211,11 @@ func TestEWMACalculation(t *testing.T) {
 
 	// For consistent values, all EWMA values should be close to the input value
 	tolerance := 1.0
-	if abs(ts.MeanBase()-100.0) > tolerance ||
-		abs(ts.MeanMid()-100.0) > tolerance ||
-		abs(ts.MeanLong()-100.0) > tolerance {
+	if abs(ts.Stat(Mean, Raw)-100.0) > tolerance ||
+		abs(ts.Stat(Mean, Mid)-100.0) > tolerance ||
+		abs(ts.Stat(Mean, Long)-100.0) > tolerance {
 		t.Errorf("EWMA values deviated too much from expected. Base: %f, Mid: %f, Long: %f",
-			ts.MeanBase(), ts.MeanMid(), ts.MeanLong())
+			ts.Stat(Mean, Raw), ts.Stat(Mean, Mid), ts.Stat(Mean, Long))
 	}
 }
 

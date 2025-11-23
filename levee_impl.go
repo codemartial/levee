@@ -8,13 +8,13 @@ import (
 )
 
 type CircuitBreaker struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	stated_slo  SLO
 	revised_slo SLO
 	metrics     metrics
 	concurrents int32
 	state       State
-	lastOpenAt  time.Time
+	lastOpenAt  atomic.Value
 }
 
 var (
@@ -23,12 +23,14 @@ var (
 )
 
 func NewCircuitBreaker(slo SLO, size uint16) *CircuitBreaker {
-	return &CircuitBreaker{
+	cb := &CircuitBreaker{
 		stated_slo:  slo,
 		revised_slo: slo,
 		metrics:     *newMetrics(size),
 		state:       CLOSED,
 	}
+	cb.lastOpenAt.Store(time.Time{})
+	return cb
 }
 
 func (cb *CircuitBreaker) AddConcurrent() {
@@ -44,14 +46,13 @@ func (cb *CircuitBreaker) Concurrents() int32 {
 }
 
 func (cb *CircuitBreaker) Call(f func() error) (State, error) {
+	// START PRE-CALL CHECKS
 	start := time.Now()
 	state := cb.State()
 
 	if state == OPEN {
-		cb.mu.Lock()
-		lastOpenAt := cb.lastOpenAt
+		lastOpenAt := cb.lastOpenAt.Load().(time.Time)
 		timeout := cb.revised_slo.Timeout
-		cb.mu.Unlock()
 
 		if time.Since(lastOpenAt) < timeout {
 			return state, ErrCircuitOpen
@@ -80,11 +81,14 @@ func (cb *CircuitBreaker) Call(f func() error) (State, error) {
 		cb.metrics.RecordRequests(1, start)
 		cb.mu.Unlock()
 	}
+	// END PRE-CALL CHECKS
 
+	// START CALL
 	call_err := f()
-
 	end := time.Now()
+	// END Call
 
+	// START POST-CALL PROCESSING
 	{
 		cb.mu.Lock()
 		cb.metrics.RecordLatency(float64(end.Sub(start).Microseconds()), end)
@@ -109,15 +113,19 @@ func (cb *CircuitBreaker) Call(f func() error) (State, error) {
 	}
 
 	return state, nil
+	// END POST-CALL PROCESSING
 }
 
 func (cb *CircuitBreaker) allowCall() bool {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	if cb.State() != HALF_OPEN {
+		panic("Bug Encountered. This method must only be called when breaker is half open")
+	}
 
 	// historicals
-	hErrors := cb.metrics.errors.MeanMid()
-	hConcurrency := cb.metrics.concurrency.MeanMid()
+	hErrors := cb.metrics.errors.Stat(Mean, Mid)
+	hConcurrency := cb.metrics.concurrency.Stat(Mean, Mid)
 
 	var allowedConcurrency float64
 	if hErrors == 0 || hConcurrency == 0 {
@@ -134,8 +142,8 @@ func (cb *CircuitBreaker) allowCall() bool {
 }
 
 func (cb *CircuitBreaker) newState() State {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
 
 	if cb.state != HALF_OPEN {
 		return cb.state
@@ -145,11 +153,9 @@ func (cb *CircuitBreaker) newState() State {
 		return OPEN
 	}
 
-	hErrors := cb.metrics.errors.MeanMid()
-	if hErrors == 0 {
-		hErrors = 0.1
-	}
-	if cb.metrics.errors.FillRate()*float64(cb.metrics.errors._size) > 1/hErrors {
+	// Check min. consecutive successes based on error rate
+	hErrors := max(0.01, cb.metrics.errors.Stat(Mean, Mid))
+	if float64(cb.metrics.errors.RawValueCount()) > 1/hErrors {
 		return CLOSED
 	}
 
@@ -157,10 +163,10 @@ func (cb *CircuitBreaker) newState() State {
 }
 
 func (cb *CircuitBreaker) mustOpen() bool {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
 
-	health := 0
+	faults := 0
 
 	var success_rate float64
 	var latency_dev float64
@@ -169,13 +175,13 @@ func (cb *CircuitBreaker) mustOpen() bool {
 
 	// If the circuit is in the half-open state, use the revised SLO
 	success_rate = 1 - cb.metrics.errors.Mean()
-	latency_dev = cb.metrics.latency.Deviation()
-	concurrency_dev = cb.metrics.concurrency.Deviation()
-	rps = cb.metrics.requests.Derivative()
+	latency_dev = cb.metrics.latency.Stat(Deviation, Raw)
+	concurrency_dev = cb.metrics.concurrency.Stat(Deviation, Raw)
+	rps = cb.metrics.requests.Stat(Derivative, Raw)
 
 	// Success Rate
 	if success_rate < cb.revised_slo.SuccessRate {
-		health += 3
+		faults += 3
 	}
 
 	// If there is increased load on the system, at most two of the following
@@ -183,21 +189,22 @@ func (cb *CircuitBreaker) mustOpen() bool {
 	// If all three metrics spike, the system is unhealthy.
 
 	// Latency Anomaly
-	if latency_dev > 10*cb.metrics.latency.DeviationMid() || latency_dev > 5*cb.metrics.latency.DeviationLong() {
-		health += 1
+	if latency_dev > 10*cb.metrics.latency.Stat(Deviation, Mid) || latency_dev > 5*cb.metrics.latency.Stat(Deviation, Long) {
+		faults += 1
 	}
 
 	// Concurrency Anomaly
-	if concurrency_dev > 10*cb.metrics.concurrency.DeviationMid() || concurrency_dev > 5*cb.metrics.concurrency.DeviationLong() {
-		health += 1
+	if concurrency_dev > 10*cb.metrics.concurrency.Stat(Deviation, Mid) ||
+		concurrency_dev > 5*cb.metrics.concurrency.Stat(Deviation, Long) {
+		faults += 1
 	}
 
 	// RPS Anomaly
-	if rps > 10*cb.metrics.requests.DerivativeMid() || rps > 5*cb.metrics.requests.DerivativeLong() {
-		health += 1
+	if rps > 10*cb.metrics.requests.Stat(Derivative, Mid) || rps > 5*cb.metrics.requests.Stat(Derivative, Long) {
+		faults += 1
 	}
 
-	return health >= 3
+	return faults >= 3
 }
 
 func (cb *CircuitBreaker) OpenCircuit() (State, error) {
@@ -206,7 +213,7 @@ func (cb *CircuitBreaker) OpenCircuit() (State, error) {
 
 	cb.metrics.Reset()
 	cb.state = OPEN
-	cb.lastOpenAt = time.Now()
+	cb.lastOpenAt.Store(time.Now())
 	return cb.state, nil
 }
 
@@ -220,8 +227,8 @@ func (cb *CircuitBreaker) CloseCircuit() (State, error) {
 }
 
 func (cb *CircuitBreaker) State() State {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
 
 	return cb.state
 }

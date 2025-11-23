@@ -77,7 +77,7 @@ func main() {
 Levee is still a work in progress. Here are some of the things that need to be done:
 1. ~~Implement concurrent access~~ (done)
 2. Implement save state and restore state capability
-3. Implement SLO revisions
+3. ~~Implement SLO revisions~~ (wontfix)
 4. Implement state updates over channels
 5. Implement timeout enforcement (currently used as a FYI)
 6. Implement calling with context
