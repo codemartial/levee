@@ -45,16 +45,15 @@ func (cb *CircuitBreaker) Concurrents() int32 {
 	return atomic.LoadInt32(&cb.concurrents)
 }
 
-func (cb *CircuitBreaker) Call(f func() error) (State, error) {
+func (cb *CircuitBreaker) Start(ts time.Time) (State, error) {
 	// START PRE-CALL CHECKS
-	start := time.Now()
 	state := cb.State()
 
 	if state == OPEN {
 		lastOpenAt := cb.lastOpenAt.Load().(time.Time)
 		timeout := cb.revised_slo.Timeout
 
-		if time.Since(lastOpenAt) < timeout {
+		if ts.Sub(lastOpenAt) < timeout {
 			return state, ErrCircuitOpen
 		} else {
 			cb.mu.Lock()
@@ -65,42 +64,51 @@ func (cb *CircuitBreaker) Call(f func() error) (State, error) {
 	}
 
 	cb.AddConcurrent()
-	defer cb.RemoveConcurrent()
 
 	if state == HALF_OPEN && !cb.allowCall() {
-		return state, ErrCircuitHalfOpen
+		cb.RemoveConcurrent()
+		return cb.State(), ErrCircuitHalfOpen
 	}
 
 	if state == CLOSED && cb.mustOpen() {
-		return cb.OpenCircuit()
+		cb.RemoveConcurrent()
+		return cb.OpenCircuit(), ErrCircuitOpen
 	}
 
 	{
 		cb.mu.Lock()
-		cb.metrics.RecordConcurrency(float64(cb.Concurrents()), start)
-		cb.metrics.RecordRequests(1, start)
+		cb.metrics.RecordConcurrency(float64(cb.Concurrents()), ts)
+		cb.metrics.RecordRequests(1, ts)
 		cb.mu.Unlock()
 	}
-	// END PRE-CALL CHECKS
-
 	// START CALL
-	call_err := f()
-	end := time.Now()
-	// END Call
+	return state, nil
+}
 
+func (cb *CircuitBreaker) Success(ts time.Time, duration time.Duration) State {
+	return cb.processResult(ts, duration, true)
+}
+
+func (cb *CircuitBreaker) Fail(ts time.Time, duration time.Duration) State {
+	return cb.processResult(ts, duration, false)
+}
+
+func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, success bool) State {
+	defer cb.RemoveConcurrent()
+
+	errCount := 0.0
+	if !success {
+		errCount = 1.0
+	}
 	// START POST-CALL PROCESSING
 	{
 		cb.mu.Lock()
-		cb.metrics.RecordLatency(float64(end.Sub(start).Microseconds()), end)
-
-		if call_err != nil {
-			cb.metrics.RecordErrors(1, end)
-		} else {
-			cb.metrics.RecordErrors(0, end)
-		}
+		cb.metrics.RecordLatency(float64(duration.Microseconds()), ts)
+		cb.metrics.RecordErrors(errCount, ts)
 		cb.mu.Unlock()
 	}
 
+	state := cb.State()
 	if state == HALF_OPEN {
 		switch cb.newState() {
 		case OPEN:
@@ -108,12 +116,37 @@ func (cb *CircuitBreaker) Call(f func() error) (State, error) {
 		case CLOSED:
 			return cb.CloseCircuit()
 		default:
-			return state, call_err
+			return state
 		}
 	}
 
-	return state, nil
 	// END POST-CALL PROCESSING
+	return state
+}
+
+func (cb *CircuitBreaker) Call(f func() error) (State, error) {
+	start := time.Now()
+
+	// Use Start() to perform pre-call checks
+	state, err := cb.Start(start)
+	if err != nil {
+		return state, err
+	}
+
+	// Execute the function
+	call_err := f()
+	end := time.Now()
+	duration := end.Sub(start)
+
+	// Use Success() or Fail() to process the result
+	var resultState State
+	if call_err != nil {
+		resultState = cb.Fail(end, duration)
+	} else {
+		resultState = cb.Success(end, duration)
+	}
+
+	return resultState, call_err
 }
 
 func (cb *CircuitBreaker) allowCall() bool {
@@ -207,23 +240,29 @@ func (cb *CircuitBreaker) mustOpen() bool {
 	return faults >= 3
 }
 
-func (cb *CircuitBreaker) OpenCircuit() (State, error) {
+func (cb *CircuitBreaker) OpenCircuit() State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if cb.state == OPEN {
+		return cb.state
+	}
 	cb.metrics.Reset()
 	cb.state = OPEN
 	cb.lastOpenAt.Store(time.Now())
-	return cb.state, nil
+	return cb.state
 }
 
-func (cb *CircuitBreaker) CloseCircuit() (State, error) {
+func (cb *CircuitBreaker) CloseCircuit() State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if cb.state == CLOSED {
+		return cb.state
+	}
 	cb.metrics.Reset()
 	cb.state = CLOSED
-	return cb.state, nil
+	return cb.state
 }
 
 func (cb *CircuitBreaker) State() State {
@@ -253,21 +292,53 @@ func NewWarmupCB(slo SLO) *WarmupCB {
 	}
 }
 
-func (cb *WarmupCB) Call(f func() error) (State, error) {
-	now := time.Now()
+func (cb *WarmupCB) Start(ts time.Time) (State, error) {
+	// No pre-call checks during warmup, just return current state
+	return cb.State(), nil
+}
 
-	// The following call uses its own locking
-	_, err := cb.CircuitBreaker.Call(f)
+func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
+	return cb.processWarmupResult(ts)
+}
 
+func (cb *WarmupCB) Fail(ts time.Time, duration time.Duration) State {
+	return cb.processWarmupResult(ts)
+}
+
+func (cb *WarmupCB) processWarmupResult(ts time.Time) State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	if now.Sub(cb.start) > cb.stated_slo.Warmup {
+	if ts.Sub(cb.start) > cb.stated_slo.Warmup {
 		cb.reqCount++
 	}
 	if cb.reqCount > 1000 {
-		cb.end = now
+		cb.end = ts
 		cb.state = CLOSED
 	}
+	return cb.state
+}
 
-	return cb.state, err
+func (cb *WarmupCB) Call(f func() error) (State, error) {
+	start := time.Now()
+
+	// Use Start() to perform pre-call checks
+	state, err := cb.Start(start)
+	if err != nil {
+		return state, err
+	}
+
+	// Execute the function
+	call_err := f()
+	end := time.Now()
+	duration := end.Sub(start)
+
+	// Use Success() or Fail() to process the result
+	var resultState State
+	if call_err != nil {
+		resultState = cb.Fail(end, duration)
+	} else {
+		resultState = cb.Success(end, duration)
+	}
+
+	return resultState, call_err
 }
