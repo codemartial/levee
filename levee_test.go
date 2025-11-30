@@ -169,7 +169,7 @@ func TestMetricsReset(t *testing.T) {
 	cb.metrics.RecordConcurrency(5, time.Now())
 
 	// Open circuit which should reset metrics
-	cb.OpenCircuit()
+	cb.OpenCircuit(time.Now())
 
 	if cb.metrics.latency.Mean() != 0 ||
 		cb.metrics.errors.Mean() != 0 ||

@@ -72,7 +72,7 @@ func (cb *CircuitBreaker) Start(ts time.Time) (State, error) {
 
 	if state == CLOSED && cb.mustOpen() {
 		cb.RemoveConcurrent()
-		return cb.OpenCircuit(), ErrCircuitOpen
+		return cb.OpenCircuit(ts), ErrCircuitOpen
 	}
 
 	{
@@ -112,9 +112,9 @@ func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, su
 	if state == HALF_OPEN {
 		switch cb.newState() {
 		case OPEN:
-			return cb.OpenCircuit()
+			return cb.OpenCircuit(ts)
 		case CLOSED:
-			return cb.CloseCircuit()
+			return cb.CloseCircuit(ts)
 		default:
 			return state
 		}
@@ -240,7 +240,7 @@ func (cb *CircuitBreaker) mustOpen() bool {
 	return faults >= 3
 }
 
-func (cb *CircuitBreaker) OpenCircuit() State {
+func (cb *CircuitBreaker) OpenCircuit(ts time.Time) State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -249,11 +249,11 @@ func (cb *CircuitBreaker) OpenCircuit() State {
 	}
 	cb.metrics.Reset()
 	cb.state = OPEN
-	cb.lastOpenAt.Store(time.Now())
+	cb.lastOpenAt.Store(ts)
 	return cb.state
 }
 
-func (cb *CircuitBreaker) CloseCircuit() State {
+func (cb *CircuitBreaker) CloseCircuit(ts time.Time) State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -288,11 +288,18 @@ func NewWarmupCB(slo SLO) *WarmupCB {
 	cb.state = INIT
 	return &WarmupCB{
 		CircuitBreaker: cb,
-		start:          time.Now(),
+		start:          time.Time{}, // Initialize to zero, will be set on first event
 	}
 }
 
 func (cb *WarmupCB) Start(ts time.Time) (State, error) {
+	// Initialize start time on first event
+	cb.mu.Lock()
+	if cb.start.IsZero() {
+		cb.start = ts
+	}
+	cb.mu.Unlock()
+
 	// No pre-call checks during warmup, just return current state
 	return cb.State(), nil
 }
