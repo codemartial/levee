@@ -2,6 +2,7 @@ package levee
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -182,16 +183,42 @@ func (cb *CircuitBreaker) newState() State {
 		return cb.state
 	}
 
-	if cb.metrics.errors.Mean() > (1 - cb.revised_slo.SuccessRate) {
+	const minSamples = 10
+	n := float64(cb.metrics.errors.RawValueCount())
+
+	// Insufficient samples to test recovery - keep testing
+	if n < minSamples {
+		return HALF_OPEN
+	}
+
+	// Sufficient samples - use Adjusted Wald with raw current window statistics
+	rawErrorRate := cb.metrics.errors.RawMean()
+	requiredSuccessRate := cb.revised_slo.SuccessRate
+
+	// Use Adjusted Wald method to compute confidence interval for success rate
+	// z=1.96 for 95% confidence
+	const z = 1.96
+	const z2 = z * z
+
+	successCount := n * (1 - rawErrorRate)
+	nAdj := n + z2
+	pTilde := (successCount + z2/2) / nAdj
+	se := math.Sqrt(pTilde * (1 - pTilde) / nAdj)
+
+	lowerBound := pTilde - z*se // Lower bound of success rate confidence interval
+	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
+
+	// If we're confident (95%) that success rate is below SLO, reopen
+	if upperBound < requiredSuccessRate {
 		return OPEN
 	}
 
-	// Check min. consecutive successes based on error rate
-	hErrors := max(0.01, cb.metrics.errors.Stat(Mean, Mid))
-	if float64(cb.metrics.errors.RawValueCount()) > 1/hErrors {
+	// If we're confident (95%) that success rate meets SLO, close the circuit
+	if lowerBound >= requiredSuccessRate {
 		return CLOSED
 	}
 
+	// Not enough confidence yet, keep testing
 	return HALF_OPEN
 }
 
@@ -201,19 +228,14 @@ func (cb *CircuitBreaker) mustOpen() bool {
 
 	faults := 0
 
-	var success_rate float64
-	var latency_dev float64
-	var concurrency_dev float64
-	var rps float64
+	// Use variance-weighted blend of current and historical for success rate
+	success_rate := 1 - cb.metrics.errors.Mean()
+	latency_dev := cb.metrics.latency.Stat(Deviation, Raw)
+	concurrency_dev := cb.metrics.concurrency.Stat(Deviation, Raw)
+	rps := cb.metrics.requests.Stat(Derivative, Raw)
 
-	// If the circuit is in the half-open state, use the revised SLO
-	success_rate = 1 - cb.metrics.errors.Mean()
-	latency_dev = cb.metrics.latency.Stat(Deviation, Raw)
-	concurrency_dev = cb.metrics.concurrency.Stat(Deviation, Raw)
-	rps = cb.metrics.requests.Stat(Derivative, Raw)
-
-	// Success Rate
-	if success_rate < cb.revised_slo.SuccessRate {
+	// Success Rate - direct SLO check with blended forecast
+	if success_rate < cb.stated_slo.SuccessRate {
 		faults += 3
 	}
 

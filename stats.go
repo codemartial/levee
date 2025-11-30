@@ -144,6 +144,10 @@ func (s *TimeSeries) Stat(st StatType, sr StatRange) float64 {
 	}
 }
 
+func (s *TimeSeries) RawMean() float64 {
+	return s.mean
+}
+
 func (s *TimeSeries) Mean() float64 {
 	sampleSize := float64(len(s.values))
 	if len(s.values) == 0 {
