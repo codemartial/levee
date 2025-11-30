@@ -299,58 +299,141 @@ func (cb *CircuitBreaker) StateUpdates() <-chan State {
 }
 
 type WarmupCB struct {
-	*CircuitBreaker
-	reqCount uint32
-	start    time.Time
-	end      time.Time
+	mu          sync.RWMutex
+	slo         SLO
+	state       State
+	start       time.Time
+	end         time.Time
+	lastOpenAt  time.Time
+	successCount uint32
+	failureCount uint32
+	reqCount    uint32
 }
 
 func NewWarmupCB(slo SLO) *WarmupCB {
-	cb := NewCircuitBreaker(slo, 100)
-	cb.state = INIT
 	return &WarmupCB{
-		CircuitBreaker: cb,
-		start:          time.Time{}, // Initialize to zero, will be set on first event
+		slo:   slo,
+		state: INIT,
 	}
 }
 
 func (cb *WarmupCB) Start(ts time.Time) (State, error) {
-	// Initialize start time on first event
 	cb.mu.Lock()
+
+	// Initialize start time on first event
 	if cb.start.IsZero() {
 		cb.start = ts
 	}
-	cb.mu.Unlock()
 
-	// No pre-call checks during warmup, just return current state
-	return cb.State(), nil
+	// Check if we're in OPEN state
+	if cb.state == OPEN {
+		if ts.Sub(cb.lastOpenAt) < cb.slo.Timeout {
+			cb.mu.Unlock()
+			return OPEN, ErrCircuitOpen
+		}
+		// Timeout expired, transition to HALF_OPEN
+		cb.state = HALF_OPEN
+	}
+
+	state := cb.state
+	cb.mu.Unlock()
+	return state, nil
 }
 
 func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
-	return cb.processWarmupResult(ts)
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.successCount++
+
+	// Only count requests after warmup period in CLOSED state
+	if ts.Sub(cb.start) > cb.slo.Warmup && cb.state == CLOSED {
+		cb.reqCount++
+		if cb.reqCount > 1000 {
+			cb.end = ts
+			// Keep state as CLOSED - will be detected by Levee for transition
+		}
+	}
+
+	// Check if we should transition from HALF_OPEN to CLOSED
+	if cb.state == HALF_OPEN {
+		totalCalls := cb.successCount + cb.failureCount
+		if totalCalls >= 10 {
+			successRate := float64(cb.successCount) / float64(totalCalls)
+			if successRate >= cb.slo.SuccessRate {
+				cb.state = CLOSED
+				cb.successCount = 0
+				cb.failureCount = 0
+				cb.reqCount = 0 // Reset count when entering CLOSED from HALF_OPEN
+			} else {
+				cb.state = OPEN
+				cb.lastOpenAt = ts
+				cb.successCount = 0
+				cb.failureCount = 0
+			}
+		}
+	} else if cb.state == INIT {
+		// Transition from INIT to CLOSED on first success after warmup
+		if ts.Sub(cb.start) > cb.slo.Warmup {
+			cb.state = CLOSED
+			cb.successCount = 0
+			cb.failureCount = 0
+			cb.reqCount = 0 // Reset count when entering CLOSED from INIT
+		}
+	}
+
+	return cb.state
 }
 
 func (cb *WarmupCB) Fail(ts time.Time, duration time.Duration) State {
-	return cb.processWarmupResult(ts)
-}
-
-func (cb *WarmupCB) processWarmupResult(ts time.Time) State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	if ts.Sub(cb.start) > cb.stated_slo.Warmup {
+
+	cb.failureCount++
+
+	// Count requests after warmup period in CLOSED state (failures count too)
+	if ts.Sub(cb.start) > cb.slo.Warmup && cb.state == CLOSED {
 		cb.reqCount++
+		if cb.reqCount > 1000 {
+			cb.end = ts
+			// Keep state as CLOSED - will be detected by Levee for transition
+		}
 	}
-	if cb.reqCount > 1000 {
-		cb.end = ts
-		cb.state = CLOSED
+
+	// Check if we should open based on simple threshold
+	totalCalls := cb.successCount + cb.failureCount
+	if totalCalls >= 10 {
+		successRate := float64(cb.successCount) / float64(totalCalls)
+		if successRate < cb.slo.SuccessRate {
+			prevState := cb.state
+			cb.state = OPEN
+			cb.lastOpenAt = ts
+			cb.successCount = 0
+			cb.failureCount = 0
+			// Reset reqCount when transitioning OUT of CLOSED
+			if prevState == CLOSED {
+				cb.reqCount = 0
+			}
+		}
 	}
+
 	return cb.state
+}
+
+func (cb *WarmupCB) State() State {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.state
+}
+
+func (cb *WarmupCB) StateUpdates() <-chan State {
+	return nil
 }
 
 func (cb *WarmupCB) Call(f func() error) (State, error) {
 	start := time.Now()
 
-	// Use Start() to perform pre-call checks
+	// Perform pre-call checks
 	state, err := cb.Start(start)
 	if err != nil {
 		return state, err
@@ -361,7 +444,7 @@ func (cb *WarmupCB) Call(f func() error) (State, error) {
 	end := time.Now()
 	duration := end.Sub(start)
 
-	// Use Success() or Fail() to process the result
+	// Process the result
 	var resultState State
 	if call_err != nil {
 		resultState = cb.Fail(end, duration)

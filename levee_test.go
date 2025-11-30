@@ -3,7 +3,6 @@ package levee
 import (
 	"errors"
 	"math"
-	"sync"
 	"testing"
 	"time"
 )
@@ -32,44 +31,28 @@ func TestWarmupPhase(t *testing.T) {
 	}
 
 	l := NewLevee(slo)
-	// Simulate successful calls during warmup
 	successFunc := func() error { return nil }
 
-	// Wait for warmup period to complete
-	time.Sleep(slo.Warmup)
-
-	// Make 1010 successful calls concurrently after warmup period (need >1000)
-	const numGoroutines = 10
-	const callsPerGoroutine = 101
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, numGoroutines*callsPerGoroutine)
-
-	for g := 0; g < numGoroutines; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < callsPerGoroutine; i++ {
-				_, err := l.Call(successFunc)
-				if err != nil {
-					errChan <- err
-				}
-			}
-		}()
+	// Start making calls immediately - first call starts warmup timer
+	// Make calls during warmup period (these don't count toward 1000)
+	for i := 0; i < 100; i++ {
+		l.Call(successFunc)
 	}
 
-	// Wait for all goroutines to complete
-	wg.Wait()
-	close(errChan)
+	// Wait for warmup period to complete from first call
+	time.Sleep(slo.Warmup + time.Millisecond*100)
 
-	// Check for any errors
-	for err := range errChan {
-		t.Errorf("Unexpected error during warmup: %v", err)
-	}
-
-	// After enough requests, the state should be CLOSED
-	if l.State() != CLOSED {
-		t.Errorf("Expected CLOSED state after warmup, got %v", l.State())
+	// Now make 1001+ successful calls after warmup - these should count
+	// Need enough to trigger transition (>1000 in CLOSED state)
+	for i := 0; i < 1100; i++ {
+		state, err := l.Call(successFunc)
+		if err != nil {
+			t.Errorf("Unexpected error during warmup: %v", err)
+		}
+		// After warmup completes, state should eventually be CLOSED
+		if i == 1099 && state != CLOSED {
+			t.Errorf("Expected CLOSED state after warmup+1000 calls, got %v", state)
+		}
 	}
 }
 

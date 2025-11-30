@@ -106,7 +106,7 @@ func (l *Levee) transitionFromWarmup(wu *WarmupCB) {
 	reqCount := wu.reqCount
 	start := wu.start
 	end := wu.end
-	slo := wu.stated_slo
+	slo := wu.slo
 	wu.mu.RUnlock()
 
 	// Figure out sample count based on SLO and detected RPS
@@ -144,6 +144,19 @@ func (l *Levee) StateUpdates() <-chan State {
 }
 
 func (l *Levee) Expunge() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Get SLO from current CB (could be WarmupCB or CircuitBreaker)
+	var slo SLO
+	if wu, ok := l.cb.(*WarmupCB); ok {
+		slo = wu.slo
+	} else if cb, ok := l.cb.(*CircuitBreaker); ok {
+		cb.mu.RLock()
+		slo = cb.stated_slo
+		cb.mu.RUnlock()
+	}
+
 	l.ready = false
-	l.cb = NewWarmupCB(l.cb.(*WarmupCB).stated_slo)
+	l.cb = NewWarmupCB(slo)
 }
