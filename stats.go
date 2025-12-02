@@ -1,6 +1,7 @@
 package levee
 
 import (
+	"math"
 	"sort"
 	"time"
 )
@@ -54,7 +55,7 @@ func (s *TimeSeries) Record(value float64, t time.Time) {
 
 	s.values = append(s.values, value)
 	s.mean = s.mean + (value-s.mean)/float64(len(s.values))
-	s.sumAD = s.sumAD + (value - s.mean)
+	s.sumAD = s.sumAD + math.Abs(value-s.mean)
 
 	normalized_t := float64(t.UnixMicro()) - s.delta_t
 	s.sumVT = s.sumVT + value*normalized_t
@@ -90,7 +91,14 @@ func (s *TimeSeries) updateEWMAs() {
 	deviation := s.sumAD / float64(len(s.values))
 	s.deviation = s.deviation.update(deviation, alphaLo, alphaHi)
 
-	derivative := s.sumTT / s.sumVT // Least squares method
+	// Derivative using least squares method: slope = Σ(t²) / Σ(v·t)
+	// Handle division by zero: if sumVT is zero/tiny, derivative is undefined (use 0)
+	var derivative float64
+	if math.Abs(s.sumVT) > 1e-9 {
+		derivative = s.sumTT / s.sumVT
+	} else {
+		derivative = 0 // No meaningful rate of change
+	}
 	s.derivative = s.derivative.update(derivative, alphaLo, alphaHi)
 }
 
