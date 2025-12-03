@@ -197,6 +197,7 @@ func newMetrics(size uint16) *metrics {
 		concurrency: TimeSeries{values: make([]float64, 0, size), _size: size},
 		latency:     TimeSeries{values: make([]float64, 0, size), _size: size},
 		errors:      TimeSeries{values: make([]float64, 0, size), _size: size},
+		requests:    TimeSeries{values: make([]float64, 0, size), _size: size},
 	}
 }
 
