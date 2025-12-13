@@ -192,7 +192,7 @@ func (cb *CircuitBreaker) newState() State {
 	}
 
 	// Sufficient samples - use Adjusted Wald with raw current window statistics
-	rawErrorRate := cb.metrics.errors.RawMean()
+	rawErrorRate := cb.metrics.errors.Mean()
 	requiredSuccessRate := cb.revised_slo.SuccessRate
 
 	// Use Adjusted Wald method to compute confidence interval for success rate
@@ -299,15 +299,15 @@ func (cb *CircuitBreaker) StateUpdates() <-chan State {
 }
 
 type WarmupCB struct {
-	mu          sync.RWMutex
-	slo         SLO
-	state       State
-	start       time.Time
-	end         time.Time
-	lastOpenAt  time.Time
+	mu           sync.RWMutex
+	slo          SLO
+	state        State
+	start        time.Time
+	end          time.Time
+	lastOpenAt   time.Time
 	successCount uint32
 	failureCount uint32
-	reqCount    uint32
+	reqCount     uint32
 }
 
 func NewWarmupCB(slo SLO) *WarmupCB {

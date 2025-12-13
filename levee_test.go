@@ -197,8 +197,9 @@ func TestConcurrencyTracking(t *testing.T) {
 
 func TestEWMACalculation(t *testing.T) {
 	ts := &TimeSeries{
-		values: make([]float64, 0, 100),
+		values: make([]float64, 100),
 		_size:  100,
+		cursor: 0,
 	}
 
 	// Record consistent values
@@ -218,3 +219,230 @@ func TestEWMACalculation(t *testing.T) {
 }
 
 var abs = math.Abs
+
+func TestSaveStateBeforeWarmup(t *testing.T) {
+	slo := SLO{
+		SuccessRate: 0.99,
+		Timeout:     time.Second,
+		Warmup:      10,
+	}
+
+	levee := NewLevee(slo)
+
+	// SaveState should return nil before warmup completes
+	state, err := levee.SaveState()
+	if err != nil {
+		t.Fatalf("SaveState returned error: %v", err)
+	}
+	if state != nil {
+		t.Error("SaveState should return nil during warmup phase")
+	}
+}
+
+func TestSaveStateAfterWarmup(t *testing.T) {
+	slo := SLO{
+		SuccessRate: 0.5, // Low success rate: 10/(1-0.5) = 20 samples
+		Timeout:     time.Second,
+		Warmup:      1 * time.Second,
+	}
+
+	levee := NewLevee(slo)
+	now := time.Now()
+
+	// Low RPS (1 req/sec) + low success rate = buffer size 100 (max of ~1, 100, 20)
+	// Need ~1000 requests to transition from WarmupCB, then 100+ to fill buffer
+	for i := 0; i < 1500; i++ {
+		ts := now.Add(time.Duration(i) * time.Second) // 1s spacing = ~1 RPS
+		levee.Start(ts)
+		levee.Success(ts, 10*time.Millisecond)
+	}
+
+	// Now SaveState should work
+	state, err := levee.SaveState()
+	if err != nil {
+		t.Fatalf("SaveState returned error after warmup: %v", err)
+	}
+	if state == nil {
+		// Check if levee is ready and if EWMAs are initialized
+		levee.mu.RLock()
+		ready := levee.ready
+		cb, _ := levee.cb.(*CircuitBreaker)
+		var bufferSize uint16
+		var hasEWMA bool
+		if cb != nil {
+			cb.mu.RLock()
+			bufferSize = cb.metrics.concurrency._size
+			hasEWMA = cb.metrics.concurrency.value != nil
+			cb.mu.RUnlock()
+		}
+		levee.mu.RUnlock()
+		t.Fatalf("SaveState returned nil (ready=%v, bufferSize=%d, hasEWMA=%v)", ready, bufferSize, hasEWMA)
+	}
+
+	// Verify state fields are populated
+	if state.SLO.SuccessRate != slo.SuccessRate {
+		t.Errorf("SLO.SuccessRate not saved correctly: got %f, want %f", state.SLO.SuccessRate, slo.SuccessRate)
+	}
+	if state.SLO.Timeout != slo.Timeout {
+		t.Errorf("SLO.Timeout not saved correctly: got %v, want %v", state.SLO.Timeout, slo.Timeout)
+	}
+	if state.BufferSize == 0 {
+		t.Error("BufferSize not saved")
+	}
+}
+
+func TestRestoreState(t *testing.T) {
+	slo := SLO{
+		SuccessRate: 0.5,
+		Timeout:     500 * time.Millisecond,
+		Warmup:      1 * time.Second,
+	}
+
+	// Create and warm up original levee
+	originalLevee := NewLevee(slo)
+	now := time.Now()
+
+	// Wide spacing for small buffer, need 1500+ requests
+	for i := 0; i < 1500; i++ {
+		ts := now.Add(time.Duration(i) * time.Second) // 1s spacing
+		originalLevee.Start(ts)
+		if i%10 == 0 {
+			// 10% error rate
+			originalLevee.Fail(ts, 20*time.Millisecond)
+		} else {
+			originalLevee.Success(ts, 15*time.Millisecond)
+		}
+	}
+
+	// Save state
+	state, err := originalLevee.SaveState()
+	if err != nil {
+		t.Fatalf("SaveState failed: %v", err)
+	}
+	if state == nil {
+		t.Fatal("SaveState returned nil")
+	}
+
+	// Restore state
+	restoredLevee := RestoreState(state)
+	if restoredLevee == nil {
+		t.Fatal("RestoreState returned nil")
+	}
+
+	// Verify the restored levee is in ready state (not warmup)
+	restoredLevee.mu.RLock()
+	if !restoredLevee.ready {
+		t.Error("Restored Levee should be in ready state")
+	}
+	cb, ok := restoredLevee.cb.(*CircuitBreaker)
+	restoredLevee.mu.RUnlock()
+
+	if !ok {
+		t.Fatal("Restored Levee should have CircuitBreaker, not WarmupCB")
+	}
+
+	// Verify EWMAs were restored
+	cb.mu.RLock()
+	if cb.metrics.concurrency.value == nil {
+		t.Error("Concurrency value EWMA not restored")
+	}
+	if cb.metrics.latency.value == nil {
+		t.Error("Latency value EWMA not restored")
+	}
+	if cb.metrics.errors.value == nil {
+		t.Error("Errors value EWMA not restored")
+	}
+	if cb.metrics.requests.value == nil {
+		t.Error("Requests value EWMA not restored")
+	}
+
+	// Verify EWMA values match saved state
+	if cb.metrics.errors.value.base != state.ErrorsValueBase {
+		t.Errorf("Error EWMA base not restored correctly: got %f, want %f",
+			cb.metrics.errors.value.base, state.ErrorsValueBase)
+	}
+	if cb.metrics.errors.value.ewmaMid != state.ErrorsValueMid {
+		t.Errorf("Error EWMA mid not restored correctly: got %f, want %f",
+			cb.metrics.errors.value.ewmaMid, state.ErrorsValueMid)
+	}
+	if cb.metrics.errors.value.ewmaLong != state.ErrorsValueLong {
+		t.Errorf("Error EWMA long not restored correctly: got %f, want %f",
+			cb.metrics.errors.value.ewmaLong, state.ErrorsValueLong)
+	}
+
+	// Verify circuit is in CLOSED state
+	if cb.state != CLOSED {
+		t.Errorf("Restored CircuitBreaker should be CLOSED, got %d", cb.state)
+	}
+
+	// Verify SLO was restored
+	if cb.stated_slo.SuccessRate != slo.SuccessRate {
+		t.Errorf("SLO.SuccessRate not restored: got %f, want %f", cb.stated_slo.SuccessRate, slo.SuccessRate)
+	}
+	cb.mu.RUnlock()
+
+	// Verify restored levee can process requests
+	resultState, err := restoredLevee.Start(now.Add(200 * time.Millisecond))
+	if err != nil {
+		t.Errorf("Restored Levee failed to process request: %v", err)
+	}
+	if resultState != CLOSED {
+		t.Errorf("Restored Levee should be CLOSED, got %d", resultState)
+	}
+}
+
+func TestStateRoundTrip(t *testing.T) {
+	slo := SLO{
+		SuccessRate: 0.5,
+		Timeout:     time.Second,
+		Warmup:      1 * time.Second,
+	}
+
+	// Create, warm up, and save
+	levee1 := NewLevee(slo)
+	now := time.Now()
+
+	// Wide spacing for small buffer, need 1500+ requests
+	for i := 0; i < 1500; i++ {
+		ts := now.Add(time.Duration(i) * time.Second) // 1s spacing
+		levee1.Start(ts)
+		levee1.Success(ts, 50*time.Millisecond)
+	}
+
+	state1, err := levee1.SaveState()
+	if err != nil || state1 == nil {
+		t.Fatalf("First SaveState failed: err=%v, state=%v", err, state1)
+	}
+
+	// Restore and save again
+	levee2 := RestoreState(state1)
+	state2, err := levee2.SaveState()
+	if err != nil || state2 == nil {
+		t.Fatalf("Second SaveState failed: err=%v, state=%v", err, state2)
+	}
+
+	// Verify all EWMA values are identical
+	if state1.ConcurrencyValueBase != state2.ConcurrencyValueBase ||
+		state1.ConcurrencyValueMid != state2.ConcurrencyValueMid ||
+		state1.ConcurrencyValueLong != state2.ConcurrencyValueLong {
+		t.Error("Concurrency Value EWMAs don't match after round-trip")
+	}
+
+	if state1.LatencyP99Base != state2.LatencyP99Base ||
+		state1.LatencyP99Mid != state2.LatencyP99Mid ||
+		state1.LatencyP99Long != state2.LatencyP99Long {
+		t.Error("Latency P99 EWMAs don't match after round-trip")
+	}
+
+	if state1.ErrorsDeviationBase != state2.ErrorsDeviationBase ||
+		state1.ErrorsDeviationMid != state2.ErrorsDeviationMid ||
+		state1.ErrorsDeviationLong != state2.ErrorsDeviationLong {
+		t.Error("Errors Deviation EWMAs don't match after round-trip")
+	}
+
+	if state1.RequestsDerivBase != state2.RequestsDerivBase ||
+		state1.RequestsDerivMid != state2.RequestsDerivMid ||
+		state1.RequestsDerivLong != state2.RequestsDerivLong {
+		t.Error("Requests Derivative EWMAs don't match after round-trip")
+	}
+}

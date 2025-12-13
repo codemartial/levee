@@ -18,19 +18,22 @@ type EWMA struct {
 }
 
 type TimeSeries struct {
-	values  []float64
-	mean    float64
-	sumAD   float64
-	sumVT   float64
-	sumTT   float64
-	delta_t float64
+	values     []float64
+	cursor     uint16
+	mean       float64
+	sumAD      float64
+	sumADStale bool
+	sumVT      float64
+	sumTT      float64
+	delta_t    float64
 
 	value      *EWMA
 	p99        *EWMA
 	deviation  *EWMA
 	derivative *EWMA
 
-	_size uint16
+	_size    uint16
+	isFilled bool // true once buffer has been filled at least once
 }
 
 func (ma *EWMA) update(value, alphaLo, alphaHi float64) *EWMA {
@@ -49,31 +52,91 @@ func (ma *EWMA) update(value, alphaLo, alphaHi float64) *EWMA {
 }
 
 func (s *TimeSeries) Record(value float64, t time.Time) {
-	if len(s.values) == 0 {
+	// Initialize or reset timestamp baseline on wrap
+	if s.cursor == 0 {
 		s.delta_t = float64(t.UnixMicro())
+		// Reset time-based sums on wrap (can't maintain without timestamp buffer)
+		if s.isFilled {
+			s.sumVT = 0
+			s.sumTT = 0
+		}
 	}
 
-	s.values = append(s.values, value)
-	s.mean = s.mean + (value-s.mean)/float64(len(s.values))
-	s.sumAD = s.sumAD + math.Abs(value-s.mean)
-
 	normalized_t := float64(t.UnixMicro()) - s.delta_t
+
+	// Handle buffer full case (overwriting old value)
+	if s.isFilled {
+		oldValue := s.values[s.cursor]
+		n := int(s._size)
+
+		// Update mean by swapping old value for new value
+		s.mean = s.mean + (value-oldValue)/float64(n)
+
+		// Mark sumAD as stale (will recompute when needed)
+		s.sumADStale = true
+	} else {
+		// Growing phase: incremental updates
+		n := int(s.cursor) + 1 // New sample count
+
+		// Welford's incremental mean
+		s.mean = s.mean + (value-s.mean)/float64(n)
+
+		// Mark sumAD as stale
+		s.sumADStale = true
+	}
+
+	// Accumulate time-based sums (these will be reset on wrap)
 	s.sumVT = s.sumVT + value*normalized_t
 	s.sumTT = s.sumTT + normalized_t*normalized_t
 
-	if len(s.values) == cap(s.values) && cap(s.values) > 0 {
+	// Write new value
+	s.values[s.cursor] = value
+
+	// Advance cursor
+	s.cursor++
+	shouldUpdateEWMA := false
+
+	if s.cursor >= s._size {
+		s.cursor = 0
+		s.isFilled = true // Mark buffer as filled on first wrap and subsequent wraps
+		shouldUpdateEWMA = true
+	}
+
+	// Update EWMAs on buffer wrap (both first fill and subsequent wraps)
+	if shouldUpdateEWMA && s._size > 0 {
 		s.updateEWMAs()
-		s.values = s.values[:0]
 	}
 }
 
 func (s *TimeSeries) ResetBase() {
-	s.values = s.values[:0]
+	// Reset ring buffer state
+	s.cursor = 0
+	s.isFilled = false // Reset filled flag - buffer starts empty again
+
+	// Clear statistics
 	s.mean = 0
 	s.sumAD = 0
+	s.sumADStale = false
 	s.sumVT = 0
 	s.sumTT = 0
 	s.delta_t = 0
+
+	// Reset EWMA base values while retaining mid/long history
+	if s.value != nil {
+		s.value.base = 0
+	}
+	if s.p99 != nil {
+		s.p99.base = 0
+	}
+	if s.deviation != nil {
+		s.deviation.base = 0
+	}
+	if s.derivative != nil {
+		s.derivative.base = 0
+	}
+
+	// Note: values array is not zeroed for performance
+	// isFilled flag prevents using stale data from the array
 }
 
 func (s *TimeSeries) updateEWMAs() {
@@ -83,12 +146,20 @@ func (s *TimeSeries) updateEWMAs() {
 
 	s.value = s.value.update(s.mean, alphaLo, alphaHi)
 
-	sort.Float64s(s.values)
-	i_99 := len(s.values) * 99 / 100
-	p99 := s.values[i_99]
+	// For P99: need to sort values, but can't modify ring buffer in place
+	// Create a temporary copy
+	count := s.RawValueCount()
+	sortedValues := make([]float64, count)
+	copy(sortedValues, s.values[:count])
+
+	sort.Float64s(sortedValues)
+	i_99 := len(sortedValues) * 99 / 100
+	p99 := sortedValues[i_99]
 	s.p99 = s.p99.update(p99, alphaLo, alphaHi)
 
-	deviation := s.sumAD / float64(len(s.values))
+	// Deviation computation - ensure sumAD is current
+	s.ensureSumAD()
+	deviation := s.sumAD / float64(count)
 	s.deviation = s.deviation.update(deviation, alphaLo, alphaHi)
 
 	// Derivative using least squares method: slope = Σ(t²) / Σ(v·t)
@@ -102,8 +173,27 @@ func (s *TimeSeries) updateEWMAs() {
 	s.derivative = s.derivative.update(derivative, alphaLo, alphaHi)
 }
 
+func (s *TimeSeries) ensureSumAD() {
+	if !s.sumADStale {
+		return
+	}
+
+	s.sumAD = 0
+	count := s.RawValueCount()
+
+	for i := 0; i < count; i++ {
+		s.sumAD += math.Abs(s.values[i] - s.mean)
+	}
+
+	s.sumADStale = false
+}
+
 func (s *TimeSeries) RawValueCount() int {
-	return len(s.values)
+	// Buffer is filled if we've wrapped around at least once
+	if s.isFilled {
+		return int(s._size)
+	}
+	return int(s.cursor)
 }
 
 type StatType uint8
@@ -152,37 +242,16 @@ func (s *TimeSeries) Stat(st StatType, sr StatRange) float64 {
 	}
 }
 
-func (s *TimeSeries) RawMean() float64 {
+func (s *TimeSeries) Mean() float64 {
 	return s.mean
 }
 
-func (s *TimeSeries) Mean() float64 {
-	sampleSize := float64(len(s.values))
-	if len(s.values) == 0 {
-		if s.value == nil {
-			return 0
-		}
-		return s.value.base // If no current data, rely entirely on historical mean
-	}
-
-	if s.value == nil {
-		return s.mean
-	}
-
-	// Adjust weights based on MAD
-	historicalWeight := float64(s._size)
-	currentWeight := sampleSize * sampleSize / (s.sumAD + 1e-9) // Lower MAD increases weight
-
-	// Weighted average
-	bestGuess := (float64(s._size)*s.value.base + currentWeight*s.mean) / (historicalWeight + currentWeight)
-	return bestGuess
-}
-
 func (s *TimeSeries) Deviation() float64 {
-	if len(s.values) == 0 {
+	if s.RawValueCount() == 0 {
 		return 0
 	}
-	return s.sumAD / float64(len(s.values))
+	s.ensureSumAD() // Lazy computation
+	return s.sumAD / float64(s.RawValueCount())
 }
 
 type metrics struct {
@@ -194,10 +263,10 @@ type metrics struct {
 
 func newMetrics(size uint16) *metrics {
 	return &metrics{
-		concurrency: TimeSeries{values: make([]float64, 0, size), _size: size},
-		latency:     TimeSeries{values: make([]float64, 0, size), _size: size},
-		errors:      TimeSeries{values: make([]float64, 0, size), _size: size},
-		requests:    TimeSeries{values: make([]float64, 0, size), _size: size},
+		concurrency: TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
+		latency:     TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
+		errors:      TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
+		requests:    TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
 	}
 }
 
