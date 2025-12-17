@@ -112,7 +112,7 @@ func TestCircuitRecovery(t *testing.T) {
 
 	// Force circuit to open
 	failureFunc := func() error { return errors.New("test error") }
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 300; i++ {
 		state, _ := l.Call(failureFunc)
 		if state == OPEN {
 			break

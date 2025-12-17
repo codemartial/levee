@@ -161,14 +161,12 @@ func (cb *CircuitBreaker) allowCall() bool {
 	hErrors := cb.metrics.errors.Stat(Mean, Mid)
 	hConcurrency := cb.metrics.concurrency.Stat(Mean, Mid)
 
-	var allowedConcurrency float64
-	if hErrors == 0 || hConcurrency == 0 {
-		allowedConcurrency = 1.0
-	} else {
-		allowedConcurrency = (1 - hErrors) * hConcurrency
+	var allowedConcurrency int32 = 1
+	if hConcurrency > 0 {
+		allowedConcurrency = max(1, int32((1-hErrors)*hConcurrency))
 	}
 
-	if float64(cb.concurrents) > allowedConcurrency {
+	if cb.concurrents > allowedConcurrency {
 		return false
 	}
 
@@ -186,12 +184,10 @@ func (cb *CircuitBreaker) newState() State {
 	const minSamples = 10
 	n := float64(cb.metrics.errors.RawValueCount())
 
-	// Insufficient samples to test recovery - keep testing
 	if n < minSamples {
 		return HALF_OPEN
 	}
 
-	// Sufficient samples - use Adjusted Wald with raw current window statistics
 	rawErrorRate := cb.metrics.errors.Mean()
 	requiredSuccessRate := cb.revised_slo.SuccessRate
 
@@ -208,12 +204,10 @@ func (cb *CircuitBreaker) newState() State {
 	lowerBound := pTilde - z*se // Lower bound of success rate confidence interval
 	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
 
-	// If we're confident (95%) that success rate is below SLO, reopen
 	if upperBound < requiredSuccessRate {
 		return OPEN
 	}
 
-	// If we're confident (95%) that success rate meets SLO, close the circuit
 	if lowerBound >= requiredSuccessRate {
 		return CLOSED
 	}
@@ -226,40 +220,81 @@ func (cb *CircuitBreaker) mustOpen() bool {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 
-	faults := 0
-
-	// Use variance-weighted blend of current and historical for success rate
-	success_rate := 1 - cb.metrics.errors.Mean()
-	latency_dev := cb.metrics.latency.Stat(Deviation, Raw)
-	concurrency_dev := cb.metrics.concurrency.Stat(Deviation, Raw)
-	rps := cb.metrics.requests.Stat(Derivative, Raw)
-
-	// Success Rate - direct SLO check with blended forecast
-	if success_rate < cb.stated_slo.SuccessRate {
-		faults += 3
+	if !cb.metrics.hasSufficientHistory() {
+		return false
 	}
 
-	// If there is increased load on the system, at most two of the following
-	// metrics can spike while the other remains normal in a healthy system.
-	// If all three metrics spike, the system is unhealthy.
+	n := float64(cb.metrics.errors.RawValueCount())
+	errorMean := cb.metrics.errors.Mean()
+	rawSuccessRate := 1 - errorMean
 
-	// Latency Anomaly
-	if latency_dev > 10*cb.metrics.latency.Stat(Deviation, Mid) || latency_dev > 5*cb.metrics.latency.Stat(Deviation, Long) {
-		faults += 1
+	// Adjusted Wald method for confidence interval
+	const z = 1.96 // 95% confidence
+	const z2 = z * z
+
+	successCount := n * rawSuccessRate
+	nAdj := n + z2
+	pTilde := (successCount + z2/2) / nAdj
+	se := math.Sqrt(pTilde * (1 - pTilde) / nAdj)
+
+	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
+
+	if upperBound < cb.stated_slo.SuccessRate {
+		return true
 	}
 
-	// Concurrency Anomaly
-	if concurrency_dev > 10*cb.metrics.concurrency.Stat(Deviation, Mid) ||
-		concurrency_dev > 5*cb.metrics.concurrency.Stat(Deviation, Long) {
-		faults += 1
+	const epsilon = 1e-9     // Prevent division by zero
+	const latencyFloor = 1.0 // 1 microsecond floor
+
+	// Current window statistics
+	concurrencyMean := cb.metrics.concurrency.Stat(Mean, Raw)
+	latencyMean := cb.metrics.latency.Stat(Mean, Raw)
+	currentRPS := concurrencyMean / max(latencyMean, latencyFloor)
+
+	// Mid-term historical statistics
+	concurrencyMid := cb.metrics.concurrency.Stat(Mean, Mid)
+	latencyMid := cb.metrics.latency.Stat(Mean, Mid)
+	latencyDevMid := cb.metrics.latency.Stat(Deviation, Mid)
+	midRPS := concurrencyMid / max(latencyMid, latencyFloor)
+
+	// Long-term historical statistics
+	concurrencyLong := cb.metrics.concurrency.Stat(Mean, Long)
+	latencyLong := cb.metrics.latency.Stat(Mean, Long)
+	latencyDevLong := cb.metrics.latency.Stat(Deviation, Long)
+	longRPS := concurrencyLong / max(latencyLong, latencyFloor)
+
+	// Check against both time horizons
+	midAnomaly := unexpectedLatencySpike(currentRPS, midRPS, latencyMean, latencyMid, latencyDevMid)
+	longAnomaly := unexpectedLatencySpike(currentRPS, longRPS, latencyMean, latencyLong, latencyDevLong)
+
+	return midAnomaly && longAnomaly
+}
+
+func unexpectedLatencySpike(currentRPS, historicalRPS, currentLatency, historicalLatency, historicalLatencyDev float64) bool {
+	const epsilon = 1e-9
+
+	// RPS multiplier: how much did traffic change?
+	rpsX := currentRPS / max(historicalRPS, epsilon)
+
+	// Expected latency multiplier: sub-linear scaling with load
+	var expectedLatencyX float64
+	if rpsX >= 1.0 {
+		expectedLatencyX = 1.0 + math.Log(rpsX)
+	} else {
+		expectedLatencyX = 1.0 // No increase expected when load drops
 	}
 
-	// RPS Anomaly
-	if rps > 10*cb.metrics.requests.Stat(Derivative, Mid) || rps > 5*cb.metrics.requests.Stat(Derivative, Long) {
-		faults += 1
-	}
+	// Actual latency multiplier
+	actualLatencyX := currentLatency / max(historicalLatency, epsilon)
 
-	return faults >= 3
+	// CV-based tolerance for natural variance
+	cvLatency := historicalLatencyDev / max(historicalLatency, epsilon)
+	tolerance := 1.0 + 3.0*cvLatency
+
+	// Threshold: expected increase with variance tolerance
+	threshold := expectedLatencyX * tolerance
+
+	return actualLatencyX > threshold
 }
 
 func (cb *CircuitBreaker) OpenCircuit(ts time.Time) State {
@@ -320,12 +355,10 @@ func NewWarmupCB(slo SLO) *WarmupCB {
 func (cb *WarmupCB) Start(ts time.Time) (State, error) {
 	cb.mu.Lock()
 
-	// Initialize start time on first event
 	if cb.start.IsZero() {
 		cb.start = ts
 	}
 
-	// Check if we're in OPEN state
 	if cb.state == OPEN {
 		if ts.Sub(cb.lastOpenAt) < cb.slo.Timeout {
 			cb.mu.Unlock()
@@ -335,9 +368,8 @@ func (cb *WarmupCB) Start(ts time.Time) (State, error) {
 		cb.state = HALF_OPEN
 	}
 
-	state := cb.state
 	cb.mu.Unlock()
-	return state, nil
+	return cb.state, nil
 }
 
 func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
@@ -351,7 +383,6 @@ func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
 		cb.reqCount++
 		if cb.reqCount > 1000 {
 			cb.end = ts
-			// Keep state as CLOSED - will be detected by Levee for transition
 		}
 	}
 

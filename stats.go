@@ -33,7 +33,7 @@ type TimeSeries struct {
 	derivative *EWMA
 
 	_size    uint16
-	isFilled bool // true once buffer has been filled at least once
+	isFilled bool
 }
 
 func (ma *EWMA) update(value, alphaLo, alphaHi float64) *EWMA {
@@ -109,11 +109,9 @@ func (s *TimeSeries) Record(value float64, t time.Time) {
 }
 
 func (s *TimeSeries) ResetBase() {
-	// Reset ring buffer state
 	s.cursor = 0
-	s.isFilled = false // Reset filled flag - buffer starts empty again
+	s.isFilled = false
 
-	// Clear statistics
 	s.mean = 0
 	s.sumAD = 0
 	s.sumADStale = false
@@ -134,15 +132,11 @@ func (s *TimeSeries) ResetBase() {
 	if s.derivative != nil {
 		s.derivative.base = 0
 	}
-
-	// Note: values array is not zeroed for performance
-	// isFilled flag prevents using stale data from the array
 }
 
 func (s *TimeSeries) updateEWMAs() {
-	// Normalize alpha based on sample count and memory window
-	alphaLo := 1.0 / float64(s._size) / memMid
-	alphaHi := 1.0 / float64(s._size) / memLong
+	alphaLo := 1.0 / float64(memMid)  // ~5 min memory
+	alphaHi := 1.0 / float64(memLong) // ~1 day memory
 
 	s.value = s.value.update(s.mean, alphaLo, alphaHi)
 
@@ -162,11 +156,12 @@ func (s *TimeSeries) updateEWMAs() {
 	deviation := s.sumAD / float64(count)
 	s.deviation = s.deviation.update(deviation, alphaLo, alphaHi)
 
-	// Derivative using least squares method: slope = Σ(t²) / Σ(v·t)
-	// Handle division by zero: if sumVT is zero/tiny, derivative is undefined (use 0)
+	// Derivative using least squares method
+	// This gives the rate of change of value over time.
+	// Handle division by zero: if sumTT is zero/tiny, derivative is undefined (use 0)
 	var derivative float64
-	if math.Abs(s.sumVT) > 1e-9 {
-		derivative = s.sumTT / s.sumVT
+	if math.Abs(s.sumTT) > 1e-9 {
+		derivative = s.sumVT / s.sumTT
 	} else {
 		derivative = 0 // No meaningful rate of change
 	}
@@ -181,7 +176,7 @@ func (s *TimeSeries) ensureSumAD() {
 	s.sumAD = 0
 	count := s.RawValueCount()
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		s.sumAD += math.Abs(s.values[i] - s.mean)
 	}
 
@@ -295,4 +290,13 @@ func (m *metrics) Reset() {
 	m.latency.ResetBase()
 	m.errors.ResetBase()
 	m.requests.ResetBase()
+}
+
+// hasSufficientHistory returns true if EWMA history has been established
+// for concurrency and latency metrics (required for anomaly detection)
+func (m *metrics) hasSufficientHistory() bool {
+	return m.concurrency.isFilled &&
+		m.latency.isFilled &&
+		m.concurrency.value != nil &&
+		m.latency.value != nil
 }
