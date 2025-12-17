@@ -76,12 +76,9 @@ func (cb *CircuitBreaker) Start(ts time.Time) (State, error) {
 		return cb.OpenCircuit(ts), ErrCircuitOpen
 	}
 
-	{
-		cb.mu.Lock()
-		cb.metrics.RecordConcurrency(float64(cb.Concurrents()), ts)
-		cb.metrics.RecordRequests(1, ts)
-		cb.mu.Unlock()
-	}
+	cb.mu.Lock()
+	cb.metrics.RecordConcurrency(float64(cb.Concurrents()))
+	cb.mu.Unlock()
 	// START CALL
 	return state, nil
 }
@@ -101,13 +98,10 @@ func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, su
 	if !success {
 		errCount = 1.0
 	}
-	// START POST-CALL PROCESSING
-	{
-		cb.mu.Lock()
-		cb.metrics.RecordLatency(float64(duration.Microseconds()), ts)
-		cb.metrics.RecordErrors(errCount, ts)
-		cb.mu.Unlock()
-	}
+	cb.mu.Lock()
+	cb.metrics.RecordLatency(float64(duration.Microseconds()))
+	cb.metrics.RecordErrors(errCount)
+	cb.mu.Unlock()
 
 	state := cb.State()
 	if state == HALF_OPEN {
@@ -115,7 +109,7 @@ func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, su
 		case OPEN:
 			return cb.OpenCircuit(ts)
 		case CLOSED:
-			return cb.CloseCircuit(ts)
+			return cb.CloseCircuit()
 		default:
 			return state
 		}
@@ -166,11 +160,7 @@ func (cb *CircuitBreaker) allowCall() bool {
 		allowedConcurrency = max(1, int32((1-hErrors)*hConcurrency))
 	}
 
-	if cb.concurrents > allowedConcurrency {
-		return false
-	}
-
-	return true
+	return cb.concurrents <= allowedConcurrency
 }
 
 func (cb *CircuitBreaker) newState() State {
@@ -243,7 +233,6 @@ func (cb *CircuitBreaker) mustOpen() bool {
 		return true
 	}
 
-	const epsilon = 1e-9     // Prevent division by zero
 	const latencyFloor = 1.0 // 1 microsecond floor
 
 	// Current window statistics
@@ -310,7 +299,7 @@ func (cb *CircuitBreaker) OpenCircuit(ts time.Time) State {
 	return cb.state
 }
 
-func (cb *CircuitBreaker) CloseCircuit(ts time.Time) State {
+func (cb *CircuitBreaker) CloseCircuit() State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 

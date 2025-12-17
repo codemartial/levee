@@ -2,8 +2,6 @@ package levee
 
 import (
 	"math"
-	"sort"
-	"time"
 )
 
 const (
@@ -23,14 +21,9 @@ type TimeSeries struct {
 	mean       float64
 	sumAD      float64
 	sumADStale bool
-	sumVT      float64
-	sumTT      float64
-	delta_t    float64
 
-	value      *EWMA
-	p99        *EWMA
-	deviation  *EWMA
-	derivative *EWMA
+	value     *EWMA
+	deviation *EWMA
 
 	_size    uint16
 	isFilled bool
@@ -51,19 +44,7 @@ func (ma *EWMA) update(value, alphaLo, alphaHi float64) *EWMA {
 	return ma
 }
 
-func (s *TimeSeries) Record(value float64, t time.Time) {
-	// Initialize or reset timestamp baseline on wrap
-	if s.cursor == 0 {
-		s.delta_t = float64(t.UnixMicro())
-		// Reset time-based sums on wrap (can't maintain without timestamp buffer)
-		if s.isFilled {
-			s.sumVT = 0
-			s.sumTT = 0
-		}
-	}
-
-	normalized_t := float64(t.UnixMicro()) - s.delta_t
-
+func (s *TimeSeries) Record(value float64) {
 	// Handle buffer full case (overwriting old value)
 	if s.isFilled {
 		oldValue := s.values[s.cursor]
@@ -84,10 +65,6 @@ func (s *TimeSeries) Record(value float64, t time.Time) {
 		// Mark sumAD as stale
 		s.sumADStale = true
 	}
-
-	// Accumulate time-based sums (these will be reset on wrap)
-	s.sumVT = s.sumVT + value*normalized_t
-	s.sumTT = s.sumTT + normalized_t*normalized_t
 
 	// Write new value
 	s.values[s.cursor] = value
@@ -115,22 +92,13 @@ func (s *TimeSeries) ResetBase() {
 	s.mean = 0
 	s.sumAD = 0
 	s.sumADStale = false
-	s.sumVT = 0
-	s.sumTT = 0
-	s.delta_t = 0
 
 	// Reset EWMA base values while retaining mid/long history
 	if s.value != nil {
 		s.value.base = 0
 	}
-	if s.p99 != nil {
-		s.p99.base = 0
-	}
 	if s.deviation != nil {
 		s.deviation.base = 0
-	}
-	if s.derivative != nil {
-		s.derivative.base = 0
 	}
 }
 
@@ -140,32 +108,10 @@ func (s *TimeSeries) updateEWMAs() {
 
 	s.value = s.value.update(s.mean, alphaLo, alphaHi)
 
-	// For P99: need to sort values, but can't modify ring buffer in place
-	// Create a temporary copy
-	count := s.RawValueCount()
-	sortedValues := make([]float64, count)
-	copy(sortedValues, s.values[:count])
-
-	sort.Float64s(sortedValues)
-	i_99 := len(sortedValues) * 99 / 100
-	p99 := sortedValues[i_99]
-	s.p99 = s.p99.update(p99, alphaLo, alphaHi)
-
 	// Deviation computation - ensure sumAD is current
 	s.ensureSumAD()
-	deviation := s.sumAD / float64(count)
+	deviation := s.sumAD / float64(s.RawValueCount())
 	s.deviation = s.deviation.update(deviation, alphaLo, alphaHi)
-
-	// Derivative using least squares method
-	// This gives the rate of change of value over time.
-	// Handle division by zero: if sumTT is zero/tiny, derivative is undefined (use 0)
-	var derivative float64
-	if math.Abs(s.sumTT) > 1e-9 {
-		derivative = s.sumVT / s.sumTT
-	} else {
-		derivative = 0 // No meaningful rate of change
-	}
-	s.derivative = s.derivative.update(derivative, alphaLo, alphaHi)
 }
 
 func (s *TimeSeries) ensureSumAD() {
@@ -194,9 +140,7 @@ func (s *TimeSeries) RawValueCount() int {
 type StatType uint8
 
 const (
-	Derivative StatType = iota
-	Mean
-	P99
+	Mean StatType = iota
 	Deviation
 )
 
@@ -211,12 +155,8 @@ const (
 func (s *TimeSeries) Stat(st StatType, sr StatRange) float64 {
 	var stat *EWMA
 	switch st {
-	case Derivative:
-		stat = s.derivative
 	case Mean:
 		stat = s.value
-	case P99:
-		stat = s.p99
 	case Deviation:
 		stat = s.deviation
 	}
@@ -241,55 +181,36 @@ func (s *TimeSeries) Mean() float64 {
 	return s.mean
 }
 
-func (s *TimeSeries) Deviation() float64 {
-	if s.RawValueCount() == 0 {
-		return 0
-	}
-	s.ensureSumAD() // Lazy computation
-	return s.sumAD / float64(s.RawValueCount())
-}
-
 type metrics struct {
 	concurrency TimeSeries
 	latency     TimeSeries
 	errors      TimeSeries
-	requests    TimeSeries
 }
 
 func newMetrics(size uint16) *metrics {
 	return &metrics{
-		concurrency: TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
-		latency:     TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
-		errors:      TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
-		requests:    TimeSeries{values: make([]float64, size), _size: size, cursor: 0},
+		concurrency: TimeSeries{values: make([]float64, size), _size: size},
+		latency:     TimeSeries{values: make([]float64, size), _size: size},
+		errors:      TimeSeries{values: make([]float64, size), _size: size},
 	}
 }
 
-func (m *metrics) RecordConcurrency(concurrency float64, t time.Time) {
-	m.concurrency.Record(concurrency, t)
+func (m *metrics) RecordConcurrency(concurrency float64) {
+	m.concurrency.Record(concurrency)
 }
 
-func (m *metrics) RecordLatency(latency float64, t time.Time) {
-	m.latency.Record(latency, t)
+func (m *metrics) RecordLatency(latency float64) {
+	m.latency.Record(latency)
 }
 
-func (m *metrics) RecordErrors(err float64, t time.Time) {
-	m.errors.Record(err, t)
-}
-
-func (m *metrics) RecordRequests(requests float64, t time.Time) {
-	m.requests.Record(requests, t)
-}
-
-func (m *metrics) ConfidenceInterval() float64 {
-	return 0
+func (m *metrics) RecordErrors(err float64) {
+	m.errors.Record(err)
 }
 
 func (m *metrics) Reset() {
 	m.concurrency.ResetBase()
 	m.latency.ResetBase()
 	m.errors.ResetBase()
-	m.requests.ResetBase()
 }
 
 // hasSufficientHistory returns true if EWMA history has been established

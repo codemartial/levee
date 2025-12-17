@@ -147,9 +147,9 @@ func TestMetricsReset(t *testing.T) {
 	}, 100)
 
 	// Record some metrics
-	cb.metrics.RecordLatency(100, time.Now())
-	cb.metrics.RecordErrors(1, time.Now())
-	cb.metrics.RecordConcurrency(5, time.Now())
+	cb.metrics.RecordLatency(100)
+	cb.metrics.RecordErrors(1)
+	cb.metrics.RecordConcurrency(5)
 
 	// Open circuit which should reset metrics
 	cb.OpenCircuit(time.Now())
@@ -203,9 +203,8 @@ func TestEWMACalculation(t *testing.T) {
 	}
 
 	// Record consistent values
-	now := time.Now()
 	for i := 0; i < 100; i++ {
-		ts.Record(100.0, now.Add(time.Duration(i)*time.Second))
+		ts.Record(100.0)
 	}
 
 	// For consistent values, all EWMA values should be close to the input value
@@ -352,9 +351,6 @@ func TestRestoreState(t *testing.T) {
 	if cb.metrics.errors.value == nil {
 		t.Error("Errors value EWMA not restored")
 	}
-	if cb.metrics.requests.value == nil {
-		t.Error("Requests value EWMA not restored")
-	}
 
 	// Verify EWMA values match saved state
 	if cb.metrics.errors.value.base != state.ErrorsValueBase {
@@ -428,21 +424,9 @@ func TestStateRoundTrip(t *testing.T) {
 		t.Error("Concurrency Value EWMAs don't match after round-trip")
 	}
 
-	if state1.LatencyP99Base != state2.LatencyP99Base ||
-		state1.LatencyP99Mid != state2.LatencyP99Mid ||
-		state1.LatencyP99Long != state2.LatencyP99Long {
-		t.Error("Latency P99 EWMAs don't match after round-trip")
-	}
-
 	if state1.ErrorsDeviationBase != state2.ErrorsDeviationBase ||
 		state1.ErrorsDeviationMid != state2.ErrorsDeviationMid ||
 		state1.ErrorsDeviationLong != state2.ErrorsDeviationLong {
 		t.Error("Errors Deviation EWMAs don't match after round-trip")
-	}
-
-	if state1.RequestsDerivBase != state2.RequestsDerivBase ||
-		state1.RequestsDerivMid != state2.RequestsDerivMid ||
-		state1.RequestsDerivLong != state2.RequestsDerivLong {
-		t.Error("Requests Derivative EWMAs don't match after round-trip")
 	}
 }
