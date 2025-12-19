@@ -45,13 +45,13 @@ func TestWarmupPhase(t *testing.T) {
 	// Now make 1001+ successful calls after warmup - these should count
 	// Need enough to trigger transition (>1000 in CLOSED state)
 	for i := 0; i < 1100; i++ {
-		state, err := l.Call(successFunc)
+		sc, err := l.Call(successFunc)
 		if err != nil {
 			t.Errorf("Unexpected error during warmup: %v", err)
 		}
 		// After warmup completes, state should eventually be CLOSED
-		if i == 1099 && state != CLOSED {
-			t.Errorf("Expected CLOSED state after warmup+1000 calls, got %v", state)
+		if i == 1099 && sc.State != CLOSED {
+			t.Errorf("Expected CLOSED state after warmup+1000 calls, got %v", sc.State)
 		}
 	}
 }
@@ -71,8 +71,8 @@ func TestCircuitBreakerFailureThreshold(t *testing.T) {
 	// Complete warmup phase
 	successFunc := func() error { return nil }
 	for i := 0; i < 1001; i++ {
-		s, _ := l.Call(successFunc)
-		if s == CLOSED {
+		sc, _ := l.Call(successFunc)
+		if sc.State == CLOSED {
 			break
 		}
 	}
@@ -82,8 +82,8 @@ func TestCircuitBreakerFailureThreshold(t *testing.T) {
 
 	// Record enough failures to potentially trigger circuit opening
 	for i := 0; i < 100; i++ {
-		state, _ := l.Call(failureFunc)
-		if state == OPEN {
+		sc, _ := l.Call(failureFunc)
+		if sc.State == OPEN {
 			// Circuit should eventually open due to failures
 			return
 		}
@@ -104,8 +104,8 @@ func TestCircuitRecovery(t *testing.T) {
 	// Complete warmup
 	successFunc := func() error { return nil }
 	for i := 0; i < 1001; i++ {
-		state, _ := l.Call(successFunc)
-		if state == CLOSED {
+		sc, _ := l.Call(successFunc)
+		if sc.State == CLOSED {
 			break
 		}
 	}
@@ -113,8 +113,8 @@ func TestCircuitRecovery(t *testing.T) {
 	// Force circuit to open
 	failureFunc := func() error { return errors.New("test error") }
 	for i := 0; i < 300; i++ {
-		state, _ := l.Call(failureFunc)
-		if state == OPEN {
+		sc, _ := l.Call(failureFunc)
+		if sc.State == OPEN {
 			break
 		}
 	}
@@ -122,22 +122,22 @@ func TestCircuitRecovery(t *testing.T) {
 	// Wait for timeout
 	time.Sleep(slo.Timeout)
 
-	if state, err := l.Call(successFunc); state != HALF_OPEN || err != nil {
+	if sc, err := l.Call(successFunc); sc.State != HALF_OPEN || err != nil {
 		t.Errorf("Expected HALF_OPEN state after timeout, got %v", l.State())
 	}
 
 	// Circuit should allow new calls and eventually close if successful
-	var lastState State
+	var lastState StateChange
 	var lastErr error
 
 	for i := 0; i < 100; i++ {
 		lastState, lastErr = l.Call(successFunc)
-		if lastState == CLOSED {
+		if lastState.State == CLOSED {
 			return // Test passed - circuit recovered
 		}
 	}
 
-	t.Errorf("Circuit failed to recover. Last state: %v, Last error: %v", lastState, lastErr)
+	t.Errorf("Circuit failed to recover. Last state: %v, Last error: %v", lastState.State, lastErr)
 }
 
 func TestMetricsReset(t *testing.T) {
@@ -209,11 +209,11 @@ func TestEWMACalculation(t *testing.T) {
 
 	// For consistent values, all EWMA values should be close to the input value
 	tolerance := 1.0
-	if abs(ts.Stat(Mean, Raw)-100.0) > tolerance ||
+	if abs(ts.Stat(Mean, Base)-100.0) > tolerance ||
 		abs(ts.Stat(Mean, Mid)-100.0) > tolerance ||
 		abs(ts.Stat(Mean, Long)-100.0) > tolerance {
 		t.Errorf("EWMA values deviated too much from expected. Base: %f, Mid: %f, Long: %f",
-			ts.Stat(Mean, Raw), ts.Stat(Mean, Mid), ts.Stat(Mean, Long))
+			ts.Stat(Mean, Base), ts.Stat(Mean, Mid), ts.Stat(Mean, Long))
 	}
 }
 
@@ -382,8 +382,8 @@ func TestRestoreState(t *testing.T) {
 	if err != nil {
 		t.Errorf("Restored Levee failed to process request: %v", err)
 	}
-	if resultState != CLOSED {
-		t.Errorf("Restored Levee should be CLOSED, got %d", resultState)
+	if resultState.State != CLOSED {
+		t.Errorf("Restored Levee should be CLOSED, got %d", resultState.State)
 	}
 }
 

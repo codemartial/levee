@@ -21,14 +21,21 @@ const (
 	HALF_OPEN
 )
 
+type Trigger error
+
+type StateChange struct {
+	State   State
+	Trigger Trigger
+}
+
 type ICircuitBreaker interface {
 	// Call executes the given function and returns the state of the circuit breaker and any error
-	Call(func() error) (State, error)
-	Start(time.Time) (State, error)
+	Call(func() error) (StateChange, error)
+	Start(time.Time) (StateChange, error)
 	Success(time.Time, time.Duration) State
 	Fail(time.Time, time.Duration) State
 	State() State
-	StateUpdates() <-chan State
+	StateUpdates() <-chan StateChange
 }
 
 type Levee struct {
@@ -46,7 +53,7 @@ func NewLevee(slo SLO) *Levee {
 	}
 }
 
-func (l *Levee) Start(ts time.Time) (State, error) {
+func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	l.mu.RLock()
 	ready := l.ready
 	cb := l.cb
@@ -118,7 +125,7 @@ func (l *Levee) transitionFromWarmup(wu *WarmupCB) {
 	l.ready = true
 }
 
-func (l *Levee) Call(f func() error) (State, error) {
+func (l *Levee) Call(f func() error) (StateChange, error) {
 	l.mu.RLock()
 	ready := l.ready
 	cb := l.cb
@@ -126,11 +133,11 @@ func (l *Levee) Call(f func() error) (State, error) {
 
 	if !ready {
 		wu := cb.(*WarmupCB)
-		s, err := wu.Call(f)
-		if s == CLOSED {
+		sc, err := wu.Call(f)
+		if sc.State == CLOSED {
 			l.transitionFromWarmup(wu)
 		}
-		return s, err
+		return sc, err
 	}
 	return cb.Call(f)
 }
@@ -139,7 +146,7 @@ func (l *Levee) State() State {
 	return l.cb.State()
 }
 
-func (l *Levee) StateUpdates() <-chan State {
+func (l *Levee) StateUpdates() <-chan StateChange {
 	return l.cb.StateUpdates()
 }
 

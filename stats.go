@@ -147,7 +147,7 @@ const (
 type StatRange uint8
 
 const (
-	Raw StatRange = iota
+	Base StatRange = iota
 	Mid
 	Long
 )
@@ -166,7 +166,7 @@ func (s *TimeSeries) Stat(st StatType, sr StatRange) float64 {
 	}
 
 	switch sr {
-	case Raw:
+	case Base:
 		return stat.base
 	case Mid:
 		return stat.ewmaMid

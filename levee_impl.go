@@ -46,7 +46,7 @@ func (cb *CircuitBreaker) Concurrents() int32 {
 	return atomic.LoadInt32(&cb.concurrents)
 }
 
-func (cb *CircuitBreaker) Start(ts time.Time) (State, error) {
+func (cb *CircuitBreaker) Start(ts time.Time) (StateChange, error) {
 	// START PRE-CALL CHECKS
 	state := cb.State()
 
@@ -55,7 +55,7 @@ func (cb *CircuitBreaker) Start(ts time.Time) (State, error) {
 		timeout := cb.revised_slo.Timeout
 
 		if ts.Sub(lastOpenAt) < timeout {
-			return state, ErrCircuitOpen
+			return StateChange{State: state}, ErrCircuitOpen
 		} else {
 			cb.mu.Lock()
 			cb.state = HALF_OPEN
@@ -68,7 +68,7 @@ func (cb *CircuitBreaker) Start(ts time.Time) (State, error) {
 
 	if state == HALF_OPEN && !cb.allowCall() {
 		cb.RemoveConcurrent()
-		return cb.State(), ErrCircuitHalfOpen
+		return StateChange{State: cb.State()}, ErrCircuitHalfOpen
 	}
 
 	if state == CLOSED && cb.mustOpen() {
@@ -80,7 +80,7 @@ func (cb *CircuitBreaker) Start(ts time.Time) (State, error) {
 	cb.metrics.RecordConcurrency(float64(cb.Concurrents()))
 	cb.mu.Unlock()
 	// START CALL
-	return state, nil
+	return StateChange{State: state}, nil
 }
 
 func (cb *CircuitBreaker) Success(ts time.Time, duration time.Duration) State {
@@ -93,6 +93,7 @@ func (cb *CircuitBreaker) Fail(ts time.Time, duration time.Duration) State {
 
 func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, success bool) State {
 	defer cb.RemoveConcurrent()
+	// END POST-CALL PROCESSING
 
 	errCount := 0.0
 	if !success {
@@ -107,25 +108,24 @@ func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, su
 	if state == HALF_OPEN {
 		switch cb.newState() {
 		case OPEN:
-			return cb.OpenCircuit(ts)
+			return cb.OpenCircuit(ts).State
 		case CLOSED:
-			return cb.CloseCircuit()
+			return cb.CloseCircuit().State
 		default:
 			return state
 		}
 	}
 
-	// END POST-CALL PROCESSING
 	return state
 }
 
-func (cb *CircuitBreaker) Call(f func() error) (State, error) {
+func (cb *CircuitBreaker) Call(f func() error) (StateChange, error) {
 	start := time.Now()
 
 	// Use Start() to perform pre-call checks
-	state, err := cb.Start(start)
+	sc, err := cb.Start(start)
 	if err != nil {
-		return state, err
+		return sc, err
 	}
 
 	// Execute the function
@@ -141,7 +141,7 @@ func (cb *CircuitBreaker) Call(f func() error) (State, error) {
 		resultState = cb.Success(end, duration)
 	}
 
-	return resultState, call_err
+	return StateChange{State: resultState}, call_err
 }
 
 func (cb *CircuitBreaker) allowCall() bool {
@@ -233,34 +233,36 @@ func (cb *CircuitBreaker) mustOpen() bool {
 		return true
 	}
 
-	const latencyFloor = 1.0 // 1 microsecond floor
+	// Trend check: compare live Mean() to Base (last buffer wrap)
+	// If both latency and concurrency are trending down, situation is improving
+	currentLatency := cb.metrics.latency.Mean()
+	baseLatency := cb.metrics.latency.Stat(Mean, Base)
+	currentConcurrency := cb.metrics.concurrency.Mean()
+	baseConcurrency := cb.metrics.concurrency.Stat(Mean, Base)
 
-	// Current window statistics
-	concurrencyMean := cb.metrics.concurrency.Stat(Mean, Raw)
-	latencyMean := cb.metrics.latency.Stat(Mean, Raw)
-	currentRPS := concurrencyMean / max(latencyMean, latencyFloor)
-
-	// Mid-term historical statistics
-	concurrencyMid := cb.metrics.concurrency.Stat(Mean, Mid)
-	latencyMid := cb.metrics.latency.Stat(Mean, Mid)
-	latencyDevMid := cb.metrics.latency.Stat(Deviation, Mid)
-	midRPS := concurrencyMid / max(latencyMid, latencyFloor)
-
-	// Long-term historical statistics
-	concurrencyLong := cb.metrics.concurrency.Stat(Mean, Long)
-	latencyLong := cb.metrics.latency.Stat(Mean, Long)
-	latencyDevLong := cb.metrics.latency.Stat(Deviation, Long)
-	longRPS := concurrencyLong / max(latencyLong, latencyFloor)
+	if currentLatency < baseLatency && currentConcurrency < baseConcurrency {
+		return false
+	}
 
 	// Check against both time horizons
-	midAnomaly := unexpectedLatencySpike(currentRPS, midRPS, latencyMean, latencyMid, latencyDevMid)
-	longAnomaly := unexpectedLatencySpike(currentRPS, longRPS, latencyMean, latencyLong, latencyDevLong)
+	midAnomaly := unexpectedLatencySpike(&cb.metrics, Mid)
+	longAnomaly := unexpectedLatencySpike(&cb.metrics, Long)
 
 	return midAnomaly && longAnomaly
 }
 
-func unexpectedLatencySpike(currentRPS, historicalRPS, currentLatency, historicalLatency, historicalLatencyDev float64) bool {
+func unexpectedLatencySpike(m *metrics, horizon StatRange) bool {
 	const epsilon = 1e-9
+
+	currentLatency := m.latency.Mean()
+	currentConcurrency := m.concurrency.Mean()
+	historicalLatency := m.latency.Stat(Mean, horizon)
+	historicalConcurrency := m.concurrency.Stat(Mean, horizon)
+	historicalLatencyDev := m.latency.Stat(Deviation, horizon)
+
+	// RPS calculation
+	currentRPS := currentConcurrency / max(currentLatency, epsilon)
+	historicalRPS := historicalConcurrency / max(historicalLatency, epsilon)
 
 	// RPS multiplier: how much did traffic change?
 	rpsX := currentRPS / max(historicalRPS, epsilon)
@@ -286,29 +288,29 @@ func unexpectedLatencySpike(currentRPS, historicalRPS, currentLatency, historica
 	return actualLatencyX > threshold
 }
 
-func (cb *CircuitBreaker) OpenCircuit(ts time.Time) State {
+func (cb *CircuitBreaker) OpenCircuit(ts time.Time) StateChange {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	if cb.state == OPEN {
-		return cb.state
+		return StateChange{State: cb.state}
 	}
 	cb.metrics.Reset()
 	cb.state = OPEN
 	cb.lastOpenAt.Store(ts)
-	return cb.state
+	return StateChange{State: cb.state}
 }
 
-func (cb *CircuitBreaker) CloseCircuit() State {
+func (cb *CircuitBreaker) CloseCircuit() StateChange {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	if cb.state == CLOSED {
-		return cb.state
+		return StateChange{State: cb.state}
 	}
 	cb.metrics.Reset()
 	cb.state = CLOSED
-	return cb.state
+	return StateChange{State: cb.state}
 }
 
 func (cb *CircuitBreaker) State() State {
@@ -318,7 +320,7 @@ func (cb *CircuitBreaker) State() State {
 	return cb.state
 }
 
-func (cb *CircuitBreaker) StateUpdates() <-chan State {
+func (cb *CircuitBreaker) StateUpdates() <-chan StateChange {
 	return nil
 }
 
@@ -341,7 +343,7 @@ func NewWarmupCB(slo SLO) *WarmupCB {
 	}
 }
 
-func (cb *WarmupCB) Start(ts time.Time) (State, error) {
+func (cb *WarmupCB) Start(ts time.Time) (StateChange, error) {
 	cb.mu.Lock()
 
 	if cb.start.IsZero() {
@@ -351,14 +353,14 @@ func (cb *WarmupCB) Start(ts time.Time) (State, error) {
 	if cb.state == OPEN {
 		if ts.Sub(cb.lastOpenAt) < cb.slo.Timeout {
 			cb.mu.Unlock()
-			return OPEN, ErrCircuitOpen
+			return StateChange{State: OPEN}, ErrCircuitOpen
 		}
 		// Timeout expired, transition to HALF_OPEN
 		cb.state = HALF_OPEN
 	}
 
 	cb.mu.Unlock()
-	return cb.state, nil
+	return StateChange{State: cb.state}, nil
 }
 
 func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
@@ -446,17 +448,17 @@ func (cb *WarmupCB) State() State {
 	return cb.state
 }
 
-func (cb *WarmupCB) StateUpdates() <-chan State {
+func (cb *WarmupCB) StateUpdates() <-chan StateChange {
 	return nil
 }
 
-func (cb *WarmupCB) Call(f func() error) (State, error) {
+func (cb *WarmupCB) Call(f func() error) (StateChange, error) {
 	start := time.Now()
 
 	// Perform pre-call checks
-	state, err := cb.Start(start)
+	sc, err := cb.Start(start)
 	if err != nil {
-		return state, err
+		return sc, err
 	}
 
 	// Execute the function
@@ -472,5 +474,5 @@ func (cb *WarmupCB) Call(f func() error) (State, error) {
 		resultState = cb.Success(end, duration)
 	}
 
-	return resultState, call_err
+	return StateChange{State: resultState}, call_err
 }
