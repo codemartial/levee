@@ -1,8 +1,25 @@
-package levee
+package benchmarks
 
 import (
+	"github.com/codemartial/levee"
 	"github.com/codemartial/loadgen"
 )
+
+// bauDegradation returns the BAU degradation multiplier for a given hour.
+// This affects both latency and error rates.
+// Phase 1: 1x -> 1.5x between 10 AM spike (hour 10) and 6 PM spike (hour 18)
+// Phase 2: 1.5x -> 3x after 6 PM spike (hours 18-23)
+func bauDegradation(hour int) float64 {
+	if hour < 10 {
+		return 1.0
+	}
+	if hour < 18 {
+		// Linear creep from 1.0 at hour 10 to 1.5 at hour 18
+		return 1.0 + 0.5*float64(hour-10)/8.0
+	}
+	// Linear creep from 1.5 at hour 18 to 3.0 at hour 23
+	return 1.5 + 1.5*float64(hour-18)/5.0
+}
 
 // generateCyberMondayWorkload creates the complete 28-hour Cyber Monday story
 // Starting 4 hours before midnight (8 PM on Sunday) through 24 hours of Cyber Monday
@@ -29,10 +46,10 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 		TimeoutMS:    timeout,
 	})
 
-	// Phase 2: Midnight spike (Hour 0) - 20x spike, backend falls over immediately
+	// Phase 2: Midnight spike (Hour 0) - 15x spike, backend falls over immediately
 	// Under-provisioned backend dies within seconds - CAUSE: traffic spike, EFFECT: errors + latency
 	specs = append(specs, loadgen.LoadSpec{
-		RPM:          20 * baselineRPM, // 20x spike (CAUSE)
+		RPM:          15 * baselineRPM, // 15x spike (CAUSE)
 		ErrorRate:    0.50,             // 50% errors - catastrophic failure (EFFECT)
 		DurationS:    120,              // 2 minutes of peak chaos
 		P50LatencyMS: 500.0,            // 10x slower (EFFECT of overload)
@@ -40,10 +57,10 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 		TimeoutMS:    timeout,
 	})
 
-	// Immediate aftermath - traffic still high, backend dying
+	// Immediate aftermath - retry storm makes it WORSE
 	specs = append(specs, loadgen.LoadSpec{
-		RPM:          15 * baselineRPM, // Still 15x (some users retry)
-		ErrorRate:    0.60,             // Even worse - retry storm
+		RPM:          20 * baselineRPM, // 20x - retry storm amplifies traffic
+		ErrorRate:    0.60,             // Even worse - backend overwhelmed
 		DurationS:    180,              // 3 more minutes
 		P50LatencyMS: 800.0,            // Getting worse
 		P99LatencyMS: 1400.0,
@@ -94,7 +111,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          2 * baselineRPM, // 2x BAU
 		ErrorRate:    healthyErrorRate,
-		DurationS:    2700, // Rest of hour 0 (45 minutes)
+		DurationS:    2400, // Rest of hour 0 (40 minutes) - total hour = 2+3+3+4+5+3+40 = 60 min
 		P50LatencyMS: 60.0,
 		P99LatencyMS: 180.0,
 		TimeoutMS:    timeout,
@@ -109,25 +126,36 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 		bauRPM := bauTraffic * float64(baselineRPM)
 
 		// Top of hour: Sales event spike - backend briefly overwhelmed
-		// Spike is 3-5x of current BAU (not 10-15x, that was too much)
+		// Spike is 3-5x of current BAU
 		spikeMultiplier := 3.0 + 2.0*(float64(hour)/10.0) // 3x-5x of BAU
 		spikeRPM := bauTraffic * spikeMultiplier * float64(baselineRPM)
 
+		// Initial spike - bad but not worst yet
 		specs = append(specs, loadgen.LoadSpec{
-			RPM:          int(spikeRPM),
-			ErrorRate:    0.08, // 8% errors during spike
-			DurationS:    60,   // 1 minute spike
+			RPM:          int(spikeRPM * 0.8), // 80% of peak
+			ErrorRate:    0.06,                // 6% errors
+			DurationS:    60,                  // 1 minute
+			P50LatencyMS: nominalP50 * 2.0,
+			P99LatencyMS: nominalP99 * 3.0,
+			TimeoutMS:    timeout,
+		})
+
+		// Retry storm - things get WORSE before they get better
+		specs = append(specs, loadgen.LoadSpec{
+			RPM:          int(spikeRPM), // Full spike with retries
+			ErrorRate:    0.10,          // 10% errors - worse
+			DurationS:    60,            // 1 minute
 			P50LatencyMS: nominalP50 * 2.5,
 			P99LatencyMS: nominalP99 * 4.0,
 			TimeoutMS:    timeout,
 		})
 
 		// Autoscaler catches up - errors drop, latency normalizes
-		// 4 minute recovery as new instances come online
-		for min := 1; min <= 4; min++ {
-			decayFactor := 1.0 - (0.20 * float64(min)) // Faster decay
+		// 3 minute recovery as new instances come online
+		for min := 1; min <= 3; min++ {
+			decayFactor := 1.0 - (0.25 * float64(min)) // Decay over 3 minutes
 			currentRPM := bauRPM * (1.0 + (spikeMultiplier-1.0)*decayFactor)
-			currentErrors := 0.08 * decayFactor // Errors drop as capacity increases
+			currentErrors := 0.10 * decayFactor // Errors drop as capacity increases
 			if currentErrors < healthyErrorRate {
 				currentErrors = healthyErrorRate
 			}
@@ -146,7 +174,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 		specs = append(specs, loadgen.LoadSpec{
 			RPM:          int(bauRPM),
 			ErrorRate:    healthyErrorRate,
-			DurationS:    55 * 60, // 55 minutes
+			DurationS:    55 * 60, // 55 minutes - total hour = 1+1+3+55 = 60 min
 			P50LatencyMS: nominalP50,
 			P99LatencyMS: nominalP99,
 			TimeoutMS:    timeout,
@@ -158,23 +186,23 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	const hour10BAU = 6.0
 	const hour10BauRPM = hour10BAU * float64(baselineRPM)
 
-	// The massive 10 AM spike - 8x current BAU
+	// Initial 10 AM spike - bad but not worst yet
 	specs = append(specs, loadgen.LoadSpec{
-		RPM:          int(hour10BauRPM * 8.0), // 48x original
-		ErrorRate:    0.30,                    // 30% errors - severe overload
+		RPM:          int(hour10BauRPM * 6.0), // 36x original - initial surge
+		ErrorRate:    0.25,                    // 25% errors
 		DurationS:    120,                     // 2 minutes
-		P50LatencyMS: 600.0,
-		P99LatencyMS: 1300.0,
+		P50LatencyMS: 500.0,
+		P99LatencyMS: 1100.0,
 		TimeoutMS:    timeout,
 	})
 
-	// Still very high traffic, autoscaler scrambling
+	// Retry storm - things get WORSE
 	specs = append(specs, loadgen.LoadSpec{
-		RPM:          int(hour10BauRPM * 6.0),
-		ErrorRate:    0.20, // Improving
-		DurationS:    180,  // 3 minutes
-		P50LatencyMS: 400.0,
-		P99LatencyMS: 1000.0,
+		RPM:          int(hour10BauRPM * 8.0), // 48x original - retry storm peaks
+		ErrorRate:    0.35,                    // 35% errors - worse
+		DurationS:    180,                     // 3 minutes
+		P50LatencyMS: 700.0,
+		P99LatencyMS: 1350.0,
 		TimeoutMS:    timeout,
 	})
 
@@ -202,55 +230,65 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          int(hour10BauRPM),
 		ErrorRate:    healthyErrorRate,
-		DurationS:    44 * 60, // 44 minutes
+		DurationS:    40 * 60, // 40 minutes - total hour = 2+3+5+10+40 = 60 min
 		P50LatencyMS: nominalP50,
 		P99LatencyMS: nominalP99,
 		TimeoutMS:    timeout,
 	})
 
-	// Hours 11-17: Peak traffic holds at 6-8x with gradual latency creep
-	// DB is slowing down as transactions accumulate (latency increases even at same load)
+	// Hours 11-17: Peak traffic holds at 6-8x with gradual degradation
+	// DB is slowing down as transactions accumulate (latency and errors increase)
 	for hour := 11; hour <= 17; hour++ {
-		bauTraffic := 6.0 + 2.0*(float64(hour-11)/7.0)        // 6x -> 8x peak at midday
-		latencyMultiplier := 1.0 + 2.0*(float64(hour-11)/7.0) // Latency creeps to 3x
+		bauTraffic := 6.0 + 2.0*(float64(hour-11)/7.0) // 6x -> 8x peak at midday
+		degradation := bauDegradation(hour)
 		bauRPM := bauTraffic * float64(baselineRPM)
 
-		// Hourly spike (4x of current BAU)
+		// Initial spike - bad but not worst yet
 		specs = append(specs, loadgen.LoadSpec{
-			RPM:          int(bauRPM * 4.0),
-			ErrorRate:    0.06, // 6% errors - mild degradation
+			RPM:          int(bauRPM * 3.2), // 80% of peak
+			ErrorRate:    0.05,              // 5% errors
 			DurationS:    60,
-			P50LatencyMS: nominalP50 * latencyMultiplier * 2.0,
-			P99LatencyMS: nominalP99 * latencyMultiplier * 3.0,
+			P50LatencyMS: nominalP50 * degradation * 1.8,
+			P99LatencyMS: nominalP99 * degradation * 2.5,
 			TimeoutMS:    timeout,
 		})
 
-		// Decay over 4 minutes
-		for min := 1; min <= 4; min++ {
-			decayFactor := 1.0 - (0.20 * float64(min))
+		// Retry storm - things get WORSE
+		specs = append(specs, loadgen.LoadSpec{
+			RPM:          int(bauRPM * 4.0), // Full spike with retries
+			ErrorRate:    0.08,              // 8% errors - worse
+			DurationS:    60,
+			P50LatencyMS: nominalP50 * degradation * 2.0,
+			P99LatencyMS: nominalP99 * degradation * 3.0,
+			TimeoutMS:    timeout,
+		})
+
+		// Decay over 3 minutes
+		for min := 1; min <= 3; min++ {
+			decayFactor := 1.0 - (0.25 * float64(min))
 			currentRPM := bauRPM * (1.0 + 3.0*decayFactor)
-			currentErrors := 0.06 * decayFactor
-			if currentErrors < healthyErrorRate {
-				currentErrors = healthyErrorRate
+			currentErrors := 0.08 * decayFactor
+			if currentErrors < healthyErrorRate*degradation {
+				currentErrors = healthyErrorRate * degradation
 			}
 
 			specs = append(specs, loadgen.LoadSpec{
 				RPM:          int(currentRPM),
 				ErrorRate:    currentErrors,
 				DurationS:    60,
-				P50LatencyMS: nominalP50 * latencyMultiplier * (1 + decayFactor),
-				P99LatencyMS: nominalP99 * latencyMultiplier * (1 + 2*decayFactor),
+				P50LatencyMS: nominalP50 * degradation * (1 + decayFactor),
+				P99LatencyMS: nominalP99 * degradation * (1 + 2*decayFactor),
 				TimeoutMS:    timeout,
 			})
 		}
 
-		// BAU for rest of hour - latency creeping up due to DB slowdown
+		// BAU for rest of hour - degradation creeping up
 		specs = append(specs, loadgen.LoadSpec{
 			RPM:          int(bauRPM),
-			ErrorRate:    healthyErrorRate,
-			DurationS:    55 * 60,
-			P50LatencyMS: nominalP50 * latencyMultiplier,
-			P99LatencyMS: nominalP99 * latencyMultiplier,
+			ErrorRate:    healthyErrorRate * degradation,
+			DurationS:    55 * 60, // 55 minutes - total hour = 1+1+3+55 = 60 min
+			P50LatencyMS: nominalP50 * degradation,
+			P99LatencyMS: nominalP99 * degradation,
 			TimeoutMS:    timeout,
 		})
 	}
@@ -258,25 +296,25 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Hour 18 (6 PM): Second mega-spike with degraded DB
 	const hour18BAU = 8.0
 	const hour18BauRPM = hour18BAU * float64(baselineRPM)
-	const hour18Latency = 3.0 // 3x latency due to DB slowdown
+	hour18Degradation := bauDegradation(18) // 1.5x at hour 18
 
-	// 6 PM spike - 6x current BAU
+	// Initial 6 PM spike - bad but not worst yet
 	specs = append(specs, loadgen.LoadSpec{
-		RPM:          int(hour18BauRPM * 6.0), // 48x original
-		ErrorRate:    0.25,                    // 25% errors - DB is slow
+		RPM:          int(hour18BauRPM * 4.5), // 36x original - initial surge
+		ErrorRate:    0.20,                    // 20% errors
 		DurationS:    120,                     // 2 minutes
-		P50LatencyMS: nominalP50 * hour18Latency * 2.5,
-		P99LatencyMS: nominalP99 * hour18Latency * 3.0,
+		P50LatencyMS: nominalP50 * hour18Degradation * 2.0,
+		P99LatencyMS: nominalP99 * hour18Degradation * 2.5,
 		TimeoutMS:    timeout,
 	})
 
-	// Recovery - autoscaler + DB catching up
+	// Retry storm - things get WORSE
 	specs = append(specs, loadgen.LoadSpec{
-		RPM:          int(hour18BauRPM * 4.0),
-		ErrorRate:    0.15,
-		DurationS:    180, // 3 minutes
-		P50LatencyMS: nominalP50 * hour18Latency * 2.0,
-		P99LatencyMS: nominalP99 * hour18Latency * 2.5,
+		RPM:          int(hour18BauRPM * 6.0), // 48x original - retry storm peaks
+		ErrorRate:    0.30,                    // 30% errors - worse
+		DurationS:    180,                     // 3 minutes
+		P50LatencyMS: nominalP50 * hour18Degradation * 2.5,
+		P99LatencyMS: nominalP99 * hour18Degradation * 3.0,
 		TimeoutMS:    timeout,
 	})
 
@@ -284,51 +322,62 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 		RPM:          int(hour18BauRPM * 2.0),
 		ErrorRate:    0.05,
 		DurationS:    600, // 10 minutes
-		P50LatencyMS: nominalP50 * hour18Latency * 1.5,
-		P99LatencyMS: nominalP99 * hour18Latency * 2.0,
+		P50LatencyMS: nominalP50 * hour18Degradation * 1.5,
+		P99LatencyMS: nominalP99 * hour18Degradation * 2.0,
 		TimeoutMS:    timeout,
 	})
 
 	// Rest of hour 18
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          int(hour18BauRPM),
-		ErrorRate:    healthyErrorRate,
+		ErrorRate:    healthyErrorRate * hour18Degradation,
 		DurationS:    45 * 60, // 45 minutes
-		P50LatencyMS: nominalP50 * hour18Latency,
-		P99LatencyMS: nominalP99 * hour18Latency,
+		P50LatencyMS: nominalP50 * hour18Degradation,
+		P99LatencyMS: nominalP99 * hour18Degradation,
 		TimeoutMS:    timeout,
 	})
 
-	// Hours 19-23: Wind down from 8x to 2x, latency still at 3x (DB still slow)
+	// Hours 19-23: Wind down from 8x to 2x, degradation continues to creep (1.5x -> 3x)
 	for hour := 19; hour <= 23; hour++ {
 		bauTraffic := 8.0 - (6.0 * float64(hour-19) / 5.0) // 8x -> 2x
+		degradation := bauDegradation(hour)
 		bauRPM := bauTraffic * float64(baselineRPM)
 
-		// Hourly spike (3x of current BAU)
+		// Initial spike - bad but not worst yet
 		specs = append(specs, loadgen.LoadSpec{
-			RPM:          int(bauRPM * 3.0),
-			ErrorRate:    0.04, // 4% errors - DB still slow
+			RPM:          int(bauRPM * 2.4), // 80% of peak
+			ErrorRate:    0.03,              // 3% errors
 			DurationS:    60,
-			P50LatencyMS: nominalP50 * hour18Latency * 1.5,
-			P99LatencyMS: nominalP99 * hour18Latency * 2.0,
+			P50LatencyMS: nominalP50 * degradation * 1.3,
+			P99LatencyMS: nominalP99 * degradation * 1.7,
 			TimeoutMS:    timeout,
 		})
 
-		// Decay
-		for min := 1; min <= 4; min++ {
-			decayFactor := 1.0 - (0.20 * float64(min))
+		// Retry storm - things get WORSE
+		specs = append(specs, loadgen.LoadSpec{
+			RPM:          int(bauRPM * 3.0), // Full spike with retries
+			ErrorRate:    0.05,              // 5% errors - worse
+			DurationS:    60,
+			P50LatencyMS: nominalP50 * degradation * 1.5,
+			P99LatencyMS: nominalP99 * degradation * 2.0,
+			TimeoutMS:    timeout,
+		})
+
+		// Decay over 3 minutes
+		for min := 1; min <= 3; min++ {
+			decayFactor := 1.0 - (0.25 * float64(min))
 			currentRPM := bauRPM * (1.0 + 2.0*decayFactor)
-			currentErrors := 0.04 * decayFactor
-			if currentErrors < healthyErrorRate {
-				currentErrors = healthyErrorRate
+			currentErrors := 0.05 * decayFactor
+			if currentErrors < healthyErrorRate*degradation {
+				currentErrors = healthyErrorRate * degradation
 			}
 
 			specs = append(specs, loadgen.LoadSpec{
 				RPM:          int(currentRPM),
 				ErrorRate:    currentErrors,
 				DurationS:    60,
-				P50LatencyMS: nominalP50 * hour18Latency * (1 + 0.5*decayFactor),
-				P99LatencyMS: nominalP99 * hour18Latency * (1 + decayFactor),
+				P50LatencyMS: nominalP50 * degradation * (1 + 0.5*decayFactor),
+				P99LatencyMS: nominalP99 * degradation * (1 + decayFactor),
 				TimeoutMS:    timeout,
 			})
 		}
@@ -336,10 +385,10 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 		// BAU
 		specs = append(specs, loadgen.LoadSpec{
 			RPM:          int(bauRPM),
-			ErrorRate:    healthyErrorRate,
-			DurationS:    55 * 60,
-			P50LatencyMS: nominalP50 * hour18Latency,
-			P99LatencyMS: nominalP99 * hour18Latency,
+			ErrorRate:    healthyErrorRate * degradation,
+			DurationS:    55 * 60, // 55 minutes - total hour = 1+1+3+55 = 60 min
+			P50LatencyMS: nominalP50 * degradation,
+			P99LatencyMS: nominalP99 * degradation,
 			TimeoutMS:    timeout,
 		})
 	}
@@ -347,15 +396,15 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	return specs
 }
 
-func stateString(s State) string {
+func stateString(s levee.State) string {
 	switch s {
-	case INIT:
+	case levee.INIT:
 		return "INIT"
-	case CLOSED:
+	case levee.CLOSED:
 		return "CLOSED"
-	case OPEN:
+	case levee.OPEN:
 		return "OPEN"
-	case HALF_OPEN:
+	case levee.HALF_OPEN:
 		return "HALF_OPEN"
 	default:
 		return "UNKNOWN"

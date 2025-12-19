@@ -1,4 +1,4 @@
-package levee
+package benchmarks
 
 import (
 	"encoding/json"
@@ -8,17 +8,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codemartial/levee"
 	"github.com/codemartial/loadgen"
 )
 
 // PrescientBreaker knows the future from load specs and makes perfect decisions
 type PrescientBreaker struct {
-	slo       SLO
+	slo       levee.SLO
 	specs     []loadgen.LoadSpec
 	startTime time.Time
 }
 
-func NewPrescientBreaker(slo SLO, specs []loadgen.LoadSpec, startTime time.Time) *PrescientBreaker {
+func NewPrescientBreaker(slo levee.SLO, specs []loadgen.LoadSpec, startTime time.Time) *PrescientBreaker {
 	return &PrescientBreaker{
 		slo:       slo,
 		specs:     specs,
@@ -27,17 +28,17 @@ func NewPrescientBreaker(slo SLO, specs []loadgen.LoadSpec, startTime time.Time)
 }
 
 // State returns the ideal state at the given timestamp based on load specs
-func (pb *PrescientBreaker) State(ts time.Time) State {
+func (pb *PrescientBreaker) State(ts time.Time) levee.State {
 	elapsed := ts.Sub(pb.startTime)
 
 	// Skip warmup period - stay INIT
 	if elapsed < pb.slo.Warmup {
-		return INIT
+		return levee.INIT
 	}
 
 	// After warmup, transition to CLOSED
 	if elapsed < pb.slo.Warmup+time.Second {
-		return CLOSED
+		return levee.CLOSED
 	}
 
 	// Find current spec
@@ -47,20 +48,20 @@ func (pb *PrescientBreaker) State(ts time.Time) State {
 		if elapsed < totalDuration+specDuration {
 			// We're in this spec - check if it's healthy according to SLO
 			if spec.ErrorRate > (1.0 - pb.slo.SuccessRate) {
-				return OPEN // Backend is unhealthy
+				return levee.OPEN // Backend is unhealthy
 			}
-			return CLOSED // Backend is healthy
+			return levee.CLOSED // Backend is healthy
 		}
 		totalDuration += specDuration
 	}
 
-	return CLOSED // Default to closed
+	return levee.CLOSED // Default to closed
 }
 
 type StateTransitionWithPrescient struct {
 	Timestamp      time.Time
-	LeveeState     State
-	PrescientState State
+	LeveeState     levee.State
+	PrescientState levee.State
 	Category       string // "false_alarm", "slow_recovery", "late_detection", "proper_recovery"
 }
 
@@ -125,9 +126,15 @@ func (m *PrescientMetrics) Finalize(endTime time.Time) {
 	}
 }
 
-// BenchmarkCyberMondayPrescient runs benchmark against prescient breaker
+// CandidateResult holds benchmark results for a single candidate
+type CandidateResult struct {
+	Name    string
+	Metrics *PrescientMetrics
+}
+
+// BenchmarkCyberMondayPrescient runs benchmark against prescient breaker for all candidates
 func BenchmarkCyberMondayPrescient(b *testing.B) {
-	slo := SLO{
+	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
 		Warmup:      10 * time.Second,
@@ -135,17 +142,249 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 
 	specs := generateCyberMondayWorkload()
 
-	// Full 28-hour Cyber Monday simulation
-	// specs = specs[:9] // Disabled: running full benchmark
-
 	b.Logf("Generated %d load specifications for Cyber Monday simulation", len(specs))
 
-	metrics := runPrescientBenchmark(slo, specs)
-	reportPrescientResults(b, "Levee vs Prescient", metrics)
+	// Run benchmark for each candidate
+	candidates := []struct {
+		name    string
+		breaker levee.ICircuitBreaker
+	}{
+		{"Levee", levee.NewLevee(slo)},
+		{"Static-BAU", NewStaticBAU()},
+		{"Static-Peak", NewStaticPeak()},
+	}
+
+	results := make([]CandidateResult, 0, len(candidates))
+
+	for _, c := range candidates {
+		b.Logf("\n>>> Running benchmark for %s...", c.name)
+		metrics := runCandidateBenchmark(slo, specs, c.breaker)
+		results = append(results, CandidateResult{Name: c.name, Metrics: metrics})
+		reportPrescientResults(b, c.name+" vs Prescient", metrics)
+	}
+
+	// Report comparative summary
+	reportComparativeSummary(b, results)
 }
 
-func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics {
-	levee := NewLevee(slo)
+// runCandidateBenchmark runs the benchmark for a single ICircuitBreaker candidate
+func runCandidateBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker levee.ICircuitBreaker) *PrescientMetrics {
+	metrics := NewPrescientMetrics()
+
+	gen := loadgen.NewLoadGenerator(specs)
+	stream := loadgen.NewEventStream(gen)
+
+	var prescient *PrescientBreaker
+
+	type pendingRequest struct {
+		startTime         time.Time
+		groundTruthResult bool
+		breakerAllowed    bool
+		prescientAllowed  bool
+		breakerState      levee.State
+		prescientState    levee.State
+	}
+	pending := make(map[int64]pendingRequest)
+
+	breakerHasOpened := false
+	var lastEvent loadgen.SimEvent
+	var prevBreakerState levee.State = levee.INIT
+	var prevPrescientState levee.State = levee.INIT
+
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			break
+		}
+		lastEvent = event
+
+		if metrics.StartTime.IsZero() {
+			metrics.StartTime = event.Timestamp
+			prescient = NewPrescientBreaker(slo, specs, event.Timestamp)
+		}
+
+		switch event.Status {
+		case loadgen.EventStart:
+			breakerState, breakerErr := breaker.Start(event.Timestamp)
+			prescientState := prescient.State(event.Timestamp)
+
+			if prescientState != prevPrescientState {
+				if prescientState == levee.CLOSED && prevPrescientState == levee.OPEN {
+					metrics.PrescientLastCloseTime = event.Timestamp
+				}
+				prevPrescientState = prescientState
+			}
+
+			if breakerState != prevBreakerState {
+				var category string
+
+				if breakerState == levee.OPEN && (prevBreakerState == levee.CLOSED || prevBreakerState == levee.INIT) {
+					if prescientState == levee.CLOSED {
+						category = "false_alarm"
+						metrics.FalseAlarms++
+
+						if !metrics.PrescientLastCloseTime.IsZero() {
+							timeSinceClose := event.Timestamp.Sub(metrics.PrescientLastCloseTime)
+							if timeSinceClose < 1*time.Minute {
+								metrics.FalseAlarmsDuringRecovery++
+							} else {
+								metrics.FalseAlarmsOutOfBlue++
+							}
+						} else {
+							metrics.FalseAlarmsOutOfBlue++
+						}
+					} else if prescientState == levee.OPEN {
+						category = "late_detection"
+						metrics.LateDetections++
+					}
+				}
+
+				if breakerState == levee.CLOSED && prevBreakerState != levee.CLOSED && prevBreakerState != levee.INIT {
+					if prescientState == levee.CLOSED {
+						category = "slow_recovery"
+						metrics.SlowRecoveries++
+					} else if prescientState == levee.OPEN {
+						category = "premature_recovery"
+						metrics.PrematureRecoveries++
+					}
+				}
+
+				if category != "" {
+					metrics.LeveeStateTransitions = append(metrics.LeveeStateTransitions, StateTransitionWithPrescient{
+						Timestamp:      event.Timestamp,
+						LeveeState:     breakerState,
+						PrescientState: prescientState,
+						Category:       category,
+					})
+				}
+
+				prevBreakerState = breakerState
+			}
+
+			if prescientState == levee.OPEN && metrics.PrescientFirstOpenTime.IsZero() {
+				metrics.PrescientFirstOpenTime = event.Timestamp
+			}
+			if breakerState == levee.OPEN && metrics.LeveeFirstOpenTime.IsZero() {
+				metrics.LeveeFirstOpenTime = event.Timestamp
+				breakerHasOpened = true
+			}
+
+			if breakerHasOpened && prescientState == levee.CLOSED && metrics.PrescientFirstCloseTime.IsZero() {
+				metrics.PrescientFirstCloseTime = event.Timestamp
+			}
+
+			if breakerHasOpened && breakerState == levee.CLOSED && metrics.LeveeFirstCloseAfterOpen.IsZero() {
+				metrics.LeveeFirstCloseAfterOpen = event.Timestamp
+			}
+
+			breakerAllowed := (breakerErr == nil)
+			prescientAllowed := (prescientState != levee.OPEN)
+
+			if breakerAllowed {
+				metrics.LeveeAllowed++
+			} else {
+				metrics.LeveeBlocked++
+			}
+
+			if prescientAllowed {
+				metrics.PrescientAllowed++
+			} else {
+				metrics.PrescientBlocked++
+			}
+
+			pending[event.EventID] = pendingRequest{
+				startTime:        event.Timestamp,
+				breakerAllowed:   breakerAllowed,
+				prescientAllowed: prescientAllowed,
+				breakerState:     breakerState,
+				prescientState:   prescientState,
+			}
+
+		case loadgen.EventSuccess:
+			req := pending[event.EventID]
+			duration := event.Timestamp.Sub(req.startTime)
+
+			metrics.TotalRequests++
+			metrics.TotalSuccesses++
+
+			if req.breakerAllowed {
+				breaker.Success(event.Timestamp, duration)
+			}
+
+			if req.prescientAllowed && !req.breakerAllowed {
+				metrics.ExtraGoodRequestsBlocked++
+			}
+
+			delete(pending, event.EventID)
+
+		case loadgen.EventError:
+			req := pending[event.EventID]
+			duration := event.Timestamp.Sub(req.startTime)
+
+			metrics.TotalRequests++
+			metrics.TotalFailures++
+
+			if req.breakerAllowed {
+				breaker.Fail(event.Timestamp, duration)
+			}
+
+			if !req.prescientAllowed && req.breakerAllowed {
+				metrics.ExtraBadRequestsAllowed++
+			}
+
+			delete(pending, event.EventID)
+		}
+	}
+
+	metrics.Finalize(lastEvent.Timestamp)
+	return metrics
+}
+
+// reportComparativeSummary prints a comparison of all candidates
+func reportComparativeSummary(b *testing.B, results []CandidateResult) {
+	sep := strings.Repeat("=", 100)
+	b.Logf("\n%s", sep)
+	b.Logf("  COMPARATIVE SUMMARY - All Candidates vs Prescient (Ideal)")
+	b.Logf("%s", sep)
+
+	// Find prescient baseline (first result's prescient metrics)
+	if len(results) == 0 {
+		return
+	}
+	prescientBlocked := results[0].Metrics.PrescientBlocked
+	prescientAllowed := results[0].Metrics.PrescientAllowed
+
+	b.Logf("\n%-15s | %12s | %12s | %10s | %10s | %10s | %12s | %12s",
+		"Candidate", "Blocked", "Allowed", "FalseAlarm", "LateDetect", "SlowRecov", "ExtraBad", "ExtraGood")
+	b.Logf("%s", strings.Repeat("-", 110))
+	b.Logf("%-15s | %12d | %12d | %10s | %10s | %10s | %12s | %12s",
+		"Prescient", prescientBlocked, prescientAllowed, "0", "0", "0", "0", "0")
+
+	for _, r := range results {
+		m := r.Metrics
+		b.Logf("%-15s | %12d | %12d | %10d | %10d | %10d | %12d | %12d",
+			r.Name, m.LeveeBlocked, m.LeveeAllowed, m.FalseAlarms, m.LateDetections, m.SlowRecoveries,
+			m.ExtraBadRequestsAllowed, m.ExtraGoodRequestsBlocked)
+	}
+
+	// Calculate relative performance
+	b.Logf("\n--- Relative Performance (lower is better) ---")
+	b.Logf("%-15s | %12s | %12s | %12s", "Candidate", "Block Delta", "Allow Delta", "Decision Err")
+	b.Logf("%s", strings.Repeat("-", 60))
+
+	for _, r := range results {
+		m := r.Metrics
+		blockDelta := m.LeveeBlocked - prescientBlocked
+		allowDelta := m.LeveeAllowed - prescientAllowed
+		decisionErr := m.ExtraBadRequestsAllowed + m.ExtraGoodRequestsBlocked
+		b.Logf("%-15s | %+12d | %+12d | %12d", r.Name, blockDelta, allowDelta, decisionErr)
+	}
+
+	b.Logf("\n%s", sep)
+}
+
+func runPrescientBenchmark(slo levee.SLO, specs []loadgen.LoadSpec) *PrescientMetrics {
+	lev := levee.NewLevee(slo)
 	metrics := NewPrescientMetrics()
 
 	gen := loadgen.NewLoadGenerator(specs)
@@ -160,15 +399,15 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 		groundTruthResult bool // true = success, false = failure
 		leveeAllowed      bool
 		prescientAllowed  bool
-		leveeState        State
-		prescientState    State
+		leveeState        levee.State
+		prescientState    levee.State
 	}
 	pending := make(map[int64]pendingRequest)
 
 	leveeHasOpened := false
 	var lastEvent loadgen.SimEvent
-	var prevLeveeState State = INIT
-	var prevPrescientState State = INIT
+	var prevLeveeState levee.State = levee.INIT
+	var prevPrescientState levee.State = levee.INIT
 
 	for {
 		event, err := stream.Next()
@@ -185,12 +424,12 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 		switch event.Status {
 		case loadgen.EventStart:
 			// Get states
-			leveeState, leveeErr := levee.Start(event.Timestamp)
+			leveeState, leveeErr := lev.Start(event.Timestamp)
 			prescientState := prescient.State(event.Timestamp)
 
 			// Track prescient state changes to detect when it closes
 			if prescientState != prevPrescientState {
-				if prescientState == CLOSED && prevPrescientState == OPEN {
+				if prescientState == levee.CLOSED && prevPrescientState == levee.OPEN {
 					metrics.PrescientLastCloseTime = event.Timestamp
 				}
 				prevPrescientState = prescientState
@@ -202,8 +441,8 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 				var category string
 
 				// Track CLOSED -> OPEN (opening the circuit)
-				if leveeState == OPEN && (prevLeveeState == CLOSED || prevLeveeState == INIT) {
-					if prescientState == CLOSED {
+				if leveeState == levee.OPEN && (prevLeveeState == levee.CLOSED || prevLeveeState == levee.INIT) {
+					if prescientState == levee.CLOSED {
 						category = "false_alarm"
 						metrics.FalseAlarms++
 
@@ -221,7 +460,7 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 							// Prescient hasn't even opened yet - definitely out of blue
 							metrics.FalseAlarmsOutOfBlue++
 						}
-					} else if prescientState == OPEN {
+					} else if prescientState == levee.OPEN {
 						category = "late_detection"
 						metrics.LateDetections++
 					}
@@ -229,11 +468,11 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 
 				// Track OPEN -> CLOSED (closing the circuit, via HALF_OPEN)
 				// Note: direct transition is OPEN -> HALF_OPEN -> CLOSED, so we track the final CLOSED
-				if leveeState == CLOSED && prevLeveeState != CLOSED && prevLeveeState != INIT {
-					if prescientState == CLOSED {
+				if leveeState == levee.CLOSED && prevLeveeState != levee.CLOSED && prevLeveeState != levee.INIT {
+					if prescientState == levee.CLOSED {
 						category = "slow_recovery"
 						metrics.SlowRecoveries++
-					} else if prescientState == OPEN {
+					} else if prescientState == levee.OPEN {
 						category = "premature_recovery" // risky!
 						metrics.PrematureRecoveries++
 					}
@@ -252,26 +491,26 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 			}
 
 			// Track first opens
-			if prescientState == OPEN && metrics.PrescientFirstOpenTime.IsZero() {
+			if prescientState == levee.OPEN && metrics.PrescientFirstOpenTime.IsZero() {
 				metrics.PrescientFirstOpenTime = event.Timestamp
 			}
-			if leveeState == OPEN && metrics.LeveeFirstOpenTime.IsZero() {
+			if leveeState == levee.OPEN && metrics.LeveeFirstOpenTime.IsZero() {
 				metrics.LeveeFirstOpenTime = event.Timestamp
 				leveeHasOpened = true
 			}
 
 			// Track first close after open for prescient
-			if leveeHasOpened && prescientState == CLOSED && metrics.PrescientFirstCloseTime.IsZero() {
+			if leveeHasOpened && prescientState == levee.CLOSED && metrics.PrescientFirstCloseTime.IsZero() {
 				metrics.PrescientFirstCloseTime = event.Timestamp
 			}
 
 			// Track first close after open for levee
-			if leveeHasOpened && leveeState == CLOSED && metrics.LeveeFirstCloseAfterOpen.IsZero() {
+			if leveeHasOpened && leveeState == levee.CLOSED && metrics.LeveeFirstCloseAfterOpen.IsZero() {
 				metrics.LeveeFirstCloseAfterOpen = event.Timestamp
 			}
 
 			leveeAllowed := (leveeErr == nil)
-			prescientAllowed := (prescientState != OPEN)
+			prescientAllowed := (prescientState != levee.OPEN)
 
 			if leveeAllowed {
 				metrics.LeveeAllowed++
@@ -307,7 +546,7 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 
 			// Report to Levee
 			if req.leveeAllowed {
-				levee.Success(event.Timestamp, duration)
+				lev.Success(event.Timestamp, duration)
 			}
 
 			// Compare against prescient
@@ -331,7 +570,7 @@ func runPrescientBenchmark(slo SLO, specs []loadgen.LoadSpec) *PrescientMetrics 
 
 			// Report to Levee
 			if req.leveeAllowed {
-				levee.Fail(event.Timestamp, duration)
+				lev.Fail(event.Timestamp, duration)
 			}
 
 			// Compare against prescient
@@ -503,8 +742,8 @@ func saveTransitionLog(m *PrescientMetrics) {
 }
 
 // buildLeveeStateUntil feeds events to Levee until the specified time offset
-func buildLeveeStateUntil(slo SLO, specs []loadgen.LoadSpec, untilOffset time.Duration) *Levee {
-	levee := NewLevee(slo)
+func buildLeveeStateUntil(slo levee.SLO, specs []loadgen.LoadSpec, untilOffset time.Duration) *levee.Levee {
+	lev := levee.NewLevee(slo)
 	gen := loadgen.NewLoadGenerator(specs)
 	stream := loadgen.NewEventStream(gen)
 
@@ -532,32 +771,32 @@ func buildLeveeStateUntil(slo SLO, specs []loadgen.LoadSpec, untilOffset time.Du
 
 		switch event.Status {
 		case loadgen.EventStart:
-			if _, err := levee.Start(event.Timestamp); err == nil {
+			if _, err := lev.Start(event.Timestamp); err == nil {
 				pending[event.EventID] = pendingRequest{startTime: event.Timestamp}
 			}
 		case loadgen.EventSuccess:
 			req := pending[event.EventID]
 			duration := event.Timestamp.Sub(req.startTime)
 			if _, ok := pending[event.EventID]; ok {
-				levee.Success(event.Timestamp, duration)
+				lev.Success(event.Timestamp, duration)
 				delete(pending, event.EventID)
 			}
 		case loadgen.EventError:
 			req := pending[event.EventID]
 			duration := event.Timestamp.Sub(req.startTime)
 			if _, ok := pending[event.EventID]; ok {
-				levee.Fail(event.Timestamp, duration)
+				lev.Fail(event.Timestamp, duration)
 				delete(pending, event.EventID)
 			}
 		}
 	}
 
-	return levee
+	return lev
 }
 
 // BenchmarkGenerateLeveeState builds Levee state up to h+03:59 and saves to file
 func BenchmarkGenerateLeveeState(b *testing.B) {
-	slo := SLO{
+	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
 		Warmup:      10 * time.Second,
@@ -592,9 +831,76 @@ func BenchmarkGenerateLeveeState(b *testing.B) {
 	b.Logf("Successfully saved Levee state to levee_state_h03_59.json")
 }
 
+// BenchmarkGenerateStateForFalseAlarmDebug builds Levee state up to h+04:59 for debugging false alarms
+func BenchmarkGenerateStateForFalseAlarmDebug(b *testing.B) {
+	slo := levee.SLO{
+		SuccessRate: 0.90,
+		Timeout:     1500 * time.Millisecond,
+		Warmup:      10 * time.Second,
+	}
+
+	specs := generateCyberMondayWorkload()
+
+	b.Logf("Building Levee state until h+04:59...")
+	leveeAtCutoff := buildLeveeStateUntil(slo, specs, 4*time.Hour+59*time.Minute)
+
+	b.Logf("Levee state at h+04:59: %s", stateString(leveeAtCutoff.State()))
+
+	savedState, err := leveeAtCutoff.SaveState()
+	if err != nil {
+		b.Fatalf("Failed to save Levee state: %v", err)
+	}
+	if savedState == nil {
+		b.Fatalf("Saved state is nil - Levee may not be in CLOSED state or still in warmup")
+	}
+
+	// Save to file
+	data, err := json.MarshalIndent(savedState, "", "  ")
+	if err != nil {
+		b.Fatalf("Failed to marshal state: %v", err)
+	}
+
+	err = os.WriteFile("levee_state_h04_59.json", data, 0644)
+	if err != nil {
+		b.Fatalf("Failed to write state file: %v", err)
+	}
+
+	b.Logf("Successfully saved Levee state to levee_state_h04_59.json")
+}
+
+// BenchmarkFalseAlarmDebug runs a focused benchmark around h+05:00 to h+05:30 where first false alarms occur
+func BenchmarkFalseAlarmDebug(b *testing.B) {
+	slo := levee.SLO{
+		SuccessRate: 0.90,
+		Timeout:     1500 * time.Millisecond,
+		Warmup:      10 * time.Second,
+	}
+
+	specs := generateCyberMondayWorkload()
+
+	// Load saved state from file
+	data, err := os.ReadFile("levee_state_h04_59.json")
+	if err != nil {
+		b.Fatalf("Failed to read state file: %v. Run BenchmarkGenerateStateForFalseAlarmDebug first.", err)
+	}
+
+	var savedState levee.LeveeState
+	err = json.Unmarshal(data, &savedState)
+	if err != nil {
+		b.Fatalf("Failed to unmarshal state: %v", err)
+	}
+
+	b.Logf("Loaded Levee state from file")
+	b.Logf("State buffer size: %d, Error EWMA base: %.4f", savedState.BufferSize, savedState.ErrorsValueBase)
+
+	// Run the truncated benchmark from h+05:00 to h+05:30 (where first false alarms occur)
+	metrics := runTruncatedPrescientBenchmark(b, slo, specs, &savedState, 5*time.Hour, 5*time.Hour+30*time.Minute)
+	reportPrescientResults(b, "Levee vs Prescient (h+05:00 to h+05:30) - False Alarm Debug", metrics)
+}
+
 // BenchmarkCyberMondayPrescientTruncated runs truncated benchmark from h+04:00 to h+04:10
 func BenchmarkTruncated(b *testing.B) {
-	slo := SLO{
+	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
 		Warmup:      10 * time.Second,
@@ -608,7 +914,7 @@ func BenchmarkTruncated(b *testing.B) {
 		b.Fatalf("Failed to read state file: %v. Run BenchmarkGenerateLeveeState first.", err)
 	}
 
-	var savedState LeveeState
+	var savedState levee.LeveeState
 	err = json.Unmarshal(data, &savedState)
 	if err != nil {
 		b.Fatalf("Failed to unmarshal state: %v", err)
@@ -622,8 +928,8 @@ func BenchmarkTruncated(b *testing.B) {
 }
 
 // runTruncatedPrescientBenchmark runs benchmark in a specific time window using restored state
-func runTruncatedPrescientBenchmark(b *testing.B, slo SLO, specs []loadgen.LoadSpec, savedState *LeveeState, startOffset, endOffset time.Duration) *PrescientMetrics {
-	levee := RestoreState(savedState)
+func runTruncatedPrescientBenchmark(b *testing.B, slo levee.SLO, specs []loadgen.LoadSpec, savedState *levee.LeveeState, startOffset, endOffset time.Duration) *PrescientMetrics {
+	lev := levee.RestoreState(savedState)
 
 	metrics := NewPrescientMetrics()
 	gen := loadgen.NewLoadGenerator(specs)
@@ -641,8 +947,8 @@ func runTruncatedPrescientBenchmark(b *testing.B, slo SLO, specs []loadgen.LoadS
 
 	leveeHasOpened := false
 	var lastEvent loadgen.SimEvent
-	var prevLeveeState State = levee.State()
-	var prevPrescientState State = INIT
+	var prevLeveeState levee.State = lev.State()
+	var prevPrescientState levee.State = levee.INIT
 
 	// Skip to start offset
 	for {
@@ -679,11 +985,11 @@ func runTruncatedPrescientBenchmark(b *testing.B, slo SLO, specs []loadgen.LoadS
 
 		switch event.Status {
 		case loadgen.EventStart:
-			leveeState, leveeErr := levee.Start(event.Timestamp)
+			leveeState, leveeErr := lev.Start(event.Timestamp)
 			prescientState := prescient.State(event.Timestamp)
 
 			if prescientState != prevPrescientState {
-				if prescientState == CLOSED && prevPrescientState == OPEN {
+				if prescientState == levee.CLOSED && prevPrescientState == levee.OPEN {
 					metrics.PrescientLastCloseTime = event.Timestamp
 				}
 				prevPrescientState = prescientState
@@ -691,20 +997,20 @@ func runTruncatedPrescientBenchmark(b *testing.B, slo SLO, specs []loadgen.LoadS
 
 			if leveeState != prevLeveeState {
 				var category string
-				if leveeState == OPEN && (prevLeveeState == CLOSED || prevLeveeState == INIT) {
-					if prescientState == CLOSED {
+				if leveeState == levee.OPEN && (prevLeveeState == levee.CLOSED || prevLeveeState == levee.INIT) {
+					if prescientState == levee.CLOSED {
 						category = "false_alarm"
 						metrics.FalseAlarms++
-					} else if prescientState == OPEN {
+					} else if prescientState == levee.OPEN {
 						category = "late_detection"
 						metrics.LateDetections++
 					}
 				}
-				if leveeState == CLOSED && prevLeveeState != CLOSED && prevLeveeState != INIT {
-					if prescientState == CLOSED {
+				if leveeState == levee.CLOSED && prevLeveeState != levee.CLOSED && prevLeveeState != levee.INIT {
+					if prescientState == levee.CLOSED {
 						category = "slow_recovery"
 						metrics.SlowRecoveries++
-					} else if prescientState == OPEN {
+					} else if prescientState == levee.OPEN {
 						category = "premature_recovery"
 						metrics.PrematureRecoveries++
 					}
@@ -720,22 +1026,22 @@ func runTruncatedPrescientBenchmark(b *testing.B, slo SLO, specs []loadgen.LoadS
 				prevLeveeState = leveeState
 			}
 
-			if prescientState == OPEN && metrics.PrescientFirstOpenTime.IsZero() {
+			if prescientState == levee.OPEN && metrics.PrescientFirstOpenTime.IsZero() {
 				metrics.PrescientFirstOpenTime = event.Timestamp
 			}
-			if leveeState == OPEN && metrics.LeveeFirstOpenTime.IsZero() {
+			if leveeState == levee.OPEN && metrics.LeveeFirstOpenTime.IsZero() {
 				metrics.LeveeFirstOpenTime = event.Timestamp
 				leveeHasOpened = true
 			}
-			if leveeHasOpened && prescientState == CLOSED && metrics.PrescientFirstCloseTime.IsZero() {
+			if leveeHasOpened && prescientState == levee.CLOSED && metrics.PrescientFirstCloseTime.IsZero() {
 				metrics.PrescientFirstCloseTime = event.Timestamp
 			}
-			if leveeHasOpened && leveeState == CLOSED && metrics.LeveeFirstCloseAfterOpen.IsZero() {
+			if leveeHasOpened && leveeState == levee.CLOSED && metrics.LeveeFirstCloseAfterOpen.IsZero() {
 				metrics.LeveeFirstCloseAfterOpen = event.Timestamp
 			}
 
 			leveeAllowed := (leveeErr == nil)
-			prescientAllowed := (prescientState != OPEN)
+			prescientAllowed := (prescientState != levee.OPEN)
 
 			if leveeAllowed {
 				metrics.LeveeAllowed++
@@ -761,7 +1067,7 @@ func runTruncatedPrescientBenchmark(b *testing.B, slo SLO, specs []loadgen.LoadS
 			metrics.TotalSuccesses++
 
 			if req.leveeAllowed {
-				levee.Success(event.Timestamp, duration)
+				lev.Success(event.Timestamp, duration)
 			}
 			if req.prescientAllowed && !req.leveeAllowed {
 				metrics.ExtraGoodRequestsBlocked++
@@ -775,7 +1081,7 @@ func runTruncatedPrescientBenchmark(b *testing.B, slo SLO, specs []loadgen.LoadS
 			metrics.TotalFailures++
 
 			if req.leveeAllowed {
-				levee.Fail(event.Timestamp, duration)
+				lev.Fail(event.Timestamp, duration)
 			}
 			if !req.prescientAllowed && req.leveeAllowed {
 				metrics.ExtraBadRequestsAllowed++
