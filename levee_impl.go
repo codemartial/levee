@@ -23,6 +23,21 @@ var (
 	ErrCircuitHalfOpen = errors.New("circuit is half open")
 )
 
+// Trigger constants for state changes
+var (
+	TriggerNone              Trigger = triggerError("no state change")
+	TriggerSLOViolation      Trigger = triggerError("SLO violation")
+	TriggerLatencyAnomaly    Trigger = triggerError("latency anomaly")
+	TriggerRecoverySucceeded Trigger = triggerError("recovery succeeded")
+	TriggerRecoveryFailed    Trigger = triggerError("recovery failed")
+	TriggerTimeoutExpired    Trigger = triggerError("timeout expired")
+	TriggerWarmupComplete    Trigger = triggerError("warmup complete")
+)
+
+type triggerError string
+
+func (e triggerError) Error() string { return string(e) }
+
 func NewCircuitBreaker(slo SLO, size uint16) *CircuitBreaker {
 	cb := &CircuitBreaker{
 		stated_slo:  slo,
@@ -49,49 +64,55 @@ func (cb *CircuitBreaker) Concurrents() int32 {
 func (cb *CircuitBreaker) Start(ts time.Time) (StateChange, error) {
 	// START PRE-CALL CHECKS
 	state := cb.State()
+	trigger := TriggerNone
 
 	if state == OPEN {
 		lastOpenAt := cb.lastOpenAt.Load().(time.Time)
 		timeout := cb.revised_slo.Timeout
 
 		if ts.Sub(lastOpenAt) < timeout {
-			return StateChange{State: state}, ErrCircuitOpen
-		} else {
-			cb.mu.Lock()
-			cb.state = HALF_OPEN
-			state = cb.state
-			cb.mu.Unlock()
+			return StateChange{State: state, Trigger: TriggerNone}, ErrCircuitOpen
 		}
+		cb.mu.Lock()
+		cb.state = HALF_OPEN
+		state = cb.state
+		trigger = TriggerTimeoutExpired
+		cb.mu.Unlock()
+		// State changed OPEN -> HALF_OPEN, continue processing
 	}
 
 	cb.AddConcurrent()
 
 	if state == HALF_OPEN && !cb.allowCall() {
 		cb.RemoveConcurrent()
-		return StateChange{State: cb.State()}, ErrCircuitHalfOpen
+		return StateChange{State: cb.State(), Trigger: trigger}, ErrCircuitHalfOpen
 	}
 
-	if state == CLOSED && cb.mustOpen() {
-		cb.RemoveConcurrent()
-		return cb.OpenCircuit(ts), ErrCircuitOpen
+	if state == CLOSED {
+		shouldOpen, openTrigger := cb.mustOpen()
+		if shouldOpen {
+			cb.RemoveConcurrent()
+			cb.OpenCircuit(ts)
+			return StateChange{State: OPEN, Trigger: openTrigger}, ErrCircuitOpen
+		}
 	}
 
 	cb.mu.Lock()
 	cb.metrics.RecordConcurrency(float64(cb.Concurrents()))
 	cb.mu.Unlock()
 	// START CALL
-	return StateChange{State: state}, nil
+	return StateChange{State: state, Trigger: trigger}, nil
 }
 
-func (cb *CircuitBreaker) Success(ts time.Time, duration time.Duration) State {
+func (cb *CircuitBreaker) Success(ts time.Time, duration time.Duration) StateChange {
 	return cb.processResult(ts, duration, true)
 }
 
-func (cb *CircuitBreaker) Fail(ts time.Time, duration time.Duration) State {
+func (cb *CircuitBreaker) Fail(ts time.Time, duration time.Duration) StateChange {
 	return cb.processResult(ts, duration, false)
 }
 
-func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, success bool) State {
+func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, success bool) StateChange {
 	defer cb.RemoveConcurrent()
 	// END POST-CALL PROCESSING
 
@@ -106,17 +127,20 @@ func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, su
 
 	state := cb.State()
 	if state == HALF_OPEN {
-		switch cb.newState() {
+		newState, trigger := cb.newState()
+		switch newState {
 		case OPEN:
-			return cb.OpenCircuit(ts).State
+			cb.OpenCircuit(ts)
+			return StateChange{State: OPEN, Trigger: trigger}
 		case CLOSED:
-			return cb.CloseCircuit().State
+			cb.CloseCircuit()
+			return StateChange{State: CLOSED, Trigger: trigger}
 		default:
-			return state
+			return StateChange{State: state, Trigger: trigger}
 		}
 	}
 
-	return state
+	return StateChange{State: state, Trigger: TriggerNone}
 }
 
 func (cb *CircuitBreaker) Call(f func() error) (StateChange, error) {
@@ -133,15 +157,11 @@ func (cb *CircuitBreaker) Call(f func() error) (StateChange, error) {
 	end := time.Now()
 	duration := end.Sub(start)
 
-	// Use Success() or Fail() to process the result
-	var resultState State
+	// Process the result
 	if call_err != nil {
-		resultState = cb.Fail(end, duration)
-	} else {
-		resultState = cb.Success(end, duration)
+		return cb.Fail(end, duration), call_err
 	}
-
-	return StateChange{State: resultState}, call_err
+	return cb.Success(end, duration), call_err
 }
 
 func (cb *CircuitBreaker) allowCall() bool {
@@ -163,19 +183,19 @@ func (cb *CircuitBreaker) allowCall() bool {
 	return cb.concurrents <= allowedConcurrency
 }
 
-func (cb *CircuitBreaker) newState() State {
+func (cb *CircuitBreaker) newState() (State, Trigger) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 
 	if cb.state != HALF_OPEN {
-		return cb.state
+		return cb.state, TriggerNone
 	}
 
 	const minSamples = 10
 	n := float64(cb.metrics.errors.RawValueCount())
 
 	if n < minSamples {
-		return HALF_OPEN
+		return HALF_OPEN, TriggerNone
 	}
 
 	rawErrorRate := cb.metrics.errors.Mean()
@@ -195,23 +215,23 @@ func (cb *CircuitBreaker) newState() State {
 	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
 
 	if upperBound < requiredSuccessRate {
-		return OPEN
+		return OPEN, TriggerRecoveryFailed
 	}
 
 	if lowerBound >= requiredSuccessRate {
-		return CLOSED
+		return CLOSED, TriggerRecoverySucceeded
 	}
 
 	// Not enough confidence yet, keep testing
-	return HALF_OPEN
+	return HALF_OPEN, TriggerNone
 }
 
-func (cb *CircuitBreaker) mustOpen() bool {
+func (cb *CircuitBreaker) mustOpen() (bool, Trigger) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 
 	if !cb.metrics.hasSufficientHistory() {
-		return false
+		return false, TriggerNone
 	}
 
 	n := float64(cb.metrics.errors.RawValueCount())
@@ -230,7 +250,7 @@ func (cb *CircuitBreaker) mustOpen() bool {
 	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
 
 	if upperBound < cb.stated_slo.SuccessRate {
-		return true
+		return true, TriggerSLOViolation
 	}
 
 	// Trend check: compare live Mean() to Base (last buffer wrap)
@@ -241,14 +261,17 @@ func (cb *CircuitBreaker) mustOpen() bool {
 	baseConcurrency := cb.metrics.concurrency.Stat(Mean, Base)
 
 	if currentLatency < baseLatency && currentConcurrency < baseConcurrency {
-		return false
+		return false, TriggerNone
 	}
 
 	// Check against both time horizons
 	midAnomaly := unexpectedLatencySpike(&cb.metrics, Mid)
 	longAnomaly := unexpectedLatencySpike(&cb.metrics, Long)
 
-	return midAnomaly && longAnomaly
+	if midAnomaly && longAnomaly {
+		return true, TriggerLatencyAnomaly
+	}
+	return false, TriggerNone
 }
 
 func unexpectedLatencySpike(m *metrics, horizon StatRange) bool {
@@ -288,29 +311,27 @@ func unexpectedLatencySpike(m *metrics, horizon StatRange) bool {
 	return actualLatencyX > threshold
 }
 
-func (cb *CircuitBreaker) OpenCircuit(ts time.Time) StateChange {
+func (cb *CircuitBreaker) OpenCircuit(ts time.Time) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	if cb.state == OPEN {
-		return StateChange{State: cb.state}
+		return
 	}
 	cb.metrics.Reset()
 	cb.state = OPEN
 	cb.lastOpenAt.Store(ts)
-	return StateChange{State: cb.state}
 }
 
-func (cb *CircuitBreaker) CloseCircuit() StateChange {
+func (cb *CircuitBreaker) CloseCircuit() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	if cb.state == CLOSED {
-		return StateChange{State: cb.state}
+		return
 	}
 	cb.metrics.Reset()
 	cb.state = CLOSED
-	return StateChange{State: cb.state}
 }
 
 func (cb *CircuitBreaker) State() State {
@@ -350,24 +371,27 @@ func (cb *WarmupCB) Start(ts time.Time) (StateChange, error) {
 		cb.start = ts
 	}
 
+	trigger := TriggerNone
 	if cb.state == OPEN {
 		if ts.Sub(cb.lastOpenAt) < cb.slo.Timeout {
 			cb.mu.Unlock()
-			return StateChange{State: OPEN}, ErrCircuitOpen
+			return StateChange{State: OPEN, Trigger: TriggerNone}, ErrCircuitOpen
 		}
 		// Timeout expired, transition to HALF_OPEN
 		cb.state = HALF_OPEN
+		trigger = TriggerTimeoutExpired
 	}
 
 	cb.mu.Unlock()
-	return StateChange{State: cb.state}, nil
+	return StateChange{State: cb.state, Trigger: trigger}, nil
 }
 
-func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
+func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) StateChange {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	cb.successCount++
+	trigger := TriggerNone
 
 	// Only count requests after warmup period in CLOSED state
 	if ts.Sub(cb.start) > cb.slo.Warmup && cb.state == CLOSED {
@@ -387,11 +411,13 @@ func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
 				cb.successCount = 0
 				cb.failureCount = 0
 				cb.reqCount = 0 // Reset count when entering CLOSED from HALF_OPEN
+				trigger = TriggerRecoverySucceeded
 			} else {
 				cb.state = OPEN
 				cb.lastOpenAt = ts
 				cb.successCount = 0
 				cb.failureCount = 0
+				trigger = TriggerRecoveryFailed
 			}
 		}
 	} else if cb.state == INIT {
@@ -401,17 +427,19 @@ func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) State {
 			cb.successCount = 0
 			cb.failureCount = 0
 			cb.reqCount = 0 // Reset count when entering CLOSED from INIT
+			trigger = TriggerWarmupComplete
 		}
 	}
 
-	return cb.state
+	return StateChange{State: cb.state, Trigger: trigger}
 }
 
-func (cb *WarmupCB) Fail(ts time.Time, duration time.Duration) State {
+func (cb *WarmupCB) Fail(ts time.Time, duration time.Duration) StateChange {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	cb.failureCount++
+	trigger := TriggerNone
 
 	// Count requests after warmup period in CLOSED state (failures count too)
 	if ts.Sub(cb.start) > cb.slo.Warmup && cb.state == CLOSED {
@@ -432,6 +460,7 @@ func (cb *WarmupCB) Fail(ts time.Time, duration time.Duration) State {
 			cb.lastOpenAt = ts
 			cb.successCount = 0
 			cb.failureCount = 0
+			trigger = TriggerSLOViolation
 			// Reset reqCount when transitioning OUT of CLOSED
 			if prevState == CLOSED {
 				cb.reqCount = 0
@@ -439,7 +468,7 @@ func (cb *WarmupCB) Fail(ts time.Time, duration time.Duration) State {
 		}
 	}
 
-	return cb.state
+	return StateChange{State: cb.state, Trigger: trigger}
 }
 
 func (cb *WarmupCB) State() State {
@@ -467,12 +496,8 @@ func (cb *WarmupCB) Call(f func() error) (StateChange, error) {
 	duration := end.Sub(start)
 
 	// Process the result
-	var resultState State
 	if call_err != nil {
-		resultState = cb.Fail(end, duration)
-	} else {
-		resultState = cb.Success(end, duration)
+		return cb.Fail(end, duration), call_err
 	}
-
-	return StateChange{State: resultState}, call_err
+	return cb.Success(end, duration), call_err
 }

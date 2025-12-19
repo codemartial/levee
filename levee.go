@@ -32,8 +32,8 @@ type ICircuitBreaker interface {
 	// Call executes the given function and returns the state of the circuit breaker and any error
 	Call(func() error) (StateChange, error)
 	Start(time.Time) (StateChange, error)
-	Success(time.Time, time.Duration) State
-	Fail(time.Time, time.Duration) State
+	Success(time.Time, time.Duration) StateChange
+	Fail(time.Time, time.Duration) StateChange
 	State() State
 	StateUpdates() <-chan StateChange
 }
@@ -65,15 +65,15 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	return cb.Start(ts)
 }
 
-func (l *Levee) Success(ts time.Time, duration time.Duration) State {
+func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	return l.processResult(ts, duration, true)
 }
 
-func (l *Levee) Fail(ts time.Time, duration time.Duration) State {
+func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 	return l.processResult(ts, duration, false)
 }
 
-func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool) State {
+func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool) StateChange {
 	l.mu.RLock()
 	ready := l.ready
 	cb := l.cb
@@ -81,16 +81,16 @@ func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool
 
 	if !ready {
 		wu := cb.(*WarmupCB)
-		var s State
+		var sc StateChange
 		if success {
-			s = wu.Success(ts, duration)
+			sc = wu.Success(ts, duration)
 		} else {
-			s = wu.Fail(ts, duration)
+			sc = wu.Fail(ts, duration)
 		}
-		if s == CLOSED {
+		if sc.State == CLOSED {
 			l.transitionFromWarmup(wu)
 		}
-		return s
+		return sc
 	}
 
 	if success {
