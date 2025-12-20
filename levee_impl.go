@@ -78,7 +78,6 @@ func (cb *CircuitBreaker) Start(ts time.Time) (StateChange, error) {
 		state = cb.state
 		trigger = TriggerTimeoutExpired
 		cb.mu.Unlock()
-		// State changed OPEN -> HALF_OPEN, continue processing
 	}
 
 	cb.AddConcurrent()
@@ -114,7 +113,7 @@ func (cb *CircuitBreaker) Fail(ts time.Time, duration time.Duration) StateChange
 
 func (cb *CircuitBreaker) processResult(ts time.Time, duration time.Duration, success bool) StateChange {
 	defer cb.RemoveConcurrent()
-	// END POST-CALL PROCESSING
+	// START POST-CALL PROCESSING
 
 	errCount := 0.0
 	if !success {
@@ -199,11 +198,11 @@ func (cb *CircuitBreaker) newState() (State, Trigger) {
 	}
 
 	rawErrorRate := cb.metrics.errors.Mean()
-	requiredSuccessRate := cb.revised_slo.SuccessRate
+	requiredSuccessRate := cb.stated_slo.SuccessRate - (1-cb.stated_slo.SuccessRate)*0.1
 
 	// Use Adjusted Wald method to compute confidence interval for success rate
-	// z=1.96 for 95% confidence
-	const z = 1.96
+	// Using 3σ (99.7% confidence)
+	const z = 3
 	const z2 = z * z
 
 	successCount := n * (1 - rawErrorRate)
@@ -211,8 +210,8 @@ func (cb *CircuitBreaker) newState() (State, Trigger) {
 	pTilde := (successCount + z2/2) / nAdj
 	se := math.Sqrt(pTilde * (1 - pTilde) / nAdj)
 
-	lowerBound := pTilde - z*se // Lower bound of success rate confidence interval
-	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
+	lowerBound := pTilde - z*se // Success rate is at least this much or more
+	upperBound := pTilde + z*se // Success rate is not more than this much
 
 	if upperBound < requiredSuccessRate {
 		return OPEN, TriggerRecoveryFailed
@@ -239,7 +238,8 @@ func (cb *CircuitBreaker) mustOpen() (bool, Trigger) {
 	rawSuccessRate := 1 - errorMean
 
 	// Adjusted Wald method for confidence interval
-	const z = 1.96 // 95% confidence
+	// Using 3σ (99.7% confidence)
+	const z = 3.0
 	const z2 = z * z
 
 	successCount := n * rawSuccessRate
@@ -249,17 +249,18 @@ func (cb *CircuitBreaker) mustOpen() (bool, Trigger) {
 
 	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
 
-	if upperBound < cb.stated_slo.SuccessRate {
+	srThreshold := cb.stated_slo.SuccessRate - (1-cb.stated_slo.SuccessRate)*0.1
+	if upperBound < srThreshold {
 		return true, TriggerSLOViolation
 	}
 
 	// Trend check: compare live Mean() to Base (last buffer wrap)
-	// If both latency and concurrency are trending down, situation is improving
 	currentLatency := cb.metrics.latency.Mean()
 	baseLatency := cb.metrics.latency.Stat(Mean, Base)
 	currentConcurrency := cb.metrics.concurrency.Mean()
 	baseConcurrency := cb.metrics.concurrency.Stat(Mean, Base)
 
+	// If both latency and concurrency are trending down, situation is improving
 	if currentLatency < baseLatency && currentConcurrency < baseConcurrency {
 		return false, TriggerNone
 	}
@@ -268,7 +269,7 @@ func (cb *CircuitBreaker) mustOpen() (bool, Trigger) {
 	midAnomaly := unexpectedLatencySpike(&cb.metrics, Mid)
 	longAnomaly := unexpectedLatencySpike(&cb.metrics, Long)
 
-	if midAnomaly && longAnomaly {
+	if midAnomaly || longAnomaly {
 		return true, TriggerLatencyAnomaly
 	}
 	return false, TriggerNone
@@ -330,7 +331,7 @@ func (cb *CircuitBreaker) CloseCircuit() {
 	if cb.state == CLOSED {
 		return
 	}
-	cb.metrics.Reset()
+	// cb.metrics.Reset() -- turned out to be a bad idea
 	cb.state = CLOSED
 }
 
@@ -410,7 +411,7 @@ func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) StateChange {
 				cb.state = CLOSED
 				cb.successCount = 0
 				cb.failureCount = 0
-				cb.reqCount = 0 // Reset count when entering CLOSED from HALF_OPEN
+				cb.reqCount = 0
 				trigger = TriggerRecoverySucceeded
 			} else {
 				cb.state = OPEN
@@ -426,7 +427,7 @@ func (cb *WarmupCB) Success(ts time.Time, duration time.Duration) StateChange {
 			cb.state = CLOSED
 			cb.successCount = 0
 			cb.failureCount = 0
-			cb.reqCount = 0 // Reset count when entering CLOSED from INIT
+			cb.reqCount = 0
 			trigger = TriggerWarmupComplete
 		}
 	}
@@ -446,7 +447,6 @@ func (cb *WarmupCB) Fail(ts time.Time, duration time.Duration) StateChange {
 		cb.reqCount++
 		if cb.reqCount > 1000 {
 			cb.end = ts
-			// Keep state as CLOSED - will be detected by Levee for transition
 		}
 	}
 
