@@ -30,11 +30,13 @@ This can lead to suboptimal performance, with the circuit breaker either being t
 
 Levee continuously monitors the RED metrics -- R: Requests per Second, E: Error Rate, D: Duration aka Response Time or Latency -- as well as in-flight concurrents. It computes statistical properties of these signals to adjust its operating parameters dynamically, ensuring that the circuit breaker and concurrency limiter are always optimally tuned.
 
+Adding levee instances throughout the network can provide the resiliency benefits of a decentralised service mesh while keeping yaml-hell away.
+
 Levee is also painstakingly designed to consume a fixed, small amount of memory, making it suitable for use in high-performance, low-latency services.
 
 ## How to use Levee?
 
-Example usage of Levee:
+### Basic, in-band usage:
 
 ```go
 package main
@@ -55,12 +57,12 @@ func main() {
 
 	l := levee.NewLevee(slo)
 
-	state, err := l.Call(func() error {
+	stateChange, err := l.Call(func() error {
 		// Call the upstream service
 		return nil
 	})
 
-  switch state {
+  switch stateChange.state {
   case levee.INIT:
   	fmt.Println("Circuit breaker is Initializing")
   case levee.OPEN:
@@ -73,15 +75,68 @@ func main() {
 }
 ```
 
+### Advanced, out-of-band usage:
+
+Levee can now be called out-of-band so you can better organise your
+code and just call Levee at the start and end of your tasks. You can
+even control the timing, e.g. for stream processors that work on
+event-time or ingestion-time. Here's an example:
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/codemartial/levee"
+)
+
+func main() {
+	slo := levee.SLO{
+		SuccessRate: 0.95,
+		Timeout:     time.Millisecond * 100,
+		Warmup:      time.Second * 300,
+	}
+
+	l := levee.NewLevee(slo)
+
+	// Check circuit state before starting the task
+	start := time.Now()
+	stateChange, err := l.Start(start)
+	if err != nil {
+		fmt.Println("Circuit is open, request rejected")
+		return
+	}
+
+	// Perform the actual task
+	taskErr := callUpstreamService()
+	end := time.Now()
+	duration := end.Sub(start)
+
+	// Report the outcome
+	if taskErr != nil {
+		stateChange = l.Fail(end, duration)
+	} else {
+		stateChange = l.Success(end, duration)
+	}
+
+	fmt.Printf("Circuit state: %v\n", stateChange.State)
+}
+```
+
+
+## Benchmark
+
+Levee outperforms meticulously configured static circuit breakers by
+over 2x better decision-making, both while preventing overload (up to
+10x better) and preventing unwanted loss of business (up to 1.7x better).
+
 ## TODO
 Levee is still a work in progress. Here are some of the things that need to be done:
 1. ~~Implement concurrent access~~ (done)
-2. Implement save state and restore state capability
-3. ~~Implement SLO revisions~~ (wontfix)
+2. ~~Implement save state and restore state capability~~ (done)
 4. Implement state updates over channels
-5. Implement timeout enforcement (currently used as a FYI)
-6. Implement calling with context
-7. Convenience functions for HTTP response handlers
-8. Implement system load monitoring
+5. Implement system load monitoring
 
-_The last one is rather tricky. There is no standard way to access the environment load in Go. The best I may be able to do is to make it Linux specific. Even that is complicated being split between VM/BM and containers._
+*The last one is rather tricky. There is no standard way to access the environment load in Go. The best I may be able to do is to make it Linux specific. Even that is complicated being split between VM/BM and containers.*

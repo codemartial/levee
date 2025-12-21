@@ -39,16 +39,16 @@ Each CB state change is classified relative to Prescient:
 | **Premature recovery** | CB closed while Prescient still open |
 | **Flapping** | CB opened <1min after previous close |
 
-### Penalty Scores (RPS²-weighted)
+### Penalty Scores
 
 Raw request counts don't capture business impact. A request during peak traffic is worth more than one at 3 AM. We use RPS²-weighted penalties computed on-the-fly:
 
-**BadTraffic Penalty** = Σ(RPS²) for each second where Prescient is OPEN but CB allowed requests
+**BadTraffic Penalty** = √Σ(RPS²) for each second where Prescient is OPEN but CB allowed requests
 - Measures damage from letting bad traffic through during incidents
 - Higher RPS bleed-through is penalised more than lower RPS, since high load increases chances of catastrophe
 - Lower is better
 
-**LostBusiness Penalty** = Σ(RPS²) for each second where Prescient is CLOSED but CB blocked requests
+**LostBusiness Penalty** = √Σ(RPS²) for each second where Prescient is CLOSED but CB blocked requests
 - Measures damage from blocking good traffic unnecessarily
 - Higher RPS traffic is considered more valuable to business than lower RPS traffic
 - Lower is better
@@ -95,11 +95,18 @@ The benchmark produces a comparative summary:
 ```
 Candidate       |    Blocked |    Allowed | Flap | FalseAlarm | LateDetect |   BadTraffic | LostBusiness | TotalPenalty
 ----------------------------------------------------------------------------------------------------------------------------------
-Prescient       |     773798 |   55747864 |    0 |          0 |          0 |            0 |            0 |            0
-Levee           |    5009564 |   51512098 |  324 |         16 |          0 |        14356 |        48536 |        62892
-Static-BAU      |    3683878 |   52845616 |   31 |         10 |          5 |        38150 |        28483 |        66633
-Static-Peak     |    3359692 |   53159733 |    1 |          0 |          3 |        41858 |         8444 |        50302
+Prescient       |     773829 |   55749793 |    0 |          0 |          0 |            0 |            0 |            0
+Levee           |    4183613 |   52340009 |    7 |          9 |          0 |         2428 |        13866 |        16294
+Static-BAU      |    4193491 |   52329110 |   32 |         10 |          3 |        13482 |        23648 |        37130
+Static-Peak     |    3713193 |   52805124 |    4 |          0 |          4 |        26897 |         6655 |        33552
 ```
+
+## The Candidates
+
+**Prescient**: This is the reference circuit breaker that has foreknowledge of the traffic and errors so it opens and closes exactly where needed
+**Levee**: The self-configuring circuit breaker. 
+**Static-BAU**: A static circuit breaker that is most optimally tuned for the BAU average workload
+**Static-Peak**: The same static circuit breaker but most optimally tuned for high traffic
 
 ## How to Read the Results
 
@@ -111,21 +118,36 @@ Static-Peak     |    3359692 |   53159733 |    1 |          0 |          3 |    
 
 **LateDetect**: CB was slow to open after backend became unhealthy. Lets bad traffic through.
 
-**BadTraffic** (√Σ RPS²): Damage from letting requests through during incidents. Levee's low score means it detects and blocks quickly.
+**BadTraffic** (√Σ RPS²): Damage from letting requests through during incidents. See [Penalty Scores](#penalty-scores) for details.
 
-**LostBusiness** (√Σ RPS²): Damage from blocking requests when backend is healthy. Levee's higher score reflects its aggressive detection causing more false positives.
+**LostBusiness** (√Σ RPS²): Damage from blocking requests when backend is healthy. See [Penalty Scores](#penalty-scores) for details.
 
-**TotalPenalty**: Combined score. Lower is better, but the breakdown matters - some applications prefer low BadTraffic (protect backend) while others prefer low LostBusiness (maximize availability).
+**TotalPenalty**: Combined score between BadTraffic and LostBusiness. Lower is better.
 
-## Interpreting Trade-offs
+## Ranking
 
-The results reveal the fundamental **sensitivity vs. specificity trade-off**:
+The results illustrates the **sensitivity vs. specificity trade-off** that static configurations fail at.
 
-- **Levee**: Fast detection (low BadTraffic) but aggressive (high LostBusiness, more flapping)
-- **Static-Peak**: Conservative (low LostBusiness, minimal flapping) but slow to detect (high BadTraffic)
-- **Static-BAU**: Middle ground on both axes
+- **Levee**: Fast detection (over 10x lower BadTraffic) while still
+  preventing loss of business (over 1.5x lower LostBusiness) 
+- **Static-Peak**: Conservative (low LostBusiness, minimal flapping)
+  but slow to detect (high BadTraffic)
+- **Static-BAU**: The most likely configuration is also the worst
+  performer with highest flapping and false alarms
 
-Choose based on your priorities:
-- **Protect downstream at all costs** → Optimize for low BadTraffic
-- **Maximize availability** → Optimize for low LostBusiness
-- **Balanced** → Optimize for low TotalPenalty
+## Further Improvements
+
+The evaluation benchmark is an *open-loop*, which means the actions of
+the circuit breakers do not influence the state of the upstream caller
+or the downstream dependency. This specifically fails to capture the
+benefits of concurrency limiting aspects of Levee. In a real
+situation, Levee's actions should lead to more reliable operations
+through micro adjustments and throttling of traffic during periods of
+stress.
+
+As with all things automated, explanability and predictability are
+inversely proportional to the decision-making capacity of the
+agent. You are advised to use simulation testing to determine
+real-world suitability, as well as focus on relevant real-world
+outcomes (e.g. aggregate *BadTraffic* and *LostBusiness* scores in this
+benchmark) rather than stressing on specific behavioural incidents.
