@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1120,8 +1122,18 @@ func writeUnifiedComparativeSummary(unified *UnifiedBenchmarkResult) {
 	fmt.Fprintf(os.Stderr, "%-15s | %10d | %10d | %4d | %10d | %10d | %12d | %12d | %12d\n",
 		"Prescient", prescientBlocked, prescientAllowed, 0, 0, 0, 0, 0, 0)
 
-	// CB rows
-	for _, name := range unified.CBNames {
+	// CB rows sorted by ascending TotalPenalty
+	sortedNames := make([]string, len(unified.CBNames))
+	copy(sortedNames, unified.CBNames)
+	sort.Slice(sortedNames, func(i, j int) bool {
+		mi := unified.PerCBMetrics[sortedNames[i]]
+		mj := unified.PerCBMetrics[sortedNames[j]]
+		penaltyI := math.Sqrt(mi.BadTrafficPenalty) + math.Sqrt(mi.LostBusinessPenalty)
+		penaltyJ := math.Sqrt(mj.BadTrafficPenalty) + math.Sqrt(mj.LostBusinessPenalty)
+		return penaltyI < penaltyJ
+	})
+
+	for _, name := range sortedNames {
 		m := unified.PerCBMetrics[name]
 		fmt.Fprintf(os.Stderr, "%-15s | %10d | %10d | %4d | %10d | %10d | %12.0f | %12.0f | %12.0f\n",
 			name, m.TotalBlocked, m.TotalAllowed, m.Flapping, m.FalseAlarms,
@@ -1306,7 +1318,7 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 
 	fmt.Fprintf(os.Stderr, "Generated %d load specifications for Cyber Monday simulation\n", len(specs))
 
-	// Run benchmark for each candidate
+	// Run benchmark for each candidate in parallel
 	candidates := []struct {
 		name    string
 		breaker levee.ICircuitBreaker
@@ -1316,12 +1328,25 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 		{"Static-Peak", NewStaticPeak()},
 	}
 
-	results := make([]CandidateResult, 0, len(candidates))
+	var wg sync.WaitGroup
+	resultsChan := make(chan CandidateResult, len(candidates))
 
 	for _, c := range candidates {
-		fmt.Fprintf(os.Stderr, "\n>>> Running benchmark for %s...\n", c.name)
-		metrics := runCandidateBenchmark(slo, specs, c.breaker)
-		results = append(results, CandidateResult{Name: c.name, Metrics: metrics})
+		wg.Add(1)
+		go func(name string, breaker levee.ICircuitBreaker) {
+			defer wg.Done()
+			fmt.Fprintf(os.Stderr, "\n>>> Running benchmark for %s...\n", name)
+			metrics := runCandidateBenchmark(slo, specs, breaker)
+			resultsChan <- CandidateResult{Name: name, Metrics: metrics}
+		}(c.name, c.breaker)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	results := make([]CandidateResult, 0, len(candidates))
+	for r := range resultsChan {
+		results = append(results, r)
 	}
 
 	// Build unified result and generate reports

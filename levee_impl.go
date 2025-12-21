@@ -201,8 +201,8 @@ func (cb *CircuitBreaker) newState() (State, Trigger) {
 	requiredSuccessRate := cb.stated_slo.SuccessRate - (1-cb.stated_slo.SuccessRate)*0.1
 
 	// Use Adjusted Wald method to compute confidence interval for success rate
-	// Using 3σ (99.7% confidence)
-	const z = 3
+	// Using 2σ (95% confidence)
+	const z = 2.0
 	const z2 = z * z
 
 	successCount := n * (1 - rawErrorRate)
