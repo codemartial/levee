@@ -50,7 +50,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Under-provisioned backend dies within seconds - CAUSE: traffic spike, EFFECT: errors + latency
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          15 * baselineRPM, // 15x spike (CAUSE)
-		ErrorRate:    0.50,             // 50% errors - catastrophic failure (EFFECT)
+		ErrorRate:    0.60,             // 60% errors - catastrophic failure (EFFECT)
 		DurationS:    120,              // 2 minutes of peak chaos
 		P50LatencyMS: 500.0,            // 10x slower (EFFECT of overload)
 		P99LatencyMS: 1200.0,           // Near timeout
@@ -60,7 +60,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Immediate aftermath - retry storm makes it WORSE
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          20 * baselineRPM, // 20x - retry storm amplifies traffic
-		ErrorRate:    0.60,             // Even worse - backend overwhelmed
+		ErrorRate:    0.70,             // Even worse - backend overwhelmed
 		DurationS:    180,              // 3 more minutes
 		P50LatencyMS: 800.0,            // Getting worse
 		P99LatencyMS: 1400.0,
@@ -70,7 +70,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// SREs enable autoscaling - traffic starts backing off, backend starts recovering
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          8 * baselineRPM, // 8x (many gave up)
-		ErrorRate:    0.15,            // Still elevated but improving as instances spin up
+		ErrorRate:    0.25,            // Still elevated but improving as instances spin up
 		DurationS:    180,             // 3 minutes
 		P50LatencyMS: 300.0,           // Improving
 		P99LatencyMS: 800.0,
@@ -177,7 +177,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Initial 10 AM spike - bad but not worst yet
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          int(hour10BauRPM * 6.0), // 36x original - initial surge
-		ErrorRate:    0.25,                    // 25% errors
+		ErrorRate:    0.35,                    // 35% errors
 		DurationS:    120,                     // 2 minutes
 		P50LatencyMS: 500.0,
 		P99LatencyMS: 1100.0,
@@ -187,7 +187,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Retry storm - things get WORSE
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          int(hour10BauRPM * 8.0), // 48x original - retry storm peaks
-		ErrorRate:    0.35,                    // 35% errors - worse
+		ErrorRate:    0.45,                    // 45% errors - worse
 		DurationS:    180,                     // 3 minutes
 		P50LatencyMS: 700.0,
 		P99LatencyMS: 1350.0,
@@ -197,7 +197,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Autoscaler catching up
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          int(hour10BauRPM * 4.0),
-		ErrorRate:    0.10,
+		ErrorRate:    0.20,
 		DurationS:    300, // 5 minutes
 		P50LatencyMS: 200.0,
 		P99LatencyMS: 600.0,
@@ -276,7 +276,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Initial 6 PM spike - bad but not worst yet
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          int(hour18BauRPM * 4.5), // 36x original - initial surge
-		ErrorRate:    0.20,                    // 20% errors
+		ErrorRate:    0.30,                    // 30% errors
 		DurationS:    120,                     // 2 minutes
 		P50LatencyMS: nominalP50 * hour18Degradation * 2.0,
 		P99LatencyMS: nominalP99 * hour18Degradation * 2.5,
@@ -286,7 +286,7 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 	// Retry storm - things get WORSE
 	specs = append(specs, loadgen.LoadSpec{
 		RPM:          int(hour18BauRPM * 6.0), // 48x original - retry storm peaks
-		ErrorRate:    0.30,                    // 30% errors - worse
+		ErrorRate:    0.60,                    // 60% errors - worse
 		DurationS:    180,                     // 3 minutes
 		P50LatencyMS: nominalP50 * hour18Degradation * 2.5,
 		P99LatencyMS: nominalP99 * hour18Degradation * 3.0,
