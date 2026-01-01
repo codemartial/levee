@@ -110,7 +110,10 @@ func (s *TimeSeries) RecordAt(value float64, ts time.Time) {
 }
 
 // maybeResize evaluates whether the buffer should be resized
+// DISABLED: Dynamic sizing causes issues with hasSufficientHistory() after metrics reset
 func (s *TimeSeries) maybeResize(ts time.Time) {
+	return // Disabled - using fixed buffer size of 100
+
 	// Skip if we don't have timing info yet
 	if s.lastWrapAt.IsZero() {
 		return

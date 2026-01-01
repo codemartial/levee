@@ -306,9 +306,7 @@ func (l *Levee) EnterThrottled(safeConcurrency float64) {
 
 	l.throttleConcurrency = safeConcurrency
 	l.state = THROTTLED
-
-	// Reset Base for new state (Mid/Long preserved and continue updating)
-	l.metrics.Reset()
+	// Note: Do NOT reset metrics here - we need to preserve history for mustOpen() checks
 }
 
 func (l *Levee) State() State {

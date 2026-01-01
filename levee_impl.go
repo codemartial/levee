@@ -211,7 +211,11 @@ func (l *Levee) safeConcurrencyFloor() float64 {
 }
 
 // shouldThrottle determines if we should enter THROTTLED state
+// DISABLED: THROTTLED causes rapid flapping between THROTTLED and CLOSED
+// TODO: Redesign the stabilisation logic before re-enabling
 func (l *Levee) shouldThrottle() (bool, float64) {
+	return false, 0 // Disabled
+
 	if !l.metrics.hasSufficientHistory() {
 		return false, 0
 	}
