@@ -364,6 +364,8 @@ func stateString(s levee.State) string {
 		return "CLOSED"
 	case levee.OPEN:
 		return "OPEN" // Includes HALF_OPEN (deprecated, now same as OPEN)
+	case levee.THROTTLED:
+		return "THROTTLED"
 	default:
 		return "UNKNOWN"
 	}

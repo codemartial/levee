@@ -17,7 +17,8 @@ type State uint8
 
 const (
 	CLOSED State = iota
-	OPEN // Combines old OPEN + HALF_OPEN: initial cooldown, then rate-limited probing
+	OPEN      // Combines old OPEN + HALF_OPEN: initial cooldown, then rate-limited probing
+	THROTTLED // Rate-limiting state based on concurrency-error correlation
 
 	// HALF_OPEN is deprecated - kept for backward compatibility with benchmarks
 	// In v0.3.0, HALF_OPEN behavior is merged into OPEN with cooldown phases
@@ -32,7 +33,8 @@ type StateChange struct {
 }
 
 var (
-	ErrCircuitOpen = errors.New("circuit is open")
+	ErrCircuitOpen      = errors.New("circuit is open")
+	ErrCircuitThrottled = errors.New("circuit is throttled")
 
 	// ErrCircuitHalfOpen is deprecated - kept for backward compatibility
 	// In v0.3.0, HALF_OPEN is merged into OPEN with rate-limited probing
@@ -47,6 +49,11 @@ var (
 	TriggerRecoverySucceeded Trigger = triggerError("recovery succeeded")
 	TriggerRecoveryFailed    Trigger = triggerError("recovery failed")
 	TriggerTimeoutExpired    Trigger = triggerError("timeout expired")
+
+	// THROTTLED state triggers
+	TriggerConcurrencyOverload  Trigger = triggerError("concurrency overload")
+	TriggerThrottlingFailed     Trigger = triggerError("throttling failed")
+	TriggerThrottlingStabilised Trigger = triggerError("throttling stabilised")
 )
 
 type triggerError string
@@ -65,6 +72,9 @@ type Levee struct {
 
 	// OPEN state phases: cooldown (wait for timeout) then probing
 	cooldownComplete bool
+
+	// THROTTLED state: current safe concurrency limit
+	throttleConcurrency float64
 }
 
 func NewLevee(slo SLO) *Levee {
@@ -94,6 +104,7 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	state := l.State()
 	trigger := TriggerNone
 
+	// OPEN state handling (with cooldown)
 	if state == OPEN {
 		lastOpenAt := l.lastOpenAt.Load().(time.Time)
 		timeout := l.revised_slo.Timeout
@@ -125,8 +136,44 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		return StateChange{State: OPEN, Trigger: trigger}, nil
 	}
 
-	// CLOSED state
 	l.AddConcurrent()
+
+	// THROTTLED state handling
+	if state == THROTTLED {
+		if l.throttlingFailed() {
+			l.RemoveConcurrent()
+			l.OpenCircuit(ts)
+			return StateChange{State: OPEN, Trigger: TriggerThrottlingFailed}, ErrCircuitOpen
+		}
+
+		// Enforce concurrency limit
+		l.mu.RLock()
+		throttleLimit := l.throttleConcurrency
+		l.mu.RUnlock()
+
+		if float64(l.Concurrents()) > throttleLimit {
+			l.RemoveConcurrent()
+			return StateChange{State: THROTTLED}, ErrCircuitThrottled
+		}
+
+		// Re-evaluate safe concurrency
+		l.mu.Lock()
+		l.throttleConcurrency = l.safeConcurrency()
+		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+		l.mu.Unlock()
+
+		return StateChange{State: THROTTLED}, nil
+	}
+
+	// CLOSED state handling
+	// Check throttle BEFORE mustOpen
+	if shouldThrottle, safeConcurrency := l.shouldThrottle(); shouldThrottle {
+		l.EnterThrottled(safeConcurrency)
+		l.mu.Lock()
+		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+		l.mu.Unlock()
+		return StateChange{State: THROTTLED, Trigger: TriggerConcurrencyOverload}, nil
+	}
 
 	shouldOpen, openTrigger := l.mustOpen()
 	if shouldOpen {
@@ -184,6 +231,14 @@ func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool
 		}
 	}
 
+	// Check THROTTLED stabilisation
+	if state == THROTTLED {
+		if l.throttlingStabilised() {
+			l.CloseCircuit()
+			return StateChange{State: CLOSED, Trigger: TriggerThrottlingStabilised}
+		}
+	}
+
 	return StateChange{State: state, Trigger: TriggerNone}
 }
 
@@ -237,6 +292,23 @@ func (l *Levee) CloseCircuit() {
 	}
 	l.state = CLOSED
 	l.cooldownComplete = false
+	l.throttleConcurrency = 0
+}
+
+// EnterThrottled transitions to THROTTLED state with the given concurrency limit
+func (l *Levee) EnterThrottled(safeConcurrency float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.state == THROTTLED {
+		return
+	}
+
+	l.throttleConcurrency = safeConcurrency
+	l.state = THROTTLED
+
+	// Reset Base for new state (Mid/Long preserved and continue updating)
+	l.metrics.Reset()
 }
 
 func (l *Levee) State() State {
