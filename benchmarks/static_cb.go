@@ -8,6 +8,16 @@ import (
 	"github.com/codemartial/levee"
 )
 
+// staticState is the internal state type for StaticCB
+// It maintains the traditional 3-state model (CLOSED, OPEN, HALF_OPEN)
+type staticState uint8
+
+const (
+	staticClosed staticState = iota
+	staticOpen
+	staticHalfOpen
+)
+
 // StaticCBConfig holds the configuration for a static circuit breaker
 type StaticCBConfig struct {
 	FailureThreshold int           // Consecutive failures to open circuit
@@ -17,16 +27,16 @@ type StaticCBConfig struct {
 }
 
 // StaticCB is a conventional threshold-based circuit breaker
-// It implements levee.ICircuitBreaker for benchmark comparison
+// It implements the CircuitBreaker interface for benchmark comparison
 type StaticCB struct {
 	mu     sync.RWMutex
 	config StaticCBConfig
 
-	state              levee.State
-	consecutiveFailures int
+	internalState        staticState // Internal 3-state tracking
+	consecutiveFailures  int
 	consecutiveSuccesses int
-	lastOpenAt         atomic.Value // time.Time
-	halfOpenCalls      int32        // atomic counter for HALF_OPEN calls
+	lastOpenAt           atomic.Value // time.Time
+	halfOpenCalls        int32        // atomic counter for HALF_OPEN calls
 }
 
 // Predefined configurations for benchmarking
@@ -80,8 +90,8 @@ var (
 // NewStaticCB creates a new static circuit breaker with the given configuration
 func NewStaticCB(config StaticCBConfig) *StaticCB {
 	cb := &StaticCB{
-		config: config,
-		state:  levee.CLOSED,
+		config:        config,
+		internalState: staticClosed,
 	}
 	cb.lastOpenAt.Store(time.Time{})
 	return cb
@@ -97,11 +107,22 @@ func NewStaticPeak() *StaticCB {
 	return NewStaticCB(StaticPeakConfig)
 }
 
+// toExternalState converts internal state to levee.State (must hold lock)
+func (cb *StaticCB) toExternalState() levee.State {
+	switch cb.internalState {
+	case staticClosed:
+		return levee.CLOSED
+	default: // staticOpen, staticHalfOpen
+		return levee.OPEN
+	}
+}
+
 // State returns the current state of the circuit breaker
+// Maps internal 3-state to levee's 2-state model (HALF_OPEN -> OPEN)
 func (cb *StaticCB) State() levee.State {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	return cb.state
+	return cb.toExternalState()
 }
 
 // StateUpdates returns nil (not implemented for benchmarks)
@@ -114,13 +135,13 @@ func (cb *StaticCB) Start(ts time.Time) (levee.StateChange, error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	switch cb.state {
-	case levee.OPEN:
+	switch cb.internalState {
+	case staticOpen:
 		// Check if timeout has elapsed
 		lastOpen := cb.lastOpenAt.Load().(time.Time)
 		if ts.Sub(lastOpen) >= cb.config.HalfOpenTimeout {
-			// Transition to HALF_OPEN
-			cb.state = levee.HALF_OPEN
+			// Transition to half-open for probing
+			cb.internalState = staticHalfOpen
 			cb.consecutiveSuccesses = 0
 			atomic.StoreInt32(&cb.halfOpenCalls, 0)
 		} else {
@@ -128,23 +149,22 @@ func (cb *StaticCB) Start(ts time.Time) (levee.StateChange, error) {
 		}
 		fallthrough
 
-	case levee.HALF_OPEN:
-		// Check if we've exceeded max concurrent calls in HALF_OPEN
+	case staticHalfOpen:
+		// Check if we've exceeded max concurrent calls in half-open
 		if cb.config.HalfOpenMaxCalls > 0 {
 			currentCalls := atomic.AddInt32(&cb.halfOpenCalls, 1)
 			if int(currentCalls) > cb.config.HalfOpenMaxCalls {
 				atomic.AddInt32(&cb.halfOpenCalls, -1)
-				return levee.StateChange{State: levee.HALF_OPEN}, levee.ErrCircuitHalfOpen
+				return levee.StateChange{State: levee.OPEN}, levee.ErrCircuitOpen
 			}
 		}
-		return levee.StateChange{State: levee.HALF_OPEN}, nil
+		return levee.StateChange{State: levee.OPEN}, nil // HALF_OPEN maps to OPEN
 
-	case levee.CLOSED:
+	case staticClosed:
 		return levee.StateChange{State: levee.CLOSED}, nil
 
 	default:
-		// INIT state - treat as CLOSED
-		cb.state = levee.CLOSED
+		cb.internalState = staticClosed
 		return levee.StateChange{State: levee.CLOSED}, nil
 	}
 }
@@ -154,8 +174,8 @@ func (cb *StaticCB) Success(ts time.Time, duration time.Duration) levee.StateCha
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	// Decrement HALF_OPEN counter if applicable
-	if cb.state == levee.HALF_OPEN {
+	// Decrement half-open counter if applicable
+	if cb.internalState == staticHalfOpen {
 		atomic.AddInt32(&cb.halfOpenCalls, -1)
 	}
 
@@ -163,13 +183,13 @@ func (cb *StaticCB) Success(ts time.Time, duration time.Duration) levee.StateCha
 	cb.consecutiveFailures = 0
 	cb.consecutiveSuccesses++
 
-	// Check if we should close the circuit (from HALF_OPEN)
-	if cb.state == levee.HALF_OPEN && cb.consecutiveSuccesses >= cb.config.SuccessThreshold {
-		cb.state = levee.CLOSED
+	// Check if we should close the circuit (from half-open)
+	if cb.internalState == staticHalfOpen && cb.consecutiveSuccesses >= cb.config.SuccessThreshold {
+		cb.internalState = staticClosed
 		cb.consecutiveSuccesses = 0
 	}
 
-	return levee.StateChange{State: cb.state}
+	return levee.StateChange{State: cb.toExternalState()}
 }
 
 // Fail processes a failed call result
@@ -177,8 +197,8 @@ func (cb *StaticCB) Fail(ts time.Time, duration time.Duration) levee.StateChange
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	// Decrement HALF_OPEN counter if applicable
-	if cb.state == levee.HALF_OPEN {
+	// Decrement half-open counter if applicable
+	if cb.internalState == staticHalfOpen {
 		atomic.AddInt32(&cb.halfOpenCalls, -1)
 	}
 
@@ -187,21 +207,21 @@ func (cb *StaticCB) Fail(ts time.Time, duration time.Duration) levee.StateChange
 	cb.consecutiveFailures++
 
 	// Check if we should open the circuit
-	switch cb.state {
-	case levee.CLOSED:
+	switch cb.internalState {
+	case staticClosed:
 		if cb.consecutiveFailures >= cb.config.FailureThreshold {
-			cb.state = levee.OPEN
+			cb.internalState = staticOpen
 			cb.lastOpenAt.Store(ts)
 			cb.consecutiveFailures = 0
 		}
-	case levee.HALF_OPEN:
-		// Any failure in HALF_OPEN reopens the circuit
-		cb.state = levee.OPEN
+	case staticHalfOpen:
+		// Any failure in half-open reopens the circuit
+		cb.internalState = staticOpen
 		cb.lastOpenAt.Store(ts)
 		cb.consecutiveFailures = 0
 	}
 
-	return levee.StateChange{State: cb.state}
+	return levee.StateChange{State: cb.toExternalState()}
 }
 
 // Call executes the given function with circuit breaker protection

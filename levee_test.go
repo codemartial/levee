@@ -11,48 +11,14 @@ func TestNewLevee(t *testing.T) {
 	slo := SLO{
 		SuccessRate: 0.99,
 		Timeout:     time.Second * 5,
-		Warmup:      time.Second * 10,
 	}
 
 	l := NewLevee(slo)
 	if l == nil {
 		t.Error("NewLevee returned nil")
 	}
-	if l.State() != INIT {
-		t.Errorf("Expected initial state INIT, got %v", l.State())
-	}
-}
-
-func TestWarmupPhase(t *testing.T) {
-	slo := SLO{
-		SuccessRate: 0.99,
-		Timeout:     time.Second * 5,
-		Warmup:      time.Second * 1,
-	}
-
-	l := NewLevee(slo)
-	successFunc := func() error { return nil }
-
-	// Start making calls immediately - first call starts warmup timer
-	// Make calls during warmup period (these don't count toward 1000)
-	for i := 0; i < 100; i++ {
-		l.Call(successFunc)
-	}
-
-	// Wait for warmup period to complete from first call
-	time.Sleep(slo.Warmup + time.Millisecond*100)
-
-	// Now make 1001+ successful calls after warmup - these should count
-	// Need enough to trigger transition (>1000 in CLOSED state)
-	for i := 0; i < 1100; i++ {
-		sc, err := l.Call(successFunc)
-		if err != nil {
-			t.Errorf("Unexpected error during warmup: %v", err)
-		}
-		// After warmup completes, state should eventually be CLOSED
-		if i == 1099 && sc.State != CLOSED {
-			t.Errorf("Expected CLOSED state after warmup+1000 calls, got %v", sc.State)
-		}
+	if l.State() != CLOSED {
+		t.Errorf("Expected initial state CLOSED, got %v", l.State())
 	}
 }
 
@@ -60,32 +26,28 @@ func TestCircuitBreakerFailureThreshold(t *testing.T) {
 	slo := SLO{
 		SuccessRate: 0.99,
 		Timeout:     time.Second * 5,
-		Warmup:      time.Second * 1,
 	}
 
 	l := NewLevee(slo)
+	now := time.Now()
 
-	// Wait for warmup period to complete
-	time.Sleep(slo.Warmup)
-
-	// Complete warmup phase
-	successFunc := func() error { return nil }
-	for i := 0; i < 1001; i++ {
-		sc, _ := l.Call(successFunc)
-		if sc.State == CLOSED {
-			break
-		}
+	// Fill the buffer with successful calls to establish history
+	for i := 0; i < 200; i++ {
+		ts := now.Add(time.Duration(i) * time.Millisecond)
+		l.Start(ts)
+		l.Success(ts, 10*time.Millisecond)
 	}
 
 	// Now simulate failures
-	failureFunc := func() error { return errors.New("test error") }
-
-	// Record enough failures to potentially trigger circuit opening
 	for i := 0; i < 100; i++ {
-		sc, _ := l.Call(failureFunc)
+		ts := now.Add(time.Duration(200+i) * time.Millisecond)
+		sc, _ := l.Start(ts)
 		if sc.State == OPEN {
-			// Circuit should eventually open due to failures
-			return
+			return // Circuit opened as expected
+		}
+		l.Fail(ts, 10*time.Millisecond)
+		if l.State() == OPEN {
+			return // Circuit opened as expected
 		}
 	}
 
@@ -96,76 +58,83 @@ func TestCircuitRecovery(t *testing.T) {
 	slo := SLO{
 		SuccessRate: 0.95,
 		Timeout:     time.Millisecond * 100, // Short timeout for testing
-		Warmup:      time.Second * 0,
 	}
 
 	l := NewLevee(slo)
+	now := time.Now()
 
-	// Complete warmup
-	successFunc := func() error { return nil }
-	for i := 0; i < 1001; i++ {
-		sc, _ := l.Call(successFunc)
-		if sc.State == CLOSED {
-			break
-		}
+	// Fill buffer with successful calls
+	for i := 0; i < 200; i++ {
+		ts := now.Add(time.Duration(i) * time.Millisecond)
+		l.Start(ts)
+		l.Success(ts, 10*time.Millisecond)
 	}
 
-	// Force circuit to open
-	failureFunc := func() error { return errors.New("test error") }
+	// Force circuit to open with failures
 	for i := 0; i < 300; i++ {
-		sc, _ := l.Call(failureFunc)
+		ts := now.Add(time.Duration(200+i) * time.Millisecond)
+		sc, _ := l.Start(ts)
 		if sc.State == OPEN {
 			break
 		}
+		l.Fail(ts, 10*time.Millisecond)
 	}
 
-	// Wait for timeout
-	time.Sleep(slo.Timeout)
-
-	if sc, err := l.Call(successFunc); sc.State != HALF_OPEN || err != nil {
-		t.Errorf("Expected HALF_OPEN state after timeout, got %v", l.State())
+	if l.State() != OPEN {
+		t.Fatal("Circuit should be OPEN")
 	}
+
+	// Wait for timeout - circuit should allow probing call
+	ts := now.Add(600 * time.Millisecond)
+	sc, err := l.Start(ts)
+	if sc.State != OPEN || err != nil {
+		t.Errorf("Expected OPEN state after timeout with probing allowed, got %v (err=%v)", l.State(), err)
+	}
+	l.Success(ts, 10*time.Millisecond)
 
 	// Circuit should allow new calls and eventually close if successful
-	var lastState StateChange
-	var lastErr error
-
 	for i := 0; i < 100; i++ {
-		lastState, lastErr = l.Call(successFunc)
-		if lastState.State == CLOSED {
+		ts := now.Add(time.Duration(700+i) * time.Millisecond)
+		sc, _ := l.Start(ts)
+		if sc.State == CLOSED {
 			return // Test passed - circuit recovered
+		}
+		l.Success(ts, 10*time.Millisecond)
+		if l.State() == CLOSED {
+			return // Test passed
 		}
 	}
 
-	t.Errorf("Circuit failed to recover. Last state: %v, Last error: %v", lastState.State, lastErr)
+	t.Errorf("Circuit failed to recover. Last state: %v", l.State())
 }
 
 func TestMetricsReset(t *testing.T) {
-	cb := NewCircuitBreaker(SLO{
+	l := NewLevee(SLO{
 		SuccessRate: 0.99,
 		Timeout:     time.Second * 5,
-	}, 100)
+	})
 
 	// Record some metrics
-	cb.metrics.RecordLatency(100)
-	cb.metrics.RecordErrors(1)
-	cb.metrics.RecordConcurrency(5)
+	now := time.Now()
+	l.metrics.RecordLatency(100, now)
+	l.metrics.RecordErrors(1, now)
+	l.metrics.RecordConcurrency(5, now)
 
 	// Open circuit which should reset metrics
-	cb.OpenCircuit(time.Now())
+	l.OpenCircuit(time.Now())
 
-	if cb.metrics.latency.Mean() != 0 ||
-		cb.metrics.errors.Mean() != 0 ||
-		cb.metrics.concurrency.Mean() != 0 {
+	if l.metrics.latency.Mean() != 0 ||
+		l.metrics.errors.Mean() != 0 ||
+		l.metrics.concurrency.Mean() != 0 {
 		t.Error("Metrics were not properly reset after circuit opened")
 	}
 }
 
 func TestConcurrencyTracking(t *testing.T) {
-	cb := NewCircuitBreaker(SLO{
+	l := NewLevee(SLO{
 		SuccessRate: 0.99,
 		Timeout:     time.Second * 5,
-	}, 100)
+	})
 
 	successFunc := func() error { time.Sleep(time.Second); return nil }
 
@@ -173,7 +142,7 @@ func TestConcurrencyTracking(t *testing.T) {
 	done := make(chan struct{})
 	for i := 0; i < 5; i++ {
 		go func() {
-			cb.Call(successFunc)
+			l.Call(successFunc)
 			done <- struct{}{}
 		}()
 	}
@@ -181,7 +150,7 @@ func TestConcurrencyTracking(t *testing.T) {
 	// Wait for a moment to let concurrent calls register
 	time.Sleep(time.Millisecond * 1)
 
-	if cb.Concurrents() == 0 {
+	if l.Concurrents() == 0 {
 		t.Error("Concurrent calls not properly tracked")
 	}
 
@@ -190,8 +159,8 @@ func TestConcurrencyTracking(t *testing.T) {
 		<-done
 	}
 
-	if cb.Concurrents() != 0 {
-		t.Errorf("Concurrent call counter not properly decremented, got %d", cb.concurrents)
+	if l.Concurrents() != 0 {
+		t.Errorf("Concurrent call counter not properly decremented, got %d", l.concurrents)
 	}
 }
 
@@ -203,8 +172,9 @@ func TestEWMACalculation(t *testing.T) {
 	}
 
 	// Record consistent values
+	now := time.Now()
 	for i := 0; i < 100; i++ {
-		ts.Record(100.0)
+		ts.RecordAt(100.0, now.Add(time.Duration(i)*10*time.Millisecond))
 	}
 
 	// For consistent values, all EWMA values should be close to the input value
@@ -219,63 +189,47 @@ func TestEWMACalculation(t *testing.T) {
 
 var abs = math.Abs
 
-func TestSaveStateBeforeWarmup(t *testing.T) {
+func TestSaveStateNoHistory(t *testing.T) {
 	slo := SLO{
 		SuccessRate: 0.99,
 		Timeout:     time.Second,
-		Warmup:      10,
 	}
 
-	levee := NewLevee(slo)
+	l := NewLevee(slo)
 
-	// SaveState should return nil before warmup completes
-	state, err := levee.SaveState()
+	// SaveState should return nil before buffer is filled
+	state, err := l.SaveState()
 	if err != nil {
 		t.Fatalf("SaveState returned error: %v", err)
 	}
 	if state != nil {
-		t.Error("SaveState should return nil during warmup phase")
+		t.Error("SaveState should return nil before EWMA is initialized")
 	}
 }
 
-func TestSaveStateAfterWarmup(t *testing.T) {
+func TestSaveStateAfterHistory(t *testing.T) {
 	slo := SLO{
-		SuccessRate: 0.5, // Low success rate: 10/(1-0.5) = 20 samples
+		SuccessRate: 0.99,
 		Timeout:     time.Second,
-		Warmup:      1 * time.Second,
 	}
 
-	levee := NewLevee(slo)
+	l := NewLevee(slo)
 	now := time.Now()
 
-	// Low RPS (1 req/sec) + low success rate = buffer size 100 (max of ~1, 100, 20)
-	// Need ~1000 requests to transition from WarmupCB, then 100+ to fill buffer
-	for i := 0; i < 1500; i++ {
-		ts := now.Add(time.Duration(i) * time.Second) // 1s spacing = ~1 RPS
-		levee.Start(ts)
-		levee.Success(ts, 10*time.Millisecond)
+	// Fill the buffer to establish EWMA history
+	for i := 0; i < 200; i++ {
+		ts := now.Add(time.Duration(i) * time.Millisecond)
+		l.Start(ts)
+		l.Success(ts, 10*time.Millisecond)
 	}
 
 	// Now SaveState should work
-	state, err := levee.SaveState()
+	state, err := l.SaveState()
 	if err != nil {
-		t.Fatalf("SaveState returned error after warmup: %v", err)
+		t.Fatalf("SaveState returned error: %v", err)
 	}
 	if state == nil {
-		// Check if levee is ready and if EWMAs are initialized
-		levee.mu.RLock()
-		ready := levee.ready
-		cb, _ := levee.cb.(*CircuitBreaker)
-		var bufferSize uint16
-		var hasEWMA bool
-		if cb != nil {
-			cb.mu.RLock()
-			bufferSize = cb.metrics.concurrency._size
-			hasEWMA = cb.metrics.concurrency.value != nil
-			cb.mu.RUnlock()
-		}
-		levee.mu.RUnlock()
-		t.Fatalf("SaveState returned nil (ready=%v, bufferSize=%d, hasEWMA=%v)", ready, bufferSize, hasEWMA)
+		t.Fatal("SaveState returned nil after establishing history")
 	}
 
 	// Verify state fields are populated
@@ -292,18 +246,16 @@ func TestSaveStateAfterWarmup(t *testing.T) {
 
 func TestRestoreState(t *testing.T) {
 	slo := SLO{
-		SuccessRate: 0.5,
+		SuccessRate: 0.95,
 		Timeout:     500 * time.Millisecond,
-		Warmup:      1 * time.Second,
 	}
 
-	// Create and warm up original levee
+	// Create original levee and fill buffer
 	originalLevee := NewLevee(slo)
 	now := time.Now()
 
-	// Wide spacing for small buffer, need 1500+ requests
-	for i := 0; i < 1500; i++ {
-		ts := now.Add(time.Duration(i) * time.Second) // 1s spacing
+	for i := 0; i < 200; i++ {
+		ts := now.Add(time.Duration(i) * time.Millisecond)
 		originalLevee.Start(ts)
 		if i%10 == 0 {
 			// 10% error rate
@@ -328,54 +280,42 @@ func TestRestoreState(t *testing.T) {
 		t.Fatal("RestoreState returned nil")
 	}
 
-	// Verify the restored levee is in ready state (not warmup)
-	restoredLevee.mu.RLock()
-	if !restoredLevee.ready {
-		t.Error("Restored Levee should be in ready state")
-	}
-	cb, ok := restoredLevee.cb.(*CircuitBreaker)
-	restoredLevee.mu.RUnlock()
-
-	if !ok {
-		t.Fatal("Restored Levee should have CircuitBreaker, not WarmupCB")
-	}
-
 	// Verify EWMAs were restored
-	cb.mu.RLock()
-	if cb.metrics.concurrency.value == nil {
+	restoredLevee.mu.RLock()
+	if restoredLevee.metrics.concurrency.value == nil {
 		t.Error("Concurrency value EWMA not restored")
 	}
-	if cb.metrics.latency.value == nil {
+	if restoredLevee.metrics.latency.value == nil {
 		t.Error("Latency value EWMA not restored")
 	}
-	if cb.metrics.errors.value == nil {
+	if restoredLevee.metrics.errors.value == nil {
 		t.Error("Errors value EWMA not restored")
 	}
 
 	// Verify EWMA values match saved state
-	if cb.metrics.errors.value.base != state.ErrorsValueBase {
+	if restoredLevee.metrics.errors.value.base != state.ErrorsValueBase {
 		t.Errorf("Error EWMA base not restored correctly: got %f, want %f",
-			cb.metrics.errors.value.base, state.ErrorsValueBase)
+			restoredLevee.metrics.errors.value.base, state.ErrorsValueBase)
 	}
-	if cb.metrics.errors.value.ewmaMid != state.ErrorsValueMid {
+	if restoredLevee.metrics.errors.value.ewmaMid != state.ErrorsValueMid {
 		t.Errorf("Error EWMA mid not restored correctly: got %f, want %f",
-			cb.metrics.errors.value.ewmaMid, state.ErrorsValueMid)
+			restoredLevee.metrics.errors.value.ewmaMid, state.ErrorsValueMid)
 	}
-	if cb.metrics.errors.value.ewmaLong != state.ErrorsValueLong {
+	if restoredLevee.metrics.errors.value.ewmaLong != state.ErrorsValueLong {
 		t.Errorf("Error EWMA long not restored correctly: got %f, want %f",
-			cb.metrics.errors.value.ewmaLong, state.ErrorsValueLong)
+			restoredLevee.metrics.errors.value.ewmaLong, state.ErrorsValueLong)
 	}
 
 	// Verify circuit is in CLOSED state
-	if cb.state != CLOSED {
-		t.Errorf("Restored CircuitBreaker should be CLOSED, got %d", cb.state)
+	if restoredLevee.state != CLOSED {
+		t.Errorf("Restored Levee should be CLOSED, got %d", restoredLevee.state)
 	}
 
 	// Verify SLO was restored
-	if cb.stated_slo.SuccessRate != slo.SuccessRate {
-		t.Errorf("SLO.SuccessRate not restored: got %f, want %f", cb.stated_slo.SuccessRate, slo.SuccessRate)
+	if restoredLevee.stated_slo.SuccessRate != slo.SuccessRate {
+		t.Errorf("SLO.SuccessRate not restored: got %f, want %f", restoredLevee.stated_slo.SuccessRate, slo.SuccessRate)
 	}
-	cb.mu.RUnlock()
+	restoredLevee.mu.RUnlock()
 
 	// Verify restored levee can process requests
 	resultState, err := restoredLevee.Start(now.Add(200 * time.Millisecond))
@@ -389,18 +329,16 @@ func TestRestoreState(t *testing.T) {
 
 func TestStateRoundTrip(t *testing.T) {
 	slo := SLO{
-		SuccessRate: 0.5,
+		SuccessRate: 0.95,
 		Timeout:     time.Second,
-		Warmup:      1 * time.Second,
 	}
 
-	// Create, warm up, and save
+	// Create and fill buffer
 	levee1 := NewLevee(slo)
 	now := time.Now()
 
-	// Wide spacing for small buffer, need 1500+ requests
-	for i := 0; i < 1500; i++ {
-		ts := now.Add(time.Duration(i) * time.Second) // 1s spacing
+	for i := 0; i < 200; i++ {
+		ts := now.Add(time.Duration(i) * time.Millisecond)
 		levee1.Start(ts)
 		levee1.Success(ts, 50*time.Millisecond)
 	}
@@ -428,5 +366,59 @@ func TestStateRoundTrip(t *testing.T) {
 		state1.ErrorsDeviationMid != state2.ErrorsDeviationMid ||
 		state1.ErrorsDeviationLong != state2.ErrorsDeviationLong {
 		t.Error("Errors Deviation EWMAs don't match after round-trip")
+	}
+}
+
+func TestExpunge(t *testing.T) {
+	slo := SLO{
+		SuccessRate: 0.99,
+		Timeout:     time.Second,
+	}
+
+	l := NewLevee(slo)
+	now := time.Now()
+
+	// Fill buffer and change state
+	for i := 0; i < 200; i++ {
+		ts := now.Add(time.Duration(i) * time.Millisecond)
+		l.Start(ts)
+		l.Fail(ts, 10*time.Millisecond)
+	}
+
+	// Expunge should reset to fresh state
+	l.Expunge()
+
+	if l.State() != CLOSED {
+		t.Errorf("Expected CLOSED after Expunge, got %v", l.State())
+	}
+
+	// Metrics should be reset
+	if l.metrics.latency.isFilled {
+		t.Error("Metrics should be reset after Expunge")
+	}
+}
+
+func TestCallFunction(t *testing.T) {
+	slo := SLO{
+		SuccessRate: 0.99,
+		Timeout:     time.Second,
+	}
+
+	l := NewLevee(slo)
+
+	// Test successful call
+	sc, err := l.Call(func() error { return nil })
+	if err != nil {
+		t.Errorf("Successful call returned error: %v", err)
+	}
+	if sc.State != CLOSED {
+		t.Errorf("Expected CLOSED state, got %v", sc.State)
+	}
+
+	// Test failed call
+	testErr := errors.New("test error")
+	sc, err = l.Call(func() error { return testErr })
+	if err != testErr {
+		t.Errorf("Failed call did not return expected error: got %v, want %v", err, testErr)
 	}
 }

@@ -360,14 +360,10 @@ func generateCyberMondayWorkload() []loadgen.LoadSpec {
 
 func stateString(s levee.State) string {
 	switch s {
-	case levee.INIT:
-		return "INIT"
 	case levee.CLOSED:
 		return "CLOSED"
 	case levee.OPEN:
-		return "OPEN"
-	case levee.HALF_OPEN:
-		return "HALF_OPEN"
+		return "OPEN" // Includes HALF_OPEN (deprecated, now same as OPEN)
 	default:
 		return "UNKNOWN"
 	}

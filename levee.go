@@ -1,24 +1,27 @@
 package levee
 
 import (
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type SLO struct {
 	SuccessRate float64
 	Timeout     time.Duration
-	Warmup      time.Duration
 }
 
-// enum for circuit breaker states
+// State represents the circuit breaker state
 type State uint8
 
 const (
-	INIT State = iota
-	CLOSED
-	OPEN
-	HALF_OPEN
+	CLOSED State = iota
+	OPEN // Combines old OPEN + HALF_OPEN: initial cooldown, then rate-limited probing
+
+	// HALF_OPEN is deprecated - kept for backward compatibility with benchmarks
+	// In v0.3.0, HALF_OPEN behavior is merged into OPEN with cooldown phases
+	HALF_OPEN = OPEN
 )
 
 type Trigger error
@@ -28,41 +31,115 @@ type StateChange struct {
 	Trigger Trigger
 }
 
-type ICircuitBreaker interface {
-	// Call executes the given function and returns the state of the circuit breaker and any error
-	Call(func() error) (StateChange, error)
-	Start(time.Time) (StateChange, error)
-	Success(time.Time, time.Duration) StateChange
-	Fail(time.Time, time.Duration) StateChange
-	State() State
-	StateUpdates() <-chan StateChange
-}
+var (
+	ErrCircuitOpen = errors.New("circuit is open")
 
+	// ErrCircuitHalfOpen is deprecated - kept for backward compatibility
+	// In v0.3.0, HALF_OPEN is merged into OPEN with rate-limited probing
+	ErrCircuitHalfOpen = ErrCircuitOpen
+)
+
+// Trigger constants for state changes
+var (
+	TriggerNone              Trigger = triggerError("no state change")
+	TriggerSLOViolation      Trigger = triggerError("SLO violation")
+	TriggerLatencyAnomaly    Trigger = triggerError("latency anomaly")
+	TriggerRecoverySucceeded Trigger = triggerError("recovery succeeded")
+	TriggerRecoveryFailed    Trigger = triggerError("recovery failed")
+	TriggerTimeoutExpired    Trigger = triggerError("timeout expired")
+)
+
+type triggerError string
+
+func (e triggerError) Error() string { return string(e) }
+
+// Levee is an adaptive circuit breaker
 type Levee struct {
-	mu    sync.RWMutex
-	ready bool
-	cb    ICircuitBreaker
-	state chan State
+	mu          sync.RWMutex
+	stated_slo  SLO
+	revised_slo SLO
+	metrics     metrics
+	concurrents int32
+	state       State
+	lastOpenAt  atomic.Value
+
+	// OPEN state phases: cooldown (wait for timeout) then probing
+	cooldownComplete bool
 }
 
 func NewLevee(slo SLO) *Levee {
-	return &Levee{
-		ready: false,
-		cb:    NewWarmupCB(slo),
-		state: make(chan State),
+	l := &Levee{
+		stated_slo:  slo,
+		revised_slo: slo,
+		metrics:     *newMetrics(100), // Fixed initial size
+		state:       CLOSED,
 	}
+	l.lastOpenAt.Store(time.Time{})
+	return l
+}
+
+func (l *Levee) AddConcurrent() {
+	atomic.AddInt32(&l.concurrents, 1)
+}
+
+func (l *Levee) RemoveConcurrent() {
+	atomic.AddInt32(&l.concurrents, -1)
+}
+
+func (l *Levee) Concurrents() int32 {
+	return atomic.LoadInt32(&l.concurrents)
 }
 
 func (l *Levee) Start(ts time.Time) (StateChange, error) {
-	l.mu.RLock()
-	ready := l.ready
-	cb := l.cb
-	l.mu.RUnlock()
+	state := l.State()
+	trigger := TriggerNone
 
-	if !ready {
-		return cb.(*WarmupCB).Start(ts)
+	if state == OPEN {
+		lastOpenAt := l.lastOpenAt.Load().(time.Time)
+		timeout := l.revised_slo.Timeout
+
+		l.mu.Lock()
+		// Check cooldown phase
+		if !l.cooldownComplete {
+			if ts.Sub(lastOpenAt) < timeout {
+				l.mu.Unlock()
+				return StateChange{State: OPEN}, ErrCircuitOpen
+			}
+			// Cooldown complete, enter probing phase
+			l.cooldownComplete = true
+			trigger = TriggerTimeoutExpired
+		}
+		l.mu.Unlock()
+
+		// Probing phase: rate-limited calls
+		l.AddConcurrent()
+		if !l.allowCall() {
+			l.RemoveConcurrent()
+			return StateChange{State: OPEN, Trigger: trigger}, ErrCircuitOpen
+		}
+
+		l.mu.Lock()
+		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+		l.mu.Unlock()
+
+		return StateChange{State: OPEN, Trigger: trigger}, nil
 	}
-	return cb.Start(ts)
+
+	// CLOSED state
+	l.AddConcurrent()
+
+	shouldOpen, openTrigger := l.mustOpen()
+	if shouldOpen {
+		l.RemoveConcurrent()
+		l.OpenCircuit(ts)
+		return StateChange{State: OPEN, Trigger: openTrigger}, ErrCircuitOpen
+	}
+
+	l.mu.Lock()
+	l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+	l.mu.Unlock()
+
+	return StateChange{State: CLOSED, Trigger: trigger}, nil
 }
 
 func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
@@ -74,96 +151,112 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 }
 
 func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool) StateChange {
+	defer l.RemoveConcurrent()
+
+	errCount := 0.0
+	if !success {
+		errCount = 1.0
+	}
+	l.mu.Lock()
+	l.metrics.RecordLatency(float64(duration.Microseconds()), ts)
+	l.metrics.RecordErrors(errCount, ts)
+	l.mu.Unlock()
+
 	l.mu.RLock()
-	ready := l.ready
-	cb := l.cb
+	state := l.state
+	inProbingPhase := state == OPEN && l.cooldownComplete
 	l.mu.RUnlock()
 
-	if !ready {
-		wu := cb.(*WarmupCB)
-		var sc StateChange
-		if success {
-			sc = wu.Success(ts, duration)
-		} else {
-			sc = wu.Fail(ts, duration)
+	// Check recovery during OPEN probing phase
+	if inProbingPhase {
+		newState, trigger := l.newState()
+		switch newState {
+		case OPEN:
+			if trigger == TriggerRecoveryFailed {
+				// Recovery failed, reset cooldown to wait again
+				l.resetCooldown(ts)
+			}
+			// Otherwise continue probing (TriggerNone = not enough confidence yet)
+			return StateChange{State: OPEN, Trigger: trigger}
+		case CLOSED:
+			l.CloseCircuit()
+			return StateChange{State: CLOSED, Trigger: trigger}
 		}
-		if sc.State == CLOSED {
-			l.transitionFromWarmup(wu)
-		}
-		return sc
 	}
 
-	if success {
-		return cb.Success(ts, duration)
-	}
-	return cb.Fail(ts, duration)
-}
-
-func (l *Levee) transitionFromWarmup(wu *WarmupCB) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Check again with write lock to prevent duplicate transitions
-	if l.ready {
-		return
-	}
-
-	// Read warmup metrics with proper locking
-	wu.mu.RLock()
-	reqCount := wu.reqCount
-	start := wu.start
-	end := wu.end
-	slo := wu.slo
-	wu.mu.RUnlock()
-
-	// Figure out sample count based on SLO and detected RPS
-	rps := float64(reqCount) / (end.Sub(start).Seconds() - slo.Warmup.Seconds())
-	sloBasedSamples := 10 / (1 - slo.SuccessRate)
-	samples := max(rps, 100, sloBasedSamples)
-	samples = min(samples, 1<<16-1)
-	l.cb = NewCircuitBreaker(slo, uint16(samples))
-	l.ready = true
+	return StateChange{State: state, Trigger: TriggerNone}
 }
 
 func (l *Levee) Call(f func() error) (StateChange, error) {
-	l.mu.RLock()
-	ready := l.ready
-	cb := l.cb
-	l.mu.RUnlock()
+	start := time.Now()
 
-	if !ready {
-		wu := cb.(*WarmupCB)
-		sc, err := wu.Call(f)
-		if sc.State == CLOSED {
-			l.transitionFromWarmup(wu)
-		}
+	sc, err := l.Start(start)
+	if err != nil {
 		return sc, err
 	}
-	return cb.Call(f)
+
+	call_err := f()
+	end := time.Now()
+	duration := end.Sub(start)
+
+	if call_err != nil {
+		return l.Fail(end, duration), call_err
+	}
+	return l.Success(end, duration), call_err
+}
+
+func (l *Levee) OpenCircuit(ts time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.state == OPEN && !l.cooldownComplete {
+		return // Already in cooldown
+	}
+	l.metrics.Reset()
+	l.state = OPEN
+	l.cooldownComplete = false
+	l.lastOpenAt.Store(ts)
+}
+
+// resetCooldown resets the cooldown timer after a failed recovery attempt
+func (l *Levee) resetCooldown(ts time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.cooldownComplete = false
+	l.lastOpenAt.Store(ts)
+	l.metrics.Reset()
+}
+
+func (l *Levee) CloseCircuit() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.state == CLOSED {
+		return
+	}
+	l.state = CLOSED
+	l.cooldownComplete = false
 }
 
 func (l *Levee) State() State {
-	return l.cb.State()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	return l.state
 }
 
 func (l *Levee) StateUpdates() <-chan StateChange {
-	return l.cb.StateUpdates()
+	return nil
 }
 
+// Expunge resets the circuit breaker to CLOSED state with fresh metrics
 func (l *Levee) Expunge() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Get SLO from current CB (could be WarmupCB or CircuitBreaker)
-	var slo SLO
-	if wu, ok := l.cb.(*WarmupCB); ok {
-		slo = wu.slo
-	} else if cb, ok := l.cb.(*CircuitBreaker); ok {
-		cb.mu.RLock()
-		slo = cb.stated_slo
-		cb.mu.RUnlock()
-	}
-
-	l.ready = false
-	l.cb = NewWarmupCB(slo)
+	l.metrics = *newMetrics(100)
+	l.state = CLOSED
+	l.cooldownComplete = false
+	l.lastOpenAt.Store(time.Time{})
 }

@@ -15,6 +15,14 @@ import (
 	"github.com/codemartial/loadgen"
 )
 
+// CircuitBreaker is a local interface for benchmark compatibility
+type CircuitBreaker interface {
+	Start(time.Time) (levee.StateChange, error)
+	Success(time.Time, time.Duration) levee.StateChange
+	Fail(time.Time, time.Duration) levee.StateChange
+	State() levee.State
+}
+
 // PrescientBreaker knows the future from load specs and makes perfect decisions
 type PrescientBreaker struct {
 	slo       levee.SLO
@@ -33,16 +41,6 @@ func NewPrescientBreaker(slo levee.SLO, specs []loadgen.LoadSpec, startTime time
 // State returns the ideal state at the given timestamp based on load specs
 func (pb *PrescientBreaker) State(ts time.Time) levee.State {
 	elapsed := ts.Sub(pb.startTime)
-
-	// Skip warmup period - stay INIT
-	if elapsed < pb.slo.Warmup {
-		return levee.INIT
-	}
-
-	// After warmup, transition to CLOSED
-	if elapsed < pb.slo.Warmup+time.Second {
-		return levee.CLOSED
-	}
 
 	// Find current spec
 	totalDuration := time.Duration(0)
@@ -249,7 +247,7 @@ func (m *PrescientMetrics) categorizeTransitions() {
 	)
 
 	var lastLeveeCloseTime time.Time
-	var lastEffectiveState levee.State = levee.INIT
+	var lastEffectiveState levee.State = levee.CLOSED
 
 	for _, raw := range m.rawLeveeTransitions {
 		var category string
@@ -393,7 +391,7 @@ func (m *PrescientMetrics) findNextPrescientCloseAfter(t time.Time) time.Time {
 
 // getPrescientStateAt returns prescient state at a given time
 func (m *PrescientMetrics) getPrescientStateAt(t time.Time) levee.State {
-	state := levee.INIT
+	state := levee.CLOSED
 	for _, sc := range m.prescientStateChanges {
 		if sc.Timestamp.After(t) {
 			break
@@ -639,7 +637,7 @@ func classifyTransitionsForCB(cbName string, raw []RawLeveeTransition, prescient
 
 	var result []CBClassifiedTransition
 	var lastCloseTime time.Time
-	var lastEffective levee.State = levee.INIT
+	var lastEffective levee.State = levee.CLOSED
 
 	for _, t := range raw {
 		toEffective := effectiveState(t.ToState)
@@ -1147,7 +1145,7 @@ func writeUnifiedComparativeSummary(unified *UnifiedBenchmarkResult) {
 }
 
 // runBenchmark runs the benchmark for a single ICircuitBreaker candidate with optional time windowing
-func runBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker levee.ICircuitBreaker, cfg BenchmarkConfig) *PrescientMetrics {
+func runBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker CircuitBreaker, cfg BenchmarkConfig) *PrescientMetrics {
 	metrics := NewPrescientMetrics()
 	penalty := &RunningPenalty{}
 
@@ -1162,7 +1160,7 @@ func runBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker levee.ICircui
 	breakerHasOpened := false
 	var lastEvent loadgen.SimEvent
 	var prevBreakerState levee.State = breaker.State()
-	var prevPrescientState levee.State = levee.INIT
+	var prevPrescientState levee.State = levee.CLOSED
 
 	// Skip to start offset if specified
 	if cfg.StartOffset > 0 {
@@ -1311,7 +1309,6 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
-		Warmup:      10 * time.Second,
 	}
 
 	specs := generateCyberMondayWorkload()
@@ -1321,7 +1318,7 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 	// Run benchmark for each candidate in parallel
 	candidates := []struct {
 		name    string
-		breaker levee.ICircuitBreaker
+		breaker CircuitBreaker
 	}{
 		{"Levee", levee.NewLevee(slo)},
 		{"Static-BAU", NewStaticBAU()},
@@ -1333,7 +1330,7 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 
 	for _, c := range candidates {
 		wg.Add(1)
-		go func(name string, breaker levee.ICircuitBreaker) {
+		go func(name string, breaker CircuitBreaker) {
 			defer wg.Done()
 			fmt.Fprintf(os.Stderr, "\n>>> Running benchmark for %s...\n", name)
 			metrics := runCandidateBenchmark(slo, specs, breaker)
@@ -1359,7 +1356,7 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 }
 
 // runCandidateBenchmark runs the benchmark for a single ICircuitBreaker candidate
-func runCandidateBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker levee.ICircuitBreaker) *PrescientMetrics {
+func runCandidateBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker CircuitBreaker) *PrescientMetrics {
 	return runBenchmark(slo, specs, breaker, BenchmarkConfig{})
 }
 
@@ -1419,7 +1416,6 @@ func BenchmarkGenerateStateFile(b *testing.B) {
 	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
-		Warmup:      10 * time.Second,
 	}
 
 	specs := generateCyberMondayWorkload()
@@ -1456,7 +1452,6 @@ func BenchmarkCyberMondayPrescientTruncated(b *testing.B) {
 	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
-		Warmup:      10 * time.Second,
 	}
 
 	specs := generateCyberMondayWorkload()

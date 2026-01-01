@@ -1,5 +1,7 @@
 package levee
 
+import "time"
+
 // LeveeState represents the saved EWMA state from a Levee circuit breaker
 // This struct is designed to be serializable (e.g., with JSON/gob encoding)
 type LeveeState struct {
@@ -32,57 +34,43 @@ type LeveeState struct {
 }
 
 // SaveState extracts the EWMA state from a Levee instance
-// Returns nil if Levee is not ready or if EWMAs haven't been initialized yet
+// Returns nil if EWMAs haven't been initialized yet
 func (l *Levee) SaveState() (*LeveeState, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	// Only save state if Levee is ready (using CircuitBreaker, not WarmupCB)
-	if !l.ready {
-		return nil, nil
-	}
-
-	// Type assert to CircuitBreaker to access metrics
-	cb, ok := l.cb.(*CircuitBreaker)
-	if !ok {
-		return nil, nil
-	}
-
-	cb.mu.RLock()
-	defer cb.mu.RUnlock()
-
 	// Check if EWMAs have been initialized (if one is nil, all are nil)
-	if cb.metrics.concurrency.value == nil {
+	if l.metrics.concurrency.value == nil {
 		return nil, nil
 	}
 
 	state := &LeveeState{
-		SLO:        cb.stated_slo,
-		BufferSize: cb.metrics.concurrency._size,
+		SLO:        l.stated_slo,
+		BufferSize: l.metrics.concurrency._size,
 
 		// Concurrency EWMAs
-		ConcurrencyValueBase:     cb.metrics.concurrency.value.base,
-		ConcurrencyValueMid:      cb.metrics.concurrency.value.ewmaMid,
-		ConcurrencyValueLong:     cb.metrics.concurrency.value.ewmaLong,
-		ConcurrencyDeviationBase: cb.metrics.concurrency.deviation.base,
-		ConcurrencyDeviationMid:  cb.metrics.concurrency.deviation.ewmaMid,
-		ConcurrencyDeviationLong: cb.metrics.concurrency.deviation.ewmaLong,
+		ConcurrencyValueBase:     l.metrics.concurrency.value.base,
+		ConcurrencyValueMid:      l.metrics.concurrency.value.ewmaMid,
+		ConcurrencyValueLong:     l.metrics.concurrency.value.ewmaLong,
+		ConcurrencyDeviationBase: l.metrics.concurrency.deviation.base,
+		ConcurrencyDeviationMid:  l.metrics.concurrency.deviation.ewmaMid,
+		ConcurrencyDeviationLong: l.metrics.concurrency.deviation.ewmaLong,
 
 		// Latency EWMAs
-		LatencyValueBase:     cb.metrics.latency.value.base,
-		LatencyValueMid:      cb.metrics.latency.value.ewmaMid,
-		LatencyValueLong:     cb.metrics.latency.value.ewmaLong,
-		LatencyDeviationBase: cb.metrics.latency.deviation.base,
-		LatencyDeviationMid:  cb.metrics.latency.deviation.ewmaMid,
-		LatencyDeviationLong: cb.metrics.latency.deviation.ewmaLong,
+		LatencyValueBase:     l.metrics.latency.value.base,
+		LatencyValueMid:      l.metrics.latency.value.ewmaMid,
+		LatencyValueLong:     l.metrics.latency.value.ewmaLong,
+		LatencyDeviationBase: l.metrics.latency.deviation.base,
+		LatencyDeviationMid:  l.metrics.latency.deviation.ewmaMid,
+		LatencyDeviationLong: l.metrics.latency.deviation.ewmaLong,
 
 		// Error EWMAs
-		ErrorsValueBase:     cb.metrics.errors.value.base,
-		ErrorsValueMid:      cb.metrics.errors.value.ewmaMid,
-		ErrorsValueLong:     cb.metrics.errors.value.ewmaLong,
-		ErrorsDeviationBase: cb.metrics.errors.deviation.base,
-		ErrorsDeviationMid:  cb.metrics.errors.deviation.ewmaMid,
-		ErrorsDeviationLong: cb.metrics.errors.deviation.ewmaLong,
+		ErrorsValueBase:     l.metrics.errors.value.base,
+		ErrorsValueMid:      l.metrics.errors.value.ewmaMid,
+		ErrorsValueLong:     l.metrics.errors.value.ewmaLong,
+		ErrorsDeviationBase: l.metrics.errors.deviation.base,
+		ErrorsDeviationMid:  l.metrics.errors.deviation.ewmaMid,
+		ErrorsDeviationLong: l.metrics.errors.deviation.ewmaLong,
 	}
 
 	return state, nil
@@ -90,49 +78,49 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 
 // RestoreState creates a new Levee in CLOSED state with EWMAs restored from saved state
 func RestoreState(state *LeveeState) *Levee {
-	// Create a new CircuitBreaker with the saved SLO and buffer size
-	cb := NewCircuitBreaker(state.SLO, state.BufferSize)
+	l := &Levee{
+		stated_slo:  state.SLO,
+		revised_slo: state.SLO,
+		metrics:     *newMetrics(state.BufferSize),
+		state:       CLOSED,
+	}
+	l.lastOpenAt.Store(time.Time{})
 
 	// Restore concurrency EWMAs
-	cb.metrics.concurrency.value = &EWMA{
+	l.metrics.concurrency.value = &EWMA{
 		base:     state.ConcurrencyValueBase,
 		ewmaMid:  state.ConcurrencyValueMid,
 		ewmaLong: state.ConcurrencyValueLong,
 	}
-	cb.metrics.concurrency.deviation = &EWMA{
+	l.metrics.concurrency.deviation = &EWMA{
 		base:     state.ConcurrencyDeviationBase,
 		ewmaMid:  state.ConcurrencyDeviationMid,
 		ewmaLong: state.ConcurrencyDeviationLong,
 	}
 
 	// Restore latency EWMAs
-	cb.metrics.latency.value = &EWMA{
+	l.metrics.latency.value = &EWMA{
 		base:     state.LatencyValueBase,
 		ewmaMid:  state.LatencyValueMid,
 		ewmaLong: state.LatencyValueLong,
 	}
-	cb.metrics.latency.deviation = &EWMA{
+	l.metrics.latency.deviation = &EWMA{
 		base:     state.LatencyDeviationBase,
 		ewmaMid:  state.LatencyDeviationMid,
 		ewmaLong: state.LatencyDeviationLong,
 	}
 
 	// Restore error EWMAs
-	cb.metrics.errors.value = &EWMA{
+	l.metrics.errors.value = &EWMA{
 		base:     state.ErrorsValueBase,
 		ewmaMid:  state.ErrorsValueMid,
 		ewmaLong: state.ErrorsValueLong,
 	}
-	cb.metrics.errors.deviation = &EWMA{
+	l.metrics.errors.deviation = &EWMA{
 		base:     state.ErrorsDeviationBase,
 		ewmaMid:  state.ErrorsDeviationMid,
 		ewmaLong: state.ErrorsDeviationLong,
 	}
 
-	// Create Levee with restored CircuitBreaker, already in ready state (CLOSED)
-	return &Levee{
-		ready: true,
-		cb:    cb,
-		state: make(chan State),
-	}
+	return l
 }
