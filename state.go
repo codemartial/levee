@@ -45,7 +45,7 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 	}
 
 	state := &LeveeState{
-		SLO:        l.stated_slo,
+		SLO:        l.slo,
 		BufferSize: l.metrics.concurrency._size,
 
 		// Concurrency EWMAs
@@ -79,10 +79,9 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 // RestoreState creates a new Levee in CLOSED state with EWMAs restored from saved state
 func RestoreState(state *LeveeState) *Levee {
 	l := &Levee{
-		stated_slo:  state.SLO,
-		revised_slo: state.SLO,
-		metrics:     *newMetrics(state.BufferSize),
-		state:       CLOSED,
+		slo:     state.SLO,
+		metrics: *newMetrics(state.BufferSize),
+		state:   CLOSED,
 	}
 	l.lastOpenAt.Store(time.Time{})
 

@@ -8,13 +8,14 @@
 
 ## What is Levee?
 
-Levee is a self-tuning circuit breaker and concurrency based rate limiter for Go services.
+Levee is a self-tuning circuit breaker and concurrency-based rate limiter for Go services.
 
 - Always watching, always adapting
 - Fully self-contained, 100% in-process operation
 - No external dependencies
+- Fleet-friendly with probabilistic rate-limiting during recovery
 
-Use a circuit breaker on outbound requests to prevent cascading failures from degraded or faulty dependencies. Use a rate limiter on incoming requests to prevent failure due to overload. 
+Use a circuit breaker on outbound requests to prevent cascading failures from degraded or faulty dependencies. Use a rate limiter on incoming requests to prevent failure due to overload.
 
 Levee is designed to be dead simple to integrate and take the guesswork out of configuring operational parameters.
 
@@ -24,7 +25,7 @@ Inspired by Hystrix from Netflix.
 
 Circuit breakers and concurrency limiters are essential components of any distributed system. However, the operating parameters of services can change over time, both short term (e.g., due to a sudden spike in traffic) and long term (e.g., due to changes in the service's dependencies).
 
-This means that the parameters of the circuit breaker and concurrency limiter need to be adjusted frequently to ensure optimal performance, but they're rarely updated often enough. Besides, circuit breaker tuning is done unscientifically, based on heuristics and guesswork. 
+This means that the parameters of the circuit breaker and concurrency limiter need to be adjusted frequently to ensure optimal performance, but they're rarely updated often enough. Besides, circuit breaker tuning is done unscientifically, based on heuristics and guesswork.
 
 This can lead to suboptimal performance, with the circuit breaker either being too aggressive (causing unnecessary service denial) or too lenient (allowing cascading failures).
 
@@ -52,7 +53,6 @@ func main() {
 	slo := levee.SLO{
 		SuccessRate: 0.95,
 		Timeout:     time.Millisecond * 100,
-		Warmup:      time.Second * 300,
 	}
 
 	l := levee.NewLevee(slo)
@@ -62,22 +62,20 @@ func main() {
 		return nil
 	})
 
-  switch stateChange.state {
-  case levee.INIT:
-  	fmt.Println("Circuit breaker is Initializing")
-  case levee.OPEN:
-  	fmt.Println("Circuit breaker is Open")
-  case levee.HALF_OPEN:
-  	fmt.Println("Circuit breaker is Half Open")
-  case levee.CLOSED:
-  	fmt.Println("Circuit breaker is Closed")
-  }
+	switch stateChange.State {
+	case levee.OPEN:
+		fmt.Println("Circuit breaker is Open")
+	case levee.THROTTLED:
+		fmt.Println("Circuit breaker is Throttling")
+	case levee.CLOSED:
+		fmt.Println("Circuit breaker is Closed")
+	}
 }
 ```
 
 ### Advanced, out-of-band usage:
 
-Levee can now be called out-of-band so you can better organise your
+Levee can be called out-of-band so you can better organise your
 code and just call Levee at the start and end of your tasks. You can
 even control the timing, e.g. for stream processors that work on
 event-time or ingestion-time. Here's an example:
@@ -96,7 +94,6 @@ func main() {
 	slo := levee.SLO{
 		SuccessRate: 0.95,
 		Timeout:     time.Millisecond * 100,
-		Warmup:      time.Second * 300,
 	}
 
 	l := levee.NewLevee(slo)
@@ -129,14 +126,16 @@ func main() {
 ## Benchmark
 
 Levee outperforms meticulously configured static circuit breakers by
-over 2x better decision-making, both while preventing overload (up to
-10x better) and preventing unwanted loss of business (up to 1.7x better).
+up to 4x in decision-making quality, both while preventing overload (up to
+10x better) and preventing unwanted loss of business (up to 3x better).
+
+Run with: `go test -bench=BenchmarkCyberMondayPrescient -benchtime=1x -v`
 
 ## TODO
 Levee is still a work in progress. Here are some of the things that need to be done:
 1. ~~Implement concurrent access~~ (done)
 2. ~~Implement save state and restore state capability~~ (done)
-4. Implement state updates over channels
-5. Implement system load monitoring
+3. Implement state updates over channels
+4. Implement system load monitoring
 
 *The last one is rather tricky. There is no standard way to access the environment load in Go. The best I may be able to do is to make it Linux specific. Even that is complicated being split between VM/BM and containers.*

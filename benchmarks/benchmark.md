@@ -128,8 +128,8 @@ Static-Peak     |    3713193 |   52805124 |    4 |          0 |          4 |    
 
 The results illustrates the **sensitivity vs. specificity trade-off** that static configurations fail at.
 
-- **Levee**: Fast detection (over 10x lower BadTraffic) while still
-  preventing loss of business (over 1.5x lower LostBusiness) 
+- **Levee**: Fast detection (up to 10x lower BadTraffic) while still
+  preventing loss of business (up to 3x lower LostBusiness) 
 - **Static-Peak**: Conservative (low LostBusiness, minimal flapping)
   but slow to detect (high BadTraffic)
 - **Static-BAU**: The most likely configuration is also the worst

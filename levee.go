@@ -2,6 +2,7 @@ package levee
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,13 +17,9 @@ type SLO struct {
 type State uint8
 
 const (
-	CLOSED State = iota
-	OPEN      // Combines old OPEN + HALF_OPEN: initial cooldown, then rate-limited probing
-	THROTTLED // Rate-limiting state based on concurrency-error correlation
-
-	// HALF_OPEN is deprecated - kept for backward compatibility with benchmarks
-	// In v0.3.0, HALF_OPEN behavior is merged into OPEN with cooldown phases
-	HALF_OPEN = OPEN
+	CLOSED    State = iota
+	OPEN            // Initial cooldown, then rate-limited probing until recovery
+	THROTTLED       // Rate-limiting state based on latency anomaly detection
 )
 
 type Trigger error
@@ -35,24 +32,16 @@ type StateChange struct {
 var (
 	ErrCircuitOpen      = errors.New("circuit is open")
 	ErrCircuitThrottled = errors.New("circuit is throttled")
-
-	// ErrCircuitHalfOpen is deprecated - kept for backward compatibility
-	// In v0.3.0, HALF_OPEN is merged into OPEN with rate-limited probing
-	ErrCircuitHalfOpen = ErrCircuitOpen
 )
 
 // Trigger constants for state changes
 var (
-	TriggerNone              Trigger = triggerError("no state change")
-	TriggerSLOViolation      Trigger = triggerError("SLO violation")
-	TriggerLatencyAnomaly    Trigger = triggerError("latency anomaly")
-	TriggerRecoverySucceeded Trigger = triggerError("recovery succeeded")
-	TriggerRecoveryFailed    Trigger = triggerError("recovery failed")
-	TriggerTimeoutExpired    Trigger = triggerError("timeout expired")
-
-	// THROTTLED state triggers
-	TriggerConcurrencyOverload  Trigger = triggerError("concurrency overload")
-	TriggerThrottlingFailed     Trigger = triggerError("throttling failed")
+	TriggerNone                 Trigger = triggerError("no state change")
+	TriggerSLOViolation         Trigger = triggerError("SLO violation")
+	TriggerLatencyAnomaly       Trigger = triggerError("latency anomaly")
+	TriggerRecoverySucceeded    Trigger = triggerError("recovery succeeded")
+	TriggerRecoveryFailed       Trigger = triggerError("recovery failed")
+	TriggerTimeoutExpired       Trigger = triggerError("timeout expired")
 	TriggerThrottlingStabilised Trigger = triggerError("throttling stabilised")
 )
 
@@ -63,8 +52,7 @@ func (e triggerError) Error() string { return string(e) }
 // Levee is an adaptive circuit breaker
 type Levee struct {
 	mu          sync.RWMutex
-	stated_slo  SLO
-	revised_slo SLO
+	slo         SLO
 	metrics     metrics
 	concurrents int32
 	state       State
@@ -73,16 +61,25 @@ type Levee struct {
 	// OPEN state phases: cooldown (wait for timeout) then probing
 	cooldownComplete bool
 
-	// THROTTLED state: current safe concurrency limit
-	throttleConcurrency float64
+	// THROTTLED state: AIMD-based concurrency control
+	throttleConcurrency   atomic.Uint64 // prevailing concurrency in THROTTLED state
+	throttleTargetLatency float64       // baseline latency when throttling started
+	throttleSampleCount   int           // samples since last AIMD adjustment
+}
+
+func (l *Levee) loadThrottleConcurrency() float64 {
+	return math.Float64frombits(l.throttleConcurrency.Load())
+}
+
+func (l *Levee) storeThrottleConcurrency(v float64) {
+	l.throttleConcurrency.Store(math.Float64bits(v))
 }
 
 func NewLevee(slo SLO) *Levee {
 	l := &Levee{
-		stated_slo:  slo,
-		revised_slo: slo,
-		metrics:     *newMetrics(100), // Fixed initial size
-		state:       CLOSED,
+		slo:     slo,
+		metrics: *newMetrics(100),
+		state:   CLOSED,
 	}
 	l.lastOpenAt.Store(time.Time{})
 	return l
@@ -107,7 +104,7 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	// OPEN state handling (with cooldown)
 	if state == OPEN {
 		lastOpenAt := l.lastOpenAt.Load().(time.Time)
-		timeout := l.revised_slo.Timeout
+		timeout := l.slo.Timeout
 
 		l.mu.Lock()
 		// Check cooldown phase
@@ -122,9 +119,9 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		}
 		l.mu.Unlock()
 
-		// Probing phase: rate-limited calls
+		// Probing phase: rate-limited calls via probingAllowed()
 		l.AddConcurrent()
-		if !l.allowCall() {
+		if !l.probingAllowed() {
 			l.RemoveConcurrent()
 			return StateChange{State: OPEN, Trigger: trigger}, ErrCircuitOpen
 		}
@@ -136,45 +133,10 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		return StateChange{State: OPEN, Trigger: trigger}, nil
 	}
 
+	// CLOSED/THROTTLED state handling (both are normal operational states)
 	l.AddConcurrent()
 
-	// THROTTLED state handling
-	if state == THROTTLED {
-		if l.throttlingFailed() {
-			l.RemoveConcurrent()
-			l.OpenCircuit(ts)
-			return StateChange{State: OPEN, Trigger: TriggerThrottlingFailed}, ErrCircuitOpen
-		}
-
-		// Enforce concurrency limit
-		l.mu.RLock()
-		throttleLimit := l.throttleConcurrency
-		l.mu.RUnlock()
-
-		if float64(l.Concurrents()) > throttleLimit {
-			l.RemoveConcurrent()
-			return StateChange{State: THROTTLED}, ErrCircuitThrottled
-		}
-
-		// Re-evaluate safe concurrency
-		l.mu.Lock()
-		l.throttleConcurrency = l.safeConcurrency()
-		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
-		l.mu.Unlock()
-
-		return StateChange{State: THROTTLED}, nil
-	}
-
-	// CLOSED state handling
-	// Check throttle BEFORE mustOpen
-	if shouldThrottle, safeConcurrency := l.shouldThrottle(); shouldThrottle {
-		l.EnterThrottled(safeConcurrency)
-		l.mu.Lock()
-		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
-		l.mu.Unlock()
-		return StateChange{State: THROTTLED, Trigger: TriggerConcurrencyOverload}, nil
-	}
-
+	// Check if we should open circuit (SLO violation only)
 	shouldOpen, openTrigger := l.mustOpen()
 	if shouldOpen {
 		l.RemoveConcurrent()
@@ -182,11 +144,96 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		return StateChange{State: OPEN, Trigger: openTrigger}, ErrCircuitOpen
 	}
 
+	// Check for latency anomaly to decide throttling
+	hasAnomaly, anomalyConcurrency := l.hasLatencyAnomaly()
+
+	// Handle CLOSED state
+	if state == CLOSED {
+		if !hasAnomaly {
+			// CLOSED → CLOSED: normal operation
+			l.mu.Lock()
+			l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+			l.mu.Unlock()
+			return StateChange{State: CLOSED, Trigger: TriggerNone}, nil
+		}
+
+		// CLOSED → THROTTLED: latency anomaly detected
+		l.mu.RLock()
+		floor := l.metrics.concurrency.Stat(Mean, Long)
+		targetLatency := l.metrics.latency.Mean()
+		l.mu.RUnlock()
+
+		ceiling := max(anomalyConcurrency, floor)
+		l.EnterThrottled(ceiling, targetLatency)
+
+		// Re-read actual ceiling (another goroutine may have set a different value)
+		ceiling = l.loadThrottleConcurrency()
+		if ceiling == 0 {
+			// Throttling was exited by another goroutine, proceed as CLOSED
+			l.mu.Lock()
+			l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+			l.mu.Unlock()
+			return StateChange{State: CLOSED, Trigger: TriggerNone}, nil
+		}
+
+		if float64(l.Concurrents()) > ceiling {
+			l.RemoveConcurrent()
+			return StateChange{State: THROTTLED, Trigger: TriggerLatencyAnomaly}, ErrCircuitThrottled
+		}
+
+		l.mu.Lock()
+		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+		l.mu.Unlock()
+		return StateChange{State: THROTTLED, Trigger: TriggerLatencyAnomaly}, nil
+	}
+
+	// Handle THROTTLED state
+	if !hasAnomaly && l.throttlingStabilised() {
+		// THROTTLED → CLOSED: errors stabilised
+		l.mu.Lock()
+		l.state = CLOSED
+		l.storeThrottleConcurrency(0)
+		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
+		l.mu.Unlock()
+		return StateChange{State: CLOSED, Trigger: TriggerThrottlingStabilised}, nil
+	}
+
+	// THROTTLED → THROTTLED: continue with AIMD adjustment
+	l.mu.Lock()
+	l.throttleSampleCount++
+	if l.throttleSampleCount >= 50 {
+		l.throttleSampleCount = 0
+		currentLatency := l.metrics.latency.Mean()
+		floor := l.metrics.concurrency.Stat(Mean, Long)
+		currentCeiling := l.loadThrottleConcurrency()
+
+		if currentLatency <= l.throttleTargetLatency*1.1 {
+			// Latency stable - increase ceiling
+			currentCeiling *= 1.1
+		} else if hasAnomaly {
+			// Latency elevated - decrease ceiling aggressively
+			currentCeiling *= 0.5
+			l.throttleTargetLatency = currentLatency
+		}
+
+		// Floor at long-term average
+		if currentCeiling < floor {
+			currentCeiling = floor
+		}
+		l.storeThrottleConcurrency(currentCeiling)
+	}
+	ceiling := l.loadThrottleConcurrency()
+	l.mu.Unlock()
+
+	if float64(l.Concurrents()) > ceiling {
+		l.RemoveConcurrent()
+		return StateChange{State: THROTTLED, Trigger: TriggerNone}, ErrCircuitThrottled
+	}
+
 	l.mu.Lock()
 	l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
 	l.mu.Unlock()
-
-	return StateChange{State: CLOSED, Trigger: trigger}, nil
+	return StateChange{State: THROTTLED, Trigger: TriggerNone}, nil
 }
 
 func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
@@ -207,12 +254,10 @@ func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool
 	l.mu.Lock()
 	l.metrics.RecordLatency(float64(duration.Microseconds()), ts)
 	l.metrics.RecordErrors(errCount, ts)
-	l.mu.Unlock()
 
-	l.mu.RLock()
 	state := l.state
 	inProbingPhase := state == OPEN && l.cooldownComplete
-	l.mu.RUnlock()
+	l.mu.Unlock()
 
 	// Check recovery during OPEN probing phase
 	if inProbingPhase {
@@ -228,14 +273,6 @@ func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool
 		case CLOSED:
 			l.CloseCircuit()
 			return StateChange{State: CLOSED, Trigger: trigger}
-		}
-	}
-
-	// Check THROTTLED stabilisation
-	if state == THROTTLED {
-		if l.throttlingStabilised() {
-			l.CloseCircuit()
-			return StateChange{State: CLOSED, Trigger: TriggerThrottlingStabilised}
 		}
 	}
 
@@ -292,11 +329,11 @@ func (l *Levee) CloseCircuit() {
 	}
 	l.state = CLOSED
 	l.cooldownComplete = false
-	l.throttleConcurrency = 0
+	l.storeThrottleConcurrency(0)
 }
 
 // EnterThrottled transitions to THROTTLED state with the given concurrency limit
-func (l *Levee) EnterThrottled(safeConcurrency float64) {
+func (l *Levee) EnterThrottled(safeConcurrency, targetLatency float64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -304,7 +341,9 @@ func (l *Levee) EnterThrottled(safeConcurrency float64) {
 		return
 	}
 
-	l.throttleConcurrency = safeConcurrency
+	l.storeThrottleConcurrency(safeConcurrency)
+	l.throttleTargetLatency = targetLatency
+	l.throttleSampleCount = 0
 	l.state = THROTTLED
 	// Note: Do NOT reset metrics here - we need to preserve history for mustOpen() checks
 }

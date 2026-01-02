@@ -40,8 +40,8 @@ type TimeSeries struct {
 	isFilled bool
 
 	// Dynamic sizing state
-	lastResizeAt   time.Time
-	lastWrapAt     time.Time
+	lastResizeAt     time.Time
+	lastWrapAt       time.Time
 	recordsSinceWrap uint32
 }
 
@@ -110,10 +110,7 @@ func (s *TimeSeries) RecordAt(value float64, ts time.Time) {
 }
 
 // maybeResize evaluates whether the buffer should be resized
-// DISABLED: Dynamic sizing causes issues with hasSufficientHistory() after metrics reset
 func (s *TimeSeries) maybeResize(ts time.Time) {
-	return // Disabled - using fixed buffer size of 100
-
 	// Skip if we don't have timing info yet
 	if s.lastWrapAt.IsZero() {
 		return
@@ -128,19 +125,13 @@ func (s *TimeSeries) maybeResize(ts time.Time) {
 	fillTime := ts.Sub(s.lastWrapAt)
 
 	if fillTime < targetFillTimeMin && s._size > minBufferSize {
-		// Buffer fills too fast, shrink by factor of 2
-		newSize := s._size / 2
-		if newSize < minBufferSize {
-			newSize = minBufferSize
-		}
+		// Buffer fills too fast, grow by factor of 2
+		newSize := min(s._size*2, maxBufferSize)
 		s.resize(newSize)
 		s.lastResizeAt = ts
 	} else if fillTime > targetFillTimeMax && s._size < maxBufferSize {
-		// Buffer fills too slow, grow by factor of 2
-		newSize := s._size * 2
-		if newSize > maxBufferSize {
-			newSize = maxBufferSize
-		}
+		// Buffer fills too slow, shrink by factor of 2
+		newSize := max(s._size/2, minBufferSize)
 		s.resize(newSize)
 		s.lastResizeAt = ts
 	}

@@ -2,27 +2,57 @@ package levee
 
 import (
 	"math"
+	"math/rand/v2"
 )
 
-func (l *Levee) allowCall() bool {
+// probingAllowed checks if a call should be allowed during OPEN probing phase.
+// Rate-limits to ~10% of historical throughput, scaling with error rate.
+func (l *Levee) probingAllowed() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	if l.state != OPEN || !l.cooldownComplete {
-		panic("Bug Encountered. This method must only be called during OPEN probing phase")
-	}
 
-	// historicals
-	hErrors := l.metrics.errors.Stat(Mean, Mid)
+	const minSamples = 10
+
+	// Always use historical EWMA for concurrency (preserved across cooldown)
 	hConcurrency := l.metrics.concurrency.Stat(Mean, Mid)
-
-	var allowedConcurrency int32 = 1
-	if hConcurrency > 0 {
-		allowedConcurrency = max(1, int32((1-hErrors)*hConcurrency))
+	if hConcurrency <= 0 {
+		return l.concurrents <= 1
 	}
 
-	return l.concurrents <= allowedConcurrency
+	// Floor at 10% of historical concurrency, capped at 1
+	// This rate-limits probing to ~10% of baseline throughput fleet-wide
+	floor := min(1.0, 0.1*hConcurrency)
+
+	// Get error rate: fresh data if available, otherwise use floor only
+	var hErrors float64
+	if l.metrics.errors.isFilled {
+		hErrors = l.metrics.errors.Stat(Mean, Mid)
+	} else if l.metrics.errors.RawValueCount() >= minSamples {
+		hErrors = l.metrics.errors.Mean()
+	} else {
+		// Not enough samples yet, probe at floor rate
+		return l.allowCall(floor)
+	}
+
+	// Scale by success rate, but never below floor
+	allowedConcurrency := max((1-hErrors)*hConcurrency, floor)
+	return l.allowCall(allowedConcurrency)
 }
 
+// allowCall checks if current concurrency is within allowed limit.
+// Uses probabilistic admission when allowedConcurrency < 1.
+func (l *Levee) allowCall(allowedConcurrency float64) bool {
+	if allowedConcurrency >= 1 {
+		return float64(l.concurrents) <= allowedConcurrency
+	}
+	// Below 1: at most 1 concurrent, probabilistically allowed
+	if l.concurrents > 1 {
+		return false
+	}
+	return rand.Float64() < allowedConcurrency
+}
+
+// newState evaluates if recovery has succeeded or failed during OPEN probing.
 func (l *Levee) newState() (State, Trigger) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -33,39 +63,25 @@ func (l *Levee) newState() (State, Trigger) {
 
 	const minSamples = 10
 	n := float64(l.metrics.errors.RawValueCount())
-
 	if n < minSamples {
-		return OPEN, TriggerNone // Continue probing
+		return OPEN, TriggerNone
 	}
 
 	rawErrorRate := l.metrics.errors.Mean()
-	requiredSuccessRate := l.stated_slo.SuccessRate - (1-l.stated_slo.SuccessRate)*0.1
+	requiredSuccessRate := l.slo.SuccessRate - (1-l.slo.SuccessRate)*0.1
 
-	// Use Adjusted Wald method to compute confidence interval for success rate
-	// Using 2σ (95% confidence)
-	const z = 2.0
-	const z2 = z * z
-
-	successCount := n * (1 - rawErrorRate)
-	nAdj := n + z2
-	pTilde := (successCount + z2/2) / nAdj
-	se := math.Sqrt(pTilde * (1 - pTilde) / nAdj)
-
-	lowerBound := pTilde - z*se // Success rate is at least this much or more
-	upperBound := pTilde + z*se // Success rate is not more than this much
-
-	if upperBound < requiredSuccessRate {
+	successCI := waldConfidenceInterval(n, 1-rawErrorRate, 2.0)
+	if successCI.upper < requiredSuccessRate {
 		return OPEN, TriggerRecoveryFailed
 	}
-
-	if lowerBound >= requiredSuccessRate {
+	if successCI.lower >= requiredSuccessRate {
 		return CLOSED, TriggerRecoverySucceeded
 	}
 
-	// Not enough confidence yet, keep probing
 	return OPEN, TriggerNone
 }
 
+// mustOpen checks if circuit should open due to SLO violation.
 func (l *Levee) mustOpen() (bool, Trigger) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -75,210 +91,97 @@ func (l *Levee) mustOpen() (bool, Trigger) {
 	}
 
 	n := float64(l.metrics.errors.RawValueCount())
-	errorMean := l.metrics.errors.Mean()
-	rawSuccessRate := 1 - errorMean
+	rawSuccessRate := 1 - l.metrics.errors.Mean()
 
-	// Adjusted Wald method for confidence interval
-	// Using 3σ (99.7% confidence)
-	const z = 3.0
-	const z2 = z * z
+	successCI := waldConfidenceInterval(n, rawSuccessRate, 3.0)
+	srThreshold := l.slo.SuccessRate - (1-l.slo.SuccessRate)*0.1
 
-	successCount := n * rawSuccessRate
-	nAdj := n + z2
-	pTilde := (successCount + z2/2) / nAdj
-	se := math.Sqrt(pTilde * (1 - pTilde) / nAdj)
-
-	upperBound := pTilde + z*se // Upper bound of success rate confidence interval
-
-	srThreshold := l.stated_slo.SuccessRate - (1-l.stated_slo.SuccessRate)*0.1
-	if upperBound < srThreshold {
+	if successCI.upper < srThreshold {
 		return true, TriggerSLOViolation
-	}
-
-	// Trend check: compare live Mean() to Base (last buffer wrap)
-	currentLatency := l.metrics.latency.Mean()
-	baseLatency := l.metrics.latency.Stat(Mean, Base)
-	currentConcurrency := l.metrics.concurrency.Mean()
-	baseConcurrency := l.metrics.concurrency.Stat(Mean, Base)
-
-	// If both latency and concurrency are trending down, situation is improving
-	if currentLatency < baseLatency && currentConcurrency < baseConcurrency {
-		return false, TriggerNone
-	}
-
-	// Check against both time horizons
-	midAnomaly := unexpectedLatencySpike(&l.metrics, Mid)
-	longAnomaly := unexpectedLatencySpike(&l.metrics, Long)
-
-	if midAnomaly || longAnomaly {
-		return true, TriggerLatencyAnomaly
 	}
 	return false, TriggerNone
 }
 
-func unexpectedLatencySpike(m *metrics, horizon StatRange) bool {
-	const epsilon = 1e-9
-
-	currentLatency := m.latency.Mean()
-	currentConcurrency := m.concurrency.Mean()
-	historicalLatency := m.latency.Stat(Mean, horizon)
-	historicalConcurrency := m.concurrency.Stat(Mean, horizon)
-	historicalLatencyDev := m.latency.Stat(Deviation, horizon)
-
-	// RPS calculation
-	currentRPS := currentConcurrency / max(currentLatency, epsilon)
-	historicalRPS := historicalConcurrency / max(historicalLatency, epsilon)
-
-	// RPS multiplier: how much did traffic change?
-	rpsX := currentRPS / max(historicalRPS, epsilon)
-
-	// Expected latency multiplier: sub-linear scaling with load
-	var expectedLatencyX float64
-	if rpsX >= 1.0 {
-		expectedLatencyX = 1.0 + math.Log(rpsX)
-	} else {
-		expectedLatencyX = 1.0 // No increase expected when load drops
-	}
-
-	// Actual latency multiplier
-	actualLatencyX := currentLatency / max(historicalLatency, epsilon)
-
-	// CV-based tolerance for natural variance
-	cvLatency := historicalLatencyDev / max(historicalLatency, epsilon)
-	tolerance := 1.0 + 3.0*cvLatency
-
-	// Threshold: expected increase with variance tolerance
-	threshold := expectedLatencyX * tolerance
-
-	return actualLatencyX > threshold
+// confidenceInterval represents a statistical confidence interval
+type confidenceInterval struct {
+	lower, upper float64
 }
 
-// concurrencyErrorCorrelation estimates beta: error rate increase per unit concurrency
-// Returns positive value when higher concurrency correlates with higher errors
-func (m *metrics) concurrencyErrorCorrelation() float64 {
-	const epsilon = 1e-9
-
-	concurrencyMean := m.concurrency.Stat(Mean, Mid)
-	concurrencyDev := m.concurrency.Stat(Deviation, Mid)
-	errorMean := m.errors.Stat(Mean, Mid)
-	errorDev := m.errors.Stat(Deviation, Mid)
-
-	if concurrencyDev < epsilon || errorDev < epsilon {
-		return 0.0
+// waldConfidenceInterval computes Adjusted Wald confidence interval for a proportion
+func waldConfidenceInterval(n, p, z float64) confidenceInterval {
+	z2 := z * z
+	nAdj := n + z2
+	pTilde := (n*p + z2/2) / nAdj
+	se := math.Sqrt(pTilde * (1 - pTilde) / nAdj)
+	return confidenceInterval{
+		lower: pTilde - z*se,
+		upper: pTilde + z*se,
 	}
-
-	// Z-scores of current values
-	currentConcurrency := m.concurrency.Mean()
-	currentErrors := m.errors.Mean()
-	concurrencyZ := (currentConcurrency - concurrencyMean) / concurrencyDev
-	errorZ := (currentErrors - errorMean) / errorDev
-
-	// Correlation coefficient (clamped to [-1, 1])
-	rho := max(-1.0, min(1.0, concurrencyZ*errorZ))
-
-	// Only return positive correlation if significant
-	if rho > 0.3 {
-		return rho * (errorDev / concurrencyDev)
-	}
-	return 0.0
 }
 
-// safeConcurrency calculates the maximum concurrency that keeps errors within SLO
-func (l *Levee) safeConcurrency() float64 {
-	beta := l.metrics.concurrencyErrorCorrelation()
-	if beta < 1e-9 {
-		return l.metrics.concurrency.Stat(Mean, Mid)
-	}
-
-	baseErrors := l.metrics.errors.Stat(Mean, Mid)
-	baseConcurrency := l.metrics.concurrency.Stat(Mean, Mid)
-
-	targetErrorRate := 1.0 - l.stated_slo.SuccessRate
-	maxAllowedErrorRate := targetErrorRate * 0.9 // 10% margin from SLO
-
-	allowableIncrease := maxAllowedErrorRate - baseErrors
-	if allowableIncrease <= 0 {
-		return l.safeConcurrencyFloor()
-	}
-
-	safe := baseConcurrency + (allowableIncrease / beta)
-	return max(safe, l.safeConcurrencyFloor())
-}
-
-// safeConcurrencyFloor returns the minimum safe concurrency (half of long-term average)
-func (l *Levee) safeConcurrencyFloor() float64 {
-	return l.metrics.concurrency.Stat(Mean, Long) / 2.0
-}
-
-// shouldThrottle determines if we should enter THROTTLED state
-// DISABLED: THROTTLED causes rapid flapping between THROTTLED and CLOSED
-// TODO: Redesign the stabilisation logic before re-enabling
-func (l *Levee) shouldThrottle() (bool, float64) {
-	return false, 0 // Disabled
+// hasLatencyAnomaly checks if there's a latency spike that warrants throttling.
+// Returns (hasAnomaly, currentConcurrency) where currentConcurrency becomes the throttle ceiling.
+func (l *Levee) hasLatencyAnomaly() (bool, float64) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
 	if !l.metrics.hasSufficientHistory() {
 		return false, 0
 	}
 
-	currentConcurrency := float64(l.Concurrents())
-	safeConcurrency := l.safeConcurrency()
+	currentLatency := l.metrics.latency.Mean()
+	baseLatency := l.metrics.latency.Stat(Mean, Base)
+	currentConcurrency := l.metrics.concurrency.Mean()
+	baseConcurrency := l.metrics.concurrency.Stat(Mean, Base)
 
-	// Only throttle if >10% above safe
-	if currentConcurrency <= safeConcurrency*1.1 {
+	// Situation is improving - no anomaly
+	if currentLatency < baseLatency && currentConcurrency < baseConcurrency {
 		return false, 0
 	}
 
-	// Only throttle if meaningful correlation exists
-	if l.metrics.concurrencyErrorCorrelation() < 0.001 {
-		return false, 0
+	if l.unexpectedLatencySpike(Mid) || l.unexpectedLatencySpike(Long) {
+		return true, currentConcurrency
 	}
-
-	// Don't throttle below floor
-	if safeConcurrency < l.safeConcurrencyFloor() {
-		return false, 0
-	}
-
-	// Too late if already near SLO boundary
-	sloErrorRate := 1.0 - l.stated_slo.SuccessRate
-	if l.metrics.errors.Mean() > sloErrorRate*0.9 {
-		return false, 0
-	}
-
-	return true, safeConcurrency
+	return false, 0
 }
 
-// throttlingFailed determines if throttling has failed to prevent SLO violation
-func (l *Levee) throttlingFailed() bool {
-	// Error rate crossed SLO
-	sloErrorRate := 1.0 - l.stated_slo.SuccessRate
-	if l.metrics.errors.Mean() > sloErrorRate {
-		return true
+func (l *Levee) unexpectedLatencySpike(horizon StatRange) bool {
+	const epsilon = 1e-9
+
+	currentLatency := l.metrics.latency.Mean()
+	currentConcurrency := l.metrics.concurrency.Mean()
+	historicalLatency := l.metrics.latency.Stat(Mean, horizon)
+	historicalConcurrency := l.metrics.concurrency.Stat(Mean, horizon)
+	historicalLatencyDev := l.metrics.latency.Stat(Deviation, horizon)
+
+	currentRPS := currentConcurrency / max(currentLatency, epsilon)
+	historicalRPS := historicalConcurrency / max(historicalLatency, epsilon)
+	rpsMultiplier := currentRPS / max(historicalRPS, epsilon)
+
+	// Expected latency increase: sub-linear scaling with load
+	expectedLatencyMultiplier := 1.0
+	if rpsMultiplier >= 1.0 {
+		expectedLatencyMultiplier = 1.0 + math.Log(rpsMultiplier)
 	}
 
-	// Safe concurrency below floor
-	if l.safeConcurrency() < l.safeConcurrencyFloor() {
-		return true
-	}
+	actualLatencyMultiplier := currentLatency / max(historicalLatency, epsilon)
 
-	// Base errors worse than Mid (situation degrading despite throttling)
-	if l.metrics.errors.Stat(Mean, Base) > l.metrics.errors.Stat(Mean, Mid)*1.2 {
-		return true
-	}
+	// CV-based tolerance for natural variance
+	cv := historicalLatencyDev / max(historicalLatency, epsilon)
+	threshold := expectedLatencyMultiplier * (1.0 + 3.0*cv)
 
-	return false
+	return actualLatencyMultiplier > threshold
 }
 
-// throttlingStabilised determines if we can exit THROTTLED and return to CLOSED
+// throttlingStabilised checks if error rate has improved enough to exit THROTTLED.
 func (l *Levee) throttlingStabilised() bool {
-	// Error rate dropped below 90% of Mid
-	if l.metrics.errors.Mean() < l.metrics.errors.Stat(Mean, Mid)*0.9 {
-		return true
-	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
-	// Safe concurrency exceeds Mid concurrency
-	if l.safeConcurrency() > l.metrics.concurrency.Stat(Mean, Mid) {
-		return true
-	}
+	currentErrors := l.metrics.errors.Mean()
+	longTermErrors := l.metrics.errors.Stat(Mean, Long)
+	errorDev := l.metrics.errors.Stat(Deviation, Long)
 
-	return false
+	// Exit when errors drop to long-term baseline + 2σ
+	return currentErrors < longTermErrors+2.0*errorDev
 }

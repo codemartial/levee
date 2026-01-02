@@ -84,28 +84,26 @@ func TestCircuitRecovery(t *testing.T) {
 		t.Fatal("Circuit should be OPEN")
 	}
 
-	// Wait for timeout - circuit should allow probing call
-	ts := now.Add(600 * time.Millisecond)
-	sc, err := l.Start(ts)
-	if sc.State != OPEN || err != nil {
-		t.Errorf("Expected OPEN state after timeout with probing allowed, got %v (err=%v)", l.State(), err)
-	}
-	l.Success(ts, 10*time.Millisecond)
-
-	// Circuit should allow new calls and eventually close if successful
-	for i := 0; i < 100; i++ {
-		ts := now.Add(time.Duration(700+i) * time.Millisecond)
-		sc, _ := l.Start(ts)
-		if sc.State == CLOSED {
-			return // Test passed - circuit recovered
-		}
-		l.Success(ts, 10*time.Millisecond)
-		if l.State() == CLOSED {
-			return // Test passed
+	// Wait for timeout - circuit should allow probing calls (probabilistically)
+	// With low historical concurrency (~1), probing is probabilistic (~10% per attempt)
+	// Need ~100 successful probes for Wald CI to confirm recovery at 95% SLO
+	probesAllowed := 0
+	for i := 0; i < 2000; i++ {
+		ts := now.Add(time.Duration(600+i) * time.Millisecond)
+		sc, err := l.Start(ts)
+		if err == nil {
+			probesAllowed++
+			l.Success(ts, 10*time.Millisecond)
+			if sc.State == CLOSED || l.State() == CLOSED {
+				return // Test passed - circuit recovered
+			}
 		}
 	}
 
-	t.Errorf("Circuit failed to recover. Last state: %v", l.State())
+	if probesAllowed == 0 {
+		t.Error("No probes were allowed during recovery phase")
+	}
+	t.Errorf("Circuit failed to recover after %d successful probes. Last state: %v", probesAllowed, l.State())
 }
 
 func TestMetricsReset(t *testing.T) {
@@ -312,8 +310,8 @@ func TestRestoreState(t *testing.T) {
 	}
 
 	// Verify SLO was restored
-	if restoredLevee.stated_slo.SuccessRate != slo.SuccessRate {
-		t.Errorf("SLO.SuccessRate not restored: got %f, want %f", restoredLevee.stated_slo.SuccessRate, slo.SuccessRate)
+	if restoredLevee.slo.SuccessRate != slo.SuccessRate {
+		t.Errorf("SLO.SuccessRate not restored: got %f, want %f", restoredLevee.slo.SuccessRate, slo.SuccessRate)
 	}
 	restoredLevee.mu.RUnlock()
 

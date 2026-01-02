@@ -140,6 +140,7 @@ func (p *RunningPenalty) Finalize() {
 type BenchmarkConfig struct {
 	StartOffset time.Duration // Skip events before this offset (0 = start from beginning)
 	EndOffset   time.Duration // Stop at this offset (0 = run to end)
+	Seed        uint64        // RNG seed for deterministic load generation (0 = use time-based seed)
 }
 
 // PrescientMetrics tracks circuit breaker performance against prescient breaker
@@ -198,11 +199,8 @@ func NewPrescientMetrics() *PrescientMetrics {
 	}
 }
 
-// effectiveState treats HALF_OPEN as OPEN for categorization purposes
+// effectiveState returns the state for categorization purposes
 func effectiveState(s levee.State) levee.State {
-	if s == levee.HALF_OPEN {
-		return levee.OPEN
-	}
 	return s
 }
 
@@ -236,8 +234,7 @@ func recordPrescientStateChange(metrics *PrescientMetrics, prevState, newState l
 	return prevState
 }
 
-// categorizeTransitions processes raw transitions and assigns categories based on time windows
-// HALF_OPEN is treated as OPEN, and consecutive OPEN/HALF_OPEN events are squashed into one
+// categorizeTransitions analyzes state transitions and classifies them
 func (m *PrescientMetrics) categorizeTransitions() {
 	const (
 		falseAlarmWindow   = 5 * time.Second // ±5s for false alarm detection
@@ -253,14 +250,13 @@ func (m *PrescientMetrics) categorizeTransitions() {
 		var category string
 		toEffective := effectiveState(raw.ToState)
 
-		// Only categorize when effective state changes (CLOSED <-> OPEN)
-		// This squashes consecutive OPEN/HALF_OPEN events
+		// Only categorize when effective state changes
 		if toEffective == lastEffectiveState {
 			continue
 		}
 
 		if toEffective == levee.OPEN {
-			// Circuit is opening (from CLOSED/INIT to OPEN/HALF_OPEN)
+			// Circuit is opening
 			// Check flapping first: <1m since last close
 			if !lastLeveeCloseTime.IsZero() && raw.Timestamp.Sub(lastLeveeCloseTime) < flappingWindow {
 				category = "flapping"
@@ -280,7 +276,7 @@ func (m *PrescientMetrics) categorizeTransitions() {
 				}
 			}
 		} else if toEffective == levee.CLOSED {
-			// Circuit is closing (from OPEN/HALF_OPEN to CLOSED)
+			// Circuit is closing
 			lastLeveeCloseTime = raw.Timestamp
 
 			if raw.PrescientState == levee.OPEN {
@@ -441,7 +437,7 @@ type CBRawTransition struct {
 type CBClassifiedTransition struct {
 	CBName         string
 	Timestamp      time.Time
-	EffectiveState levee.State // OPEN or CLOSED (HALF_OPEN squashed to OPEN)
+	EffectiveState levee.State // OPEN, CLOSED, or THROTTLED
 	PrescientState levee.State
 	Classification string // Human-readable: "Late detection", "False alarm", etc.
 	Trigger        levee.Trigger
@@ -869,7 +865,7 @@ func computeIncidentMetrics(unified *UnifiedBenchmarkResult, results []Candidate
 
 			// During OPEN: only probing traffic (low RPS)
 			// During CLOSED: full traffic (high RPS) - THIS IS BAD during an incident!
-			probeRPS := 5.0 // Typical probe rate during OPEN/HALF_OPEN
+			probeRPS := 5.0 // Typical probe rate during OPEN
 
 			// Requests allowed = probing during OPEN + full traffic during CLOSED
 			reqsFromOpen := probeRPS * openDuration.Seconds()
@@ -1149,7 +1145,12 @@ func runBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker CircuitBreake
 	metrics := NewPrescientMetrics()
 	penalty := &RunningPenalty{}
 
-	gen := loadgen.NewLoadGenerator(specs)
+	var gen *loadgen.LoadGenerator
+	if cfg.Seed != 0 {
+		gen = loadgen.NewLoadGeneratorWithSeed(specs, cfg.Seed)
+	} else {
+		gen = loadgen.NewLoadGenerator(specs)
+	}
 	stream := loadgen.NewEventStream(gen)
 
 	var prescient *PrescientBreaker
@@ -1306,6 +1307,8 @@ func runBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker CircuitBreake
 
 // BenchmarkCyberMondayPrescient runs benchmark against prescient breaker for all candidates
 func BenchmarkCyberMondayPrescient(b *testing.B) {
+	const benchmarkSeed uint64 = 20241225 // Fixed seed for deterministic results
+
 	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
@@ -1333,7 +1336,7 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 		go func(name string, breaker CircuitBreaker) {
 			defer wg.Done()
 			fmt.Fprintf(os.Stderr, "\n>>> Running benchmark for %s...\n", name)
-			metrics := runCandidateBenchmark(slo, specs, breaker)
+			metrics := runCandidateBenchmark(slo, specs, breaker, benchmarkSeed)
 			resultsChan <- CandidateResult{Name: name, Metrics: metrics}
 		}(c.name, c.breaker)
 	}
@@ -1356,14 +1359,14 @@ func BenchmarkCyberMondayPrescient(b *testing.B) {
 }
 
 // runCandidateBenchmark runs the benchmark for a single ICircuitBreaker candidate
-func runCandidateBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker CircuitBreaker) *PrescientMetrics {
-	return runBenchmark(slo, specs, breaker, BenchmarkConfig{})
+func runCandidateBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker CircuitBreaker, seed uint64) *PrescientMetrics {
+	return runBenchmark(slo, specs, breaker, BenchmarkConfig{Seed: seed})
 }
 
 // buildLeveeStateUntil feeds events to Levee until the specified time offset
-func buildLeveeStateUntil(slo levee.SLO, specs []loadgen.LoadSpec, untilOffset time.Duration) *levee.Levee {
+func buildLeveeStateUntil(slo levee.SLO, specs []loadgen.LoadSpec, untilOffset time.Duration, seed uint64) *levee.Levee {
 	lev := levee.NewLevee(slo)
-	gen := loadgen.NewLoadGenerator(specs)
+	gen := loadgen.NewLoadGeneratorWithSeed(specs, seed)
 	stream := loadgen.NewEventStream(gen)
 
 	type pendingRequest struct {
@@ -1413,6 +1416,8 @@ func buildLeveeStateUntil(slo levee.SLO, specs []loadgen.LoadSpec, untilOffset t
 
 // BenchmarkGenerateStateFile builds Levee state up to h+03:59 and saves to file
 func BenchmarkGenerateStateFile(b *testing.B) {
+	const benchmarkSeed uint64 = 20241225 // Fixed seed for deterministic results
+
 	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
@@ -1421,7 +1426,7 @@ func BenchmarkGenerateStateFile(b *testing.B) {
 	specs := generateCyberMondayWorkload()
 
 	b.Logf("Building Levee state until h+03:59...")
-	leveeAtCutoff := buildLeveeStateUntil(slo, specs, 3*time.Hour+59*time.Minute)
+	leveeAtCutoff := buildLeveeStateUntil(slo, specs, 3*time.Hour+59*time.Minute, benchmarkSeed)
 
 	b.Logf("Levee state at h+03:59: %s", stateString(leveeAtCutoff.State()))
 
@@ -1449,6 +1454,8 @@ func BenchmarkGenerateStateFile(b *testing.B) {
 
 // BenchmarkCyberMondayPrescientTruncated runs truncated benchmark from h+04:00 to h+04:20
 func BenchmarkCyberMondayPrescientTruncated(b *testing.B) {
+	const benchmarkSeed uint64 = 20241225 // Fixed seed for deterministic results
+
 	slo := levee.SLO{
 		SuccessRate: 0.90,
 		Timeout:     1500 * time.Millisecond,
@@ -1471,7 +1478,7 @@ func BenchmarkCyberMondayPrescientTruncated(b *testing.B) {
 	fmt.Fprintf(os.Stderr, "Loaded Levee state from file\n")
 
 	// Run the truncated benchmark
-	metrics := runTruncatedPrescientBenchmark(slo, specs, &savedState, 4*time.Hour, 4*time.Hour+20*time.Minute)
+	metrics := runTruncatedPrescientBenchmark(slo, specs, &savedState, 4*time.Hour, 4*time.Hour+20*time.Minute, benchmarkSeed)
 
 	// Build unified result and generate reports
 	results := []CandidateResult{{Name: "Levee", Metrics: metrics}}
@@ -1484,10 +1491,11 @@ func BenchmarkCyberMondayPrescientTruncated(b *testing.B) {
 }
 
 // runTruncatedPrescientBenchmark runs benchmark in a specific time window using restored state
-func runTruncatedPrescientBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, savedState *levee.LeveeState, startOffset, endOffset time.Duration) *PrescientMetrics {
+func runTruncatedPrescientBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, savedState *levee.LeveeState, startOffset, endOffset time.Duration, seed uint64) *PrescientMetrics {
 	breaker := levee.RestoreState(savedState)
 	return runBenchmark(slo, specs, breaker, BenchmarkConfig{
 		StartOffset: startOffset,
 		EndOffset:   endOffset,
+		Seed:        seed,
 	})
 }

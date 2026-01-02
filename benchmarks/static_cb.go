@@ -118,7 +118,7 @@ func (cb *StaticCB) toExternalState() levee.State {
 }
 
 // State returns the current state of the circuit breaker
-// Maps internal 3-state to levee's 2-state model (HALF_OPEN -> OPEN)
+// Maps internal HALF_OPEN to levee.OPEN for external representation
 func (cb *StaticCB) State() levee.State {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
