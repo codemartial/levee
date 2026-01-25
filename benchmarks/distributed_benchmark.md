@@ -143,16 +143,16 @@ Delta = SuccessScore - FailureScore  [higher is better]
 
 **Key findings:**
 
-1. **No-CB baseline proves CB value**: Without protection, 22.4% failure rate and negative Delta (-66K)
+1. **No-CB baseline proves CB value**: Without protection, 28.9% failure rate and negative Delta (-66K)
 2. **Levee achieves highest Delta** (+47,936) - 12% better than Static-BAU, 20% better than Static-Peak
 3. **Levee allows 8-13% more throughput** while maintaining acceptable failure rates
-4. **All CBs dramatically outperform No-CB** during stress periods
 
-### Short 4-Hour Results (Baseline Only)
+We note that during the early baseline (4 hours Short Benchmark), all circuit breakers behave identically within margins of error.
+We also prove that Levee provides viable 0-configuration drop-in stability protection within similar ballpark of failure rates.
+It is interesting to note that Levee has the highest failure rate (1.6% vs 0.9% best) among the circuit breakers but also scores highest.
+This is due to Levee's superior performance during high load conditions, which the scoring gives a higher weightage to.
 
-During calm baseline traffic (0.5% error rate, no incidents):
-- All CBs perform identically - no blocking, ~0.5% baseline failures
-- No differentiation because there's nothing to protect against
+For comparably **similar reliability**, Levee achieves the **best business outcome** with *least operational supervision* (i.e. tuning) vs. specially crafted circuit breakers.
 
 ## Technical Notes
 
