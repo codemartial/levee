@@ -13,7 +13,6 @@ Levee is a self-tuning circuit breaker and concurrency-based rate limiter for Go
 - Always watching, always adapting
 - Fully self-contained, 100% in-process operation
 - No external dependencies
-- Fleet-friendly with probabilistic rate-limiting during recovery
 
 Use a circuit breaker on outbound requests to prevent cascading failures from degraded or faulty dependencies. Use a rate limiter on incoming requests to prevent failure due to overload.
 
