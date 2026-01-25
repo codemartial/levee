@@ -14,7 +14,7 @@ import (
 
 	"github.com/codemartial/levee"
 	"github.com/codemartial/levee/benchmarks"
-	"github.com/codemartial/levee/distributed/api"
+	"github.com/codemartial/levee/benchmarks/distributed/api"
 	"github.com/codemartial/loadgen"
 )
 

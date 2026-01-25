@@ -14,10 +14,10 @@ import (
 
 	"github.com/codemartial/levee"
 	"github.com/codemartial/levee/benchmarks"
-	"github.com/codemartial/levee/distributed/api"
-	"github.com/codemartial/levee/distributed/app"
-	"github.com/codemartial/levee/distributed/backend"
-	distloadgen "github.com/codemartial/levee/distributed/loadgen"
+	"github.com/codemartial/levee/benchmarks/distributed/api"
+	"github.com/codemartial/levee/benchmarks/distributed/app"
+	"github.com/codemartial/levee/benchmarks/distributed/backend"
+	distloadgen "github.com/codemartial/levee/benchmarks/distributed/loadgen"
 	"github.com/codemartial/loadgen"
 )
 

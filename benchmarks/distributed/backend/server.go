@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/codemartial/levee/distributed/api"
+	"github.com/codemartial/levee/benchmarks/distributed/api"
 	"github.com/codemartial/loadgen"
 )
 
