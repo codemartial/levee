@@ -246,3 +246,79 @@ func (cb *StaticCB) Call(f func() error) (levee.StateChange, error) {
 
 	return resultState, callErr
 }
+
+// StaticCBState holds the serializable state of a StaticCB for checkpointing.
+type StaticCBState struct {
+	InternalState        uint8 `json:"internal_state"`
+	ConsecutiveFailures  int   `json:"consecutive_failures"`
+	ConsecutiveSuccesses int   `json:"consecutive_successes"`
+	LastOpenAtNS         int64 `json:"last_open_at_ns"`
+	HalfOpenCalls        int32 `json:"half_open_calls"`
+}
+
+// SaveState serializes the current state for checkpointing.
+func (cb *StaticCB) SaveState() *StaticCBState {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+
+	lastOpen := cb.lastOpenAt.Load().(time.Time)
+	var lastOpenNS int64
+	if !lastOpen.IsZero() {
+		lastOpenNS = lastOpen.UnixNano()
+	}
+
+	return &StaticCBState{
+		InternalState:        uint8(cb.internalState),
+		ConsecutiveFailures:  cb.consecutiveFailures,
+		ConsecutiveSuccesses: cb.consecutiveSuccesses,
+		LastOpenAtNS:         lastOpenNS,
+		HalfOpenCalls:        atomic.LoadInt32(&cb.halfOpenCalls),
+	}
+}
+
+// RestoreStaticCB creates a StaticCB from a saved state.
+func RestoreStaticCB(config StaticCBConfig, state *StaticCBState) *StaticCB {
+	cb := &StaticCB{
+		config:               config,
+		internalState:        staticState(state.InternalState),
+		consecutiveFailures:  state.ConsecutiveFailures,
+		consecutiveSuccesses: state.ConsecutiveSuccesses,
+	}
+
+	var lastOpen time.Time
+	if state.LastOpenAtNS != 0 {
+		lastOpen = time.Unix(0, state.LastOpenAtNS)
+	}
+	cb.lastOpenAt.Store(lastOpen)
+	atomic.StoreInt32(&cb.halfOpenCalls, state.HalfOpenCalls)
+
+	return cb
+}
+
+// NoCB is a "circuit breaker" that never blocks - used as baseline
+type NoCB struct{}
+
+// NewNoCB creates a new NoCB instance
+func NewNoCB() *NoCB {
+	return &NoCB{}
+}
+
+// Start always allows requests (returns CLOSED state, no error)
+func (cb *NoCB) Start(ts time.Time) (levee.StateChange, error) {
+	return levee.StateChange{State: levee.CLOSED}, nil
+}
+
+// Success is a no-op that returns CLOSED state
+func (cb *NoCB) Success(ts time.Time, duration time.Duration) levee.StateChange {
+	return levee.StateChange{State: levee.CLOSED}
+}
+
+// Fail is a no-op that returns CLOSED state
+func (cb *NoCB) Fail(ts time.Time, duration time.Duration) levee.StateChange {
+	return levee.StateChange{State: levee.CLOSED}
+}
+
+// State always returns CLOSED
+func (cb *NoCB) State() levee.State {
+	return levee.CLOSED
+}

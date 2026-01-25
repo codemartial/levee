@@ -1,6 +1,6 @@
 # Goal
 
-To prove that Levee, with its self-tuning capability, is a superior solution to simpler, statically configured circuit breakers
+To find out whether Levee, with its self-tuning capability, is a superior solution to simpler, statically configured circuit breakers
 
 # Approach
 
