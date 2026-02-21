@@ -27,14 +27,13 @@ type EWMA struct {
 }
 
 type TimeSeries struct {
-	values     []float64 // Pre-allocated to maxBufferSize
-	cursor     uint16
-	mean       float64
-	sumAD      float64
-	sumADStale bool
+	values []float64 // Pre-allocated to maxBufferSize
+	cursor uint16
+	mean   float64
 
 	value     *EWMA
 	deviation *EWMA
+	tMean     *EWMA // time-averaged mean: sum(values) / fillDuration
 
 	_size    uint16 // Logical size (32-4096)
 	isFilled bool
@@ -69,17 +68,10 @@ func (s *TimeSeries) RecordAt(value float64, ts time.Time) {
 		// Update mean by swapping old value for new value
 		s.mean = s.mean + (value-oldValue)/float64(n)
 
-		// Mark sumAD as stale (will recompute when needed)
-		s.sumADStale = true
 	} else {
-		// Growing phase: incremental updates
-		n := int(s.cursor) + 1 // New sample count
-
-		// Welford's incremental mean
+		// Growing phase: Welford's incremental mean
+		n := int(s.cursor) + 1
 		s.mean = s.mean + (value-s.mean)/float64(n)
-
-		// Mark sumAD as stale
-		s.sumADStale = true
 	}
 
 	// Write new value
@@ -89,11 +81,17 @@ func (s *TimeSeries) RecordAt(value float64, ts time.Time) {
 	s.cursor++
 	s.recordsSinceWrap++
 	shouldUpdateEWMA := false
+	var fillDuration time.Duration
 
 	if s.cursor >= s._size {
 		s.cursor = 0
 		s.isFilled = true
 		shouldUpdateEWMA = true
+
+		// Capture fill duration before overwriting lastWrapAt
+		if !s.lastWrapAt.IsZero() {
+			fillDuration = ts.Sub(s.lastWrapAt)
+		}
 
 		// Dynamic resizing on buffer wrap
 		s.maybeResize(ts)
@@ -105,7 +103,7 @@ func (s *TimeSeries) RecordAt(value float64, ts time.Time) {
 
 	// Update EWMAs on buffer wrap
 	if shouldUpdateEWMA && s._size > 0 {
-		s.updateEWMAs()
+		s.updateEWMAs(fillDuration)
 	}
 }
 
@@ -154,8 +152,6 @@ func (s *TimeSeries) resize(newSize uint16) {
 			s.cursor = s.cursor % newSize
 		}
 		// If we were filled, we're still filled (just with fewer samples)
-		// Mark stats as stale to recalculate from new window
-		s.sumADStale = true
 		s.recalculateMean()
 	} else {
 		// Growing: buffer is no longer filled until we wrap at new size
@@ -183,8 +179,6 @@ func (s *TimeSeries) ResetBase() {
 	s.isFilled = false
 
 	s.mean = 0
-	s.sumAD = 0
-	s.sumADStale = false
 
 	// Reset EWMA base values while retaining mid/long history
 	if s.value != nil {
@@ -193,37 +187,34 @@ func (s *TimeSeries) ResetBase() {
 	if s.deviation != nil {
 		s.deviation.base = 0
 	}
+	if s.tMean != nil {
+		s.tMean.base = 0
+	}
 
 	// Reset timing state
 	s.lastWrapAt = time.Time{}
 	s.recordsSinceWrap = 0
 }
 
-func (s *TimeSeries) updateEWMAs() {
+func (s *TimeSeries) updateEWMAs(fillDuration time.Duration) {
 	alphaLo := 1.0 / float64(memMid)  // ~5 min memory
 	alphaHi := 1.0 / float64(memLong) // ~1 day memory
 
 	s.value = s.value.update(s.mean, alphaLo, alphaHi)
 
-	// Deviation computation - ensure sumAD is current
-	s.ensureSumAD()
-	deviation := s.sumAD / float64(s.RawValueCount())
-	s.deviation = s.deviation.update(deviation, alphaLo, alphaHi)
-}
-
-func (s *TimeSeries) ensureSumAD() {
-	if !s.sumADStale {
-		return
-	}
-
-	s.sumAD = 0
+	// Mean absolute deviation
 	count := s.RawValueCount()
-
+	sumAD := 0.0
 	for i := range count {
-		s.sumAD += math.Abs(s.values[i] - s.mean)
+		sumAD += math.Abs(s.values[i] - s.mean)
 	}
+	s.deviation = s.deviation.update(sumAD/float64(count), alphaLo, alphaHi)
 
-	s.sumADStale = false
+	// TMean: rate of accumulation (sum of values / fill duration)
+	if fillDuration > 0 {
+		deriv := s.mean * float64(s._size) / fillDuration.Seconds()
+		s.tMean = s.tMean.update(deriv, alphaLo, alphaHi)
+	}
 }
 
 func (s *TimeSeries) RawValueCount() int {
@@ -239,6 +230,7 @@ type StatType uint8
 const (
 	Mean StatType = iota
 	Deviation
+	TMean
 )
 
 type StatRange uint8
@@ -256,6 +248,8 @@ func (s *TimeSeries) Stat(st StatType, sr StatRange) float64 {
 		stat = s.value
 	case Deviation:
 		stat = s.deviation
+	case TMean:
+		stat = s.tMean
 	}
 
 	if stat == nil {
@@ -279,43 +273,38 @@ func (s *TimeSeries) Mean() float64 {
 }
 
 type metrics struct {
-	concurrency TimeSeries
-	latency     TimeSeries
-	errors      TimeSeries
+	successes TimeSeries
+	latency   TimeSeries
 }
 
 func newMetrics(size uint16) *metrics {
 	// Pre-allocate to maxBufferSize for all buffers
 	return &metrics{
-		concurrency: TimeSeries{values: make([]float64, maxBufferSize), _size: size},
-		latency:     TimeSeries{values: make([]float64, maxBufferSize), _size: size},
-		errors:      TimeSeries{values: make([]float64, maxBufferSize), _size: size},
+		successes: TimeSeries{values: make([]float64, maxBufferSize), _size: size},
+		latency:   TimeSeries{values: make([]float64, maxBufferSize), _size: size},
 	}
 }
 
-func (m *metrics) RecordConcurrency(concurrency float64, ts time.Time) {
-	m.concurrency.RecordAt(concurrency, ts)
+func (m *metrics) RecordSuccesses(successes float64, ts time.Time) {
+	m.successes.RecordAt(successes, ts)
 }
 
 func (m *metrics) RecordLatency(latency float64, ts time.Time) {
 	m.latency.RecordAt(latency, ts)
 }
 
-func (m *metrics) RecordErrors(err float64, ts time.Time) {
-	m.errors.RecordAt(err, ts)
-}
-
 func (m *metrics) Reset() {
-	m.concurrency.ResetBase()
+	m.successes.ResetBase()
 	m.latency.ResetBase()
-	m.errors.ResetBase()
 }
 
 // hasSufficientHistory returns true if EWMA history has been established
-// for concurrency and latency metrics (required for anomaly detection)
+// for successes and latency metrics (required for anomaly detection)
 func (m *metrics) hasSufficientHistory() bool {
-	return m.concurrency.isFilled &&
+	return m.successes.isFilled &&
 		m.latency.isFilled &&
-		m.concurrency.value != nil &&
-		m.latency.value != nil
+		m.successes.value != nil &&
+		m.latency.value != nil &&
+		m.successes.tMean != nil &&
+		m.latency.tMean != nil
 }

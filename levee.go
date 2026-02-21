@@ -126,10 +126,6 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 			return StateChange{State: OPEN, Trigger: trigger}, ErrCircuitOpen
 		}
 
-		l.mu.Lock()
-		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
-		l.mu.Unlock()
-
 		return StateChange{State: OPEN, Trigger: trigger}, nil
 	}
 
@@ -151,15 +147,12 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	if state == CLOSED {
 		if !hasAnomaly {
 			// CLOSED → CLOSED: normal operation
-			l.mu.Lock()
-			l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
-			l.mu.Unlock()
 			return StateChange{State: CLOSED, Trigger: TriggerNone}, nil
 		}
 
 		// CLOSED → THROTTLED: latency anomaly detected
 		l.mu.RLock()
-		floor := l.metrics.concurrency.Stat(Mean, Long)
+		floor := l.metrics.latency.Stat(TMean, Long) / 1_000_000
 		targetLatency := l.metrics.latency.Mean()
 		l.mu.RUnlock()
 
@@ -170,9 +163,6 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		ceiling = l.loadThrottleConcurrency()
 		if ceiling == 0 {
 			// Throttling was exited by another goroutine, proceed as CLOSED
-			l.mu.Lock()
-			l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
-			l.mu.Unlock()
 			return StateChange{State: CLOSED, Trigger: TriggerNone}, nil
 		}
 
@@ -181,9 +171,6 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 			return StateChange{State: THROTTLED, Trigger: TriggerLatencyAnomaly}, ErrCircuitThrottled
 		}
 
-		l.mu.Lock()
-		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
-		l.mu.Unlock()
 		return StateChange{State: THROTTLED, Trigger: TriggerLatencyAnomaly}, nil
 	}
 
@@ -193,7 +180,6 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		l.mu.Lock()
 		l.state = CLOSED
 		l.storeThrottleConcurrency(0)
-		l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
 		l.mu.Unlock()
 		return StateChange{State: CLOSED, Trigger: TriggerThrottlingStabilised}, nil
 	}
@@ -204,7 +190,7 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	if l.throttleSampleCount >= 50 {
 		l.throttleSampleCount = 0
 		currentLatency := l.metrics.latency.Mean()
-		floor := l.metrics.concurrency.Stat(Mean, Long)
+		floor := l.metrics.latency.Stat(TMean, Long) / 1_000_000
 		currentCeiling := l.loadThrottleConcurrency()
 
 		if currentLatency <= l.throttleTargetLatency*1.1 {
@@ -230,9 +216,6 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		return StateChange{State: THROTTLED, Trigger: TriggerNone}, ErrCircuitThrottled
 	}
 
-	l.mu.Lock()
-	l.metrics.RecordConcurrency(float64(l.Concurrents()), ts)
-	l.mu.Unlock()
 	return StateChange{State: THROTTLED, Trigger: TriggerNone}, nil
 }
 
@@ -247,13 +230,13 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool) StateChange {
 	defer l.RemoveConcurrent()
 
-	errCount := 0.0
+	successCount := 1.0
 	if !success {
-		errCount = 1.0
+		successCount = 0.0
 	}
 	l.mu.Lock()
 	l.metrics.RecordLatency(float64(duration.Microseconds()), ts)
-	l.metrics.RecordErrors(errCount, ts)
+	l.metrics.RecordSuccesses(successCount, ts)
 
 	state := l.state
 	inProbingPhase := state == OPEN && l.cooldownComplete

@@ -13,8 +13,8 @@ func (l *Levee) probingAllowed() bool {
 
 	const minSamples = 10
 
-	// Always use historical EWMA for concurrency (preserved across cooldown)
-	hConcurrency := l.metrics.concurrency.Stat(Mean, Mid)
+	// Derive historical concurrency from latency TMean (Little's Law)
+	hConcurrency := l.metrics.latency.Stat(TMean, Mid) / 1_000_000
 	if hConcurrency <= 0 {
 		return l.concurrents <= 1
 	}
@@ -25,10 +25,10 @@ func (l *Levee) probingAllowed() bool {
 
 	// Get error rate: fresh data if available, otherwise use floor only
 	var hErrors float64
-	if l.metrics.errors.isFilled {
-		hErrors = l.metrics.errors.Stat(Mean, Mid)
-	} else if l.metrics.errors.RawValueCount() >= minSamples {
-		hErrors = l.metrics.errors.Mean()
+	if l.metrics.successes.isFilled {
+		hErrors = 1 - l.metrics.successes.Stat(Mean, Mid)
+	} else if l.metrics.successes.RawValueCount() >= minSamples {
+		hErrors = 1 - l.metrics.successes.Mean()
 	} else {
 		// Not enough samples yet, probe at floor rate
 		return l.allowCall(floor)
@@ -62,15 +62,15 @@ func (l *Levee) newState() (State, Trigger) {
 	}
 
 	const minSamples = 10
-	n := float64(l.metrics.errors.RawValueCount())
+	n := float64(l.metrics.successes.RawValueCount())
 	if n < minSamples {
 		return OPEN, TriggerNone
 	}
 
-	rawErrorRate := l.metrics.errors.Mean()
+	rawSuccessRate := l.metrics.successes.Mean()
 	requiredSuccessRate := l.slo.SuccessRate - (1-l.slo.SuccessRate)*0.1
 
-	successCI := waldConfidenceInterval(n, 1-rawErrorRate, 2.0)
+	successCI := waldConfidenceInterval(n, rawSuccessRate, 2.0)
 	if successCI.upper < requiredSuccessRate {
 		return OPEN, TriggerRecoveryFailed
 	}
@@ -90,8 +90,8 @@ func (l *Levee) mustOpen() (bool, Trigger) {
 		return false, TriggerNone
 	}
 
-	n := float64(l.metrics.errors.RawValueCount())
-	rawSuccessRate := 1 - l.metrics.errors.Mean()
+	n := float64(l.metrics.successes.RawValueCount())
+	rawSuccessRate := l.metrics.successes.Mean()
 
 	successCI := waldConfidenceInterval(n, rawSuccessRate, 3.0)
 	srThreshold := l.slo.SuccessRate - (1-l.slo.SuccessRate)*0.1
@@ -131,8 +131,8 @@ func (l *Levee) hasLatencyAnomaly() (bool, float64) {
 
 	currentLatency := l.metrics.latency.Mean()
 	baseLatency := l.metrics.latency.Stat(Mean, Base)
-	currentConcurrency := l.metrics.concurrency.Mean()
-	baseConcurrency := l.metrics.concurrency.Stat(Mean, Base)
+	currentConcurrency := l.metrics.latency.Stat(TMean, Base) / 1_000_000
+	baseConcurrency := l.metrics.latency.Stat(TMean, Mid) / 1_000_000
 
 	// Situation is improving - no anomaly
 	if currentLatency < baseLatency && currentConcurrency < baseConcurrency {
@@ -149,9 +149,9 @@ func (l *Levee) unexpectedLatencySpike(horizon StatRange) bool {
 	const epsilon = 1e-9
 
 	currentLatency := l.metrics.latency.Mean()
-	currentConcurrency := l.metrics.concurrency.Mean()
+	currentConcurrency := l.metrics.latency.Stat(TMean, Base) / 1_000_000
 	historicalLatency := l.metrics.latency.Stat(Mean, horizon)
-	historicalConcurrency := l.metrics.concurrency.Stat(Mean, horizon)
+	historicalConcurrency := l.metrics.latency.Stat(TMean, horizon) / 1_000_000
 	historicalLatencyDev := l.metrics.latency.Stat(Deviation, horizon)
 
 	currentRPS := currentConcurrency / max(currentLatency, epsilon)
@@ -178,9 +178,9 @@ func (l *Levee) throttlingStabilised() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	currentErrors := l.metrics.errors.Mean()
-	longTermErrors := l.metrics.errors.Stat(Mean, Long)
-	errorDev := l.metrics.errors.Stat(Deviation, Long)
+	currentErrors := 1 - l.metrics.successes.Mean()
+	longTermErrors := 1 - l.metrics.successes.Stat(Mean, Long)
+	errorDev := l.metrics.successes.Stat(Deviation, Long)
 
 	// Exit when errors drop to long-term baseline + 2σ
 	return currentErrors < longTermErrors+2.0*errorDev

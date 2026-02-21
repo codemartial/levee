@@ -8,13 +8,16 @@ type LeveeState struct {
 	SLO        SLO
 	BufferSize uint16
 
-	// Concurrency EWMAs
-	ConcurrencyValueBase     float64
-	ConcurrencyValueMid      float64
-	ConcurrencyValueLong     float64
-	ConcurrencyDeviationBase float64
-	ConcurrencyDeviationMid  float64
-	ConcurrencyDeviationLong float64
+	// Successes EWMAs
+	SuccessesValueBase     float64
+	SuccessesValueMid      float64
+	SuccessesValueLong     float64
+	SuccessesDeviationBase float64
+	SuccessesDeviationMid  float64
+	SuccessesDeviationLong float64
+	SuccessesTMeanBase     float64
+	SuccessesTMeanMid      float64
+	SuccessesTMeanLong     float64
 
 	// Latency EWMAs
 	LatencyValueBase     float64
@@ -23,14 +26,9 @@ type LeveeState struct {
 	LatencyDeviationBase float64
 	LatencyDeviationMid  float64
 	LatencyDeviationLong float64
-
-	// Error rate EWMAs
-	ErrorsValueBase     float64
-	ErrorsValueMid      float64
-	ErrorsValueLong     float64
-	ErrorsDeviationBase float64
-	ErrorsDeviationMid  float64
-	ErrorsDeviationLong float64
+	LatencyTMeanBase     float64
+	LatencyTMeanMid      float64
+	LatencyTMeanLong     float64
 }
 
 // SaveState extracts the EWMA state from a Levee instance
@@ -39,22 +37,22 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	// Check if EWMAs have been initialized (if one is nil, all are nil)
-	if l.metrics.concurrency.value == nil {
+	// Check if EWMAs have been initialized
+	if l.metrics.successes.value == nil {
 		return nil, nil
 	}
 
 	state := &LeveeState{
 		SLO:        l.slo,
-		BufferSize: l.metrics.concurrency._size,
+		BufferSize: l.metrics.successes._size,
 
-		// Concurrency EWMAs
-		ConcurrencyValueBase:     l.metrics.concurrency.value.base,
-		ConcurrencyValueMid:      l.metrics.concurrency.value.ewmaMid,
-		ConcurrencyValueLong:     l.metrics.concurrency.value.ewmaLong,
-		ConcurrencyDeviationBase: l.metrics.concurrency.deviation.base,
-		ConcurrencyDeviationMid:  l.metrics.concurrency.deviation.ewmaMid,
-		ConcurrencyDeviationLong: l.metrics.concurrency.deviation.ewmaLong,
+		// Successes EWMAs
+		SuccessesValueBase:     l.metrics.successes.value.base,
+		SuccessesValueMid:      l.metrics.successes.value.ewmaMid,
+		SuccessesValueLong:     l.metrics.successes.value.ewmaLong,
+		SuccessesDeviationBase: l.metrics.successes.deviation.base,
+		SuccessesDeviationMid:  l.metrics.successes.deviation.ewmaMid,
+		SuccessesDeviationLong: l.metrics.successes.deviation.ewmaLong,
 
 		// Latency EWMAs
 		LatencyValueBase:     l.metrics.latency.value.base,
@@ -63,14 +61,18 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 		LatencyDeviationBase: l.metrics.latency.deviation.base,
 		LatencyDeviationMid:  l.metrics.latency.deviation.ewmaMid,
 		LatencyDeviationLong: l.metrics.latency.deviation.ewmaLong,
+	}
 
-		// Error EWMAs
-		ErrorsValueBase:     l.metrics.errors.value.base,
-		ErrorsValueMid:      l.metrics.errors.value.ewmaMid,
-		ErrorsValueLong:     l.metrics.errors.value.ewmaLong,
-		ErrorsDeviationBase: l.metrics.errors.deviation.base,
-		ErrorsDeviationMid:  l.metrics.errors.deviation.ewmaMid,
-		ErrorsDeviationLong: l.metrics.errors.deviation.ewmaLong,
+	// TMean may not be initialized yet (requires two buffer wraps)
+	if l.metrics.successes.tMean != nil {
+		state.SuccessesTMeanBase = l.metrics.successes.tMean.base
+		state.SuccessesTMeanMid = l.metrics.successes.tMean.ewmaMid
+		state.SuccessesTMeanLong = l.metrics.successes.tMean.ewmaLong
+	}
+	if l.metrics.latency.tMean != nil {
+		state.LatencyTMeanBase = l.metrics.latency.tMean.base
+		state.LatencyTMeanMid = l.metrics.latency.tMean.ewmaMid
+		state.LatencyTMeanLong = l.metrics.latency.tMean.ewmaLong
 	}
 
 	return state, nil
@@ -85,16 +87,23 @@ func RestoreState(state *LeveeState) *Levee {
 	}
 	l.lastOpenAt.Store(time.Time{})
 
-	// Restore concurrency EWMAs
-	l.metrics.concurrency.value = &EWMA{
-		base:     state.ConcurrencyValueBase,
-		ewmaMid:  state.ConcurrencyValueMid,
-		ewmaLong: state.ConcurrencyValueLong,
+	// Restore successes EWMAs
+	l.metrics.successes.value = &EWMA{
+		base:     state.SuccessesValueBase,
+		ewmaMid:  state.SuccessesValueMid,
+		ewmaLong: state.SuccessesValueLong,
 	}
-	l.metrics.concurrency.deviation = &EWMA{
-		base:     state.ConcurrencyDeviationBase,
-		ewmaMid:  state.ConcurrencyDeviationMid,
-		ewmaLong: state.ConcurrencyDeviationLong,
+	l.metrics.successes.deviation = &EWMA{
+		base:     state.SuccessesDeviationBase,
+		ewmaMid:  state.SuccessesDeviationMid,
+		ewmaLong: state.SuccessesDeviationLong,
+	}
+	if state.SuccessesTMeanBase != 0 || state.SuccessesTMeanMid != 0 || state.SuccessesTMeanLong != 0 {
+		l.metrics.successes.tMean = &EWMA{
+			base:     state.SuccessesTMeanBase,
+			ewmaMid:  state.SuccessesTMeanMid,
+			ewmaLong: state.SuccessesTMeanLong,
+		}
 	}
 
 	// Restore latency EWMAs
@@ -108,17 +117,12 @@ func RestoreState(state *LeveeState) *Levee {
 		ewmaMid:  state.LatencyDeviationMid,
 		ewmaLong: state.LatencyDeviationLong,
 	}
-
-	// Restore error EWMAs
-	l.metrics.errors.value = &EWMA{
-		base:     state.ErrorsValueBase,
-		ewmaMid:  state.ErrorsValueMid,
-		ewmaLong: state.ErrorsValueLong,
-	}
-	l.metrics.errors.deviation = &EWMA{
-		base:     state.ErrorsDeviationBase,
-		ewmaMid:  state.ErrorsDeviationMid,
-		ewmaLong: state.ErrorsDeviationLong,
+	if state.LatencyTMeanBase != 0 || state.LatencyTMeanMid != 0 || state.LatencyTMeanLong != 0 {
+		l.metrics.latency.tMean = &EWMA{
+			base:     state.LatencyTMeanBase,
+			ewmaMid:  state.LatencyTMeanMid,
+			ewmaLong: state.LatencyTMeanLong,
+		}
 	}
 
 	return l

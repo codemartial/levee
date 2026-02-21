@@ -115,15 +115,13 @@ func TestMetricsReset(t *testing.T) {
 	// Record some metrics
 	now := time.Now()
 	l.metrics.RecordLatency(100, now)
-	l.metrics.RecordErrors(1, now)
-	l.metrics.RecordConcurrency(5, now)
+	l.metrics.RecordSuccesses(1, now)
 
 	// Open circuit which should reset metrics
 	l.OpenCircuit(time.Now())
 
 	if l.metrics.latency.Mean() != 0 ||
-		l.metrics.errors.Mean() != 0 ||
-		l.metrics.concurrency.Mean() != 0 {
+		l.metrics.successes.Mean() != 0 {
 		t.Error("Metrics were not properly reset after circuit opened")
 	}
 }
@@ -280,28 +278,25 @@ func TestRestoreState(t *testing.T) {
 
 	// Verify EWMAs were restored
 	restoredLevee.mu.RLock()
-	if restoredLevee.metrics.concurrency.value == nil {
-		t.Error("Concurrency value EWMA not restored")
+	if restoredLevee.metrics.successes.value == nil {
+		t.Error("Successes value EWMA not restored")
 	}
 	if restoredLevee.metrics.latency.value == nil {
 		t.Error("Latency value EWMA not restored")
 	}
-	if restoredLevee.metrics.errors.value == nil {
-		t.Error("Errors value EWMA not restored")
-	}
 
 	// Verify EWMA values match saved state
-	if restoredLevee.metrics.errors.value.base != state.ErrorsValueBase {
-		t.Errorf("Error EWMA base not restored correctly: got %f, want %f",
-			restoredLevee.metrics.errors.value.base, state.ErrorsValueBase)
+	if restoredLevee.metrics.successes.value.base != state.SuccessesValueBase {
+		t.Errorf("Successes EWMA base not restored correctly: got %f, want %f",
+			restoredLevee.metrics.successes.value.base, state.SuccessesValueBase)
 	}
-	if restoredLevee.metrics.errors.value.ewmaMid != state.ErrorsValueMid {
-		t.Errorf("Error EWMA mid not restored correctly: got %f, want %f",
-			restoredLevee.metrics.errors.value.ewmaMid, state.ErrorsValueMid)
+	if restoredLevee.metrics.successes.value.ewmaMid != state.SuccessesValueMid {
+		t.Errorf("Successes EWMA mid not restored correctly: got %f, want %f",
+			restoredLevee.metrics.successes.value.ewmaMid, state.SuccessesValueMid)
 	}
-	if restoredLevee.metrics.errors.value.ewmaLong != state.ErrorsValueLong {
-		t.Errorf("Error EWMA long not restored correctly: got %f, want %f",
-			restoredLevee.metrics.errors.value.ewmaLong, state.ErrorsValueLong)
+	if restoredLevee.metrics.successes.value.ewmaLong != state.SuccessesValueLong {
+		t.Errorf("Successes EWMA long not restored correctly: got %f, want %f",
+			restoredLevee.metrics.successes.value.ewmaLong, state.SuccessesValueLong)
 	}
 
 	// Verify circuit is in CLOSED state
@@ -354,16 +349,16 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 
 	// Verify all EWMA values are identical
-	if state1.ConcurrencyValueBase != state2.ConcurrencyValueBase ||
-		state1.ConcurrencyValueMid != state2.ConcurrencyValueMid ||
-		state1.ConcurrencyValueLong != state2.ConcurrencyValueLong {
-		t.Error("Concurrency Value EWMAs don't match after round-trip")
+	if state1.SuccessesValueBase != state2.SuccessesValueBase ||
+		state1.SuccessesValueMid != state2.SuccessesValueMid ||
+		state1.SuccessesValueLong != state2.SuccessesValueLong {
+		t.Error("Successes Value EWMAs don't match after round-trip")
 	}
 
-	if state1.ErrorsDeviationBase != state2.ErrorsDeviationBase ||
-		state1.ErrorsDeviationMid != state2.ErrorsDeviationMid ||
-		state1.ErrorsDeviationLong != state2.ErrorsDeviationLong {
-		t.Error("Errors Deviation EWMAs don't match after round-trip")
+	if state1.LatencyDeviationBase != state2.LatencyDeviationBase ||
+		state1.LatencyDeviationMid != state2.LatencyDeviationMid ||
+		state1.LatencyDeviationLong != state2.LatencyDeviationLong {
+		t.Error("Latency Deviation EWMAs don't match after round-trip")
 	}
 }
 
