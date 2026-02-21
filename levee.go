@@ -174,17 +174,7 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		return StateChange{State: THROTTLED, Trigger: TriggerLatencyAnomaly}, nil
 	}
 
-	// Handle THROTTLED state
-	if !hasAnomaly && l.throttlingStabilised() {
-		// THROTTLED → CLOSED: errors stabilised
-		l.mu.Lock()
-		l.state = CLOSED
-		l.storeThrottleConcurrency(0)
-		l.mu.Unlock()
-		return StateChange{State: CLOSED, Trigger: TriggerThrottlingStabilised}, nil
-	}
-
-	// THROTTLED → THROTTLED: continue with AIMD adjustment
+	// THROTTLED → THROTTLED: AIMD adjustment, then check exit
 	l.mu.Lock()
 	l.throttleSampleCount++
 	if l.throttleSampleCount >= 50 {
@@ -209,7 +199,17 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		l.storeThrottleConcurrency(currentCeiling)
 	}
 	ceiling := l.loadThrottleConcurrency()
+	recentConcurrency := l.metrics.latency.Stat(TMean, Base) / 1_000_000
 	l.mu.Unlock()
+
+	// THROTTLED → CLOSED: ceiling has grown past demand and no anomaly
+	if !hasAnomaly && ceiling > recentConcurrency*1.2 {
+		l.mu.Lock()
+		l.state = CLOSED
+		l.storeThrottleConcurrency(0)
+		l.mu.Unlock()
+		return StateChange{State: CLOSED, Trigger: TriggerThrottlingStabilised}, nil
+	}
 
 	if float64(l.Concurrents()) > ceiling {
 		l.RemoveConcurrent()

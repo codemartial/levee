@@ -173,15 +173,3 @@ func (l *Levee) unexpectedLatencySpike(horizon StatRange) bool {
 	return actualLatencyMultiplier > threshold
 }
 
-// throttlingStabilised checks if error rate has improved enough to exit THROTTLED.
-func (l *Levee) throttlingStabilised() bool {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	currentErrors := 1 - l.metrics.successes.Mean()
-	longTermErrors := 1 - l.metrics.successes.Stat(Mean, Long)
-	errorDev := l.metrics.successes.Stat(Deviation, Long)
-
-	// Exit when errors drop to long-term baseline + 2σ
-	return currentErrors < longTermErrors+2.0*errorDev
-}
