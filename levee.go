@@ -78,7 +78,7 @@ func (l *Levee) storeThrottleConcurrency(v float64) {
 func NewLevee(slo SLO) *Levee {
 	l := &Levee{
 		slo:     slo,
-		metrics: *newMetrics(100),
+		metrics: *newMetrics(initialBufferSize),
 		state:   CLOSED,
 	}
 	l.lastOpenAt.Store(time.Time{})
@@ -271,14 +271,14 @@ func (l *Levee) Call(f func() error) (StateChange, error) {
 		return sc, err
 	}
 
-	call_err := f()
+	callErr := f()
 	end := time.Now()
 	duration := end.Sub(start)
 
-	if call_err != nil {
-		return l.Fail(end, duration), call_err
+	if callErr != nil {
+		return l.Fail(end, duration), callErr
 	}
-	return l.Success(end, duration), call_err
+	return l.Success(end, duration), callErr
 }
 
 func (l *Levee) OpenCircuit(ts time.Time) {
@@ -348,7 +348,7 @@ func (l *Levee) Expunge() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.metrics = *newMetrics(100)
+	l.metrics = *newMetrics(initialBufferSize)
 	l.state = CLOSED
 	l.cooldownComplete = false
 	l.lastOpenAt.Store(time.Time{})

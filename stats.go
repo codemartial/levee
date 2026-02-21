@@ -14,7 +14,7 @@ const (
 	// (Wald confidence interval needs ~100 samples for reliable recovery decisions)
 	minBufferSize     = 100
 	maxBufferSize     = 4096
-	initialBufferSize = 100
+	initialBufferSize = minBufferSize
 	targetFillTimeMin = 500 * time.Millisecond
 	targetFillTimeMax = 1 * time.Second
 	minResizeInterval = 1 * time.Second
@@ -39,9 +39,8 @@ type TimeSeries struct {
 	isFilled bool
 
 	// Dynamic sizing state
-	lastResizeAt     time.Time
-	lastWrapAt       time.Time
-	recordsSinceWrap uint32
+	lastResizeAt time.Time
+	lastWrapAt   time.Time
 }
 
 func (ma *EWMA) update(value, alphaLo, alphaHi float64) *EWMA {
@@ -79,31 +78,21 @@ func (s *TimeSeries) RecordAt(value float64, ts time.Time) {
 
 	// Advance cursor
 	s.cursor++
-	s.recordsSinceWrap++
-	shouldUpdateEWMA := false
-	var fillDuration time.Duration
-
 	if s.cursor >= s._size {
 		s.cursor = 0
 		s.isFilled = true
-		shouldUpdateEWMA = true
 
 		// Capture fill duration before overwriting lastWrapAt
+		var fillDuration time.Duration
 		if !s.lastWrapAt.IsZero() {
 			fillDuration = ts.Sub(s.lastWrapAt)
 		}
 
-		// Dynamic resizing on buffer wrap
-		s.maybeResize(ts)
-
-		// Reset wrap tracking
-		s.lastWrapAt = ts
-		s.recordsSinceWrap = 0
-	}
-
-	// Update EWMAs on buffer wrap
-	if shouldUpdateEWMA && s._size > 0 {
 		s.updateEWMAs(fillDuration)
+
+		// Dynamic resizing on buffer wrap (after EWMA update)
+		s.maybeResize(ts)
+		s.lastWrapAt = ts
 	}
 }
 
@@ -122,12 +111,12 @@ func (s *TimeSeries) maybeResize(ts time.Time) {
 	// Calculate fill time for this wrap
 	fillTime := ts.Sub(s.lastWrapAt)
 
-	if fillTime < targetFillTimeMin && s._size > minBufferSize {
+	if fillTime < targetFillTimeMin && s._size < maxBufferSize {
 		// Buffer fills too fast, grow by factor of 2
 		newSize := min(s._size*2, maxBufferSize)
 		s.resize(newSize)
 		s.lastResizeAt = ts
-	} else if fillTime > targetFillTimeMax && s._size < maxBufferSize {
+	} else if fillTime > targetFillTimeMax && s._size > minBufferSize {
 		// Buffer fills too slow, shrink by factor of 2
 		newSize := max(s._size/2, minBufferSize)
 		s.resize(newSize)
@@ -191,9 +180,7 @@ func (s *TimeSeries) ResetBase() {
 		s.tMean.base = 0
 	}
 
-	// Reset timing state
 	s.lastWrapAt = time.Time{}
-	s.recordsSinceWrap = 0
 }
 
 func (s *TimeSeries) updateEWMAs(fillDuration time.Duration) {
@@ -301,10 +288,5 @@ func (m *metrics) Reset() {
 // hasSufficientHistory returns true if EWMA history has been established
 // for successes and latency metrics (required for anomaly detection)
 func (m *metrics) hasSufficientHistory() bool {
-	return m.successes.isFilled &&
-		m.latency.isFilled &&
-		m.successes.value != nil &&
-		m.latency.value != nil &&
-		m.successes.tMean != nil &&
-		m.latency.tMean != nil
+	return m.successes.tMean != nil && m.latency.tMean != nil
 }
