@@ -200,10 +200,11 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	}
 	ceiling := l.loadThrottleConcurrency()
 	recentConcurrency := l.metrics.latency.Stat(TMean, Base) / 1_000_000
+	errorsOk := l.metrics.successes.Mean() >= l.metrics.successes.Stat(Mean, Base)
 	l.mu.Unlock()
 
-	// THROTTLED → CLOSED: ceiling has grown past demand and no anomaly
-	if !hasAnomaly && ceiling > recentConcurrency*1.2 {
+	// THROTTLED → CLOSED: ceiling has grown past demand, no anomaly, errors stable
+	if !hasAnomaly && errorsOk && ceiling > recentConcurrency*1.2 {
 		l.mu.Lock()
 		l.state = CLOSED
 		l.storeThrottleConcurrency(0)
