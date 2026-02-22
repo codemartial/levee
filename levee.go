@@ -343,13 +343,3 @@ func (l *Levee) StateUpdates() <-chan StateChange {
 	return nil
 }
 
-// Expunge resets the circuit breaker to CLOSED state with fresh metrics
-func (l *Levee) Expunge() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.metrics = *newMetrics(initialBufferSize)
-	l.state = CLOSED
-	l.cooldownComplete = false
-	l.lastOpenAt.Store(time.Time{})
-}

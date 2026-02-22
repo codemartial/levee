@@ -76,17 +76,18 @@ func (s *TimeSeries) RecordAt(value float64, ts time.Time) {
 	// Write new value
 	s.values[s.cursor] = value
 
+	// Seed wrap timestamp on first record
+	if s.lastWrapAt.IsZero() {
+		s.lastWrapAt = ts
+	}
+
 	// Advance cursor
 	s.cursor++
 	if s.cursor >= s._size {
 		s.cursor = 0
 		s.isFilled = true
 
-		// Capture fill duration before overwriting lastWrapAt
-		var fillDuration time.Duration
-		if !s.lastWrapAt.IsZero() {
-			fillDuration = ts.Sub(s.lastWrapAt)
-		}
+		fillDuration := ts.Sub(s.lastWrapAt)
 
 		s.updateEWMAs(fillDuration)
 

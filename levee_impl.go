@@ -5,13 +5,13 @@ import (
 	"math/rand/v2"
 )
 
+const minSamples = 10
+
 // probingAllowed checks if a call should be allowed during OPEN probing phase.
 // Rate-limits to ~10% of historical throughput, scaling with error rate.
 func (l *Levee) probingAllowed() bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-
-	const minSamples = 10
 
 	// Derive historical concurrency from latency TMean (Little's Law)
 	hConcurrency := l.metrics.latency.Stat(TMean, Mid) / 1_000_000
@@ -61,14 +61,13 @@ func (l *Levee) newState() (State, Trigger) {
 		return l.state, TriggerNone
 	}
 
-	const minSamples = 10
 	n := float64(l.metrics.successes.RawValueCount())
 	if n < minSamples {
 		return OPEN, TriggerNone
 	}
 
 	rawSuccessRate := l.metrics.successes.Mean()
-	requiredSuccessRate := l.slo.SuccessRate - (1-l.slo.SuccessRate)*0.1
+	requiredSuccessRate := l.slo.SuccessRate
 
 	successCI := waldConfidenceInterval(n, rawSuccessRate, 2.0)
 	if successCI.upper < requiredSuccessRate {
@@ -94,7 +93,7 @@ func (l *Levee) mustOpen() (bool, Trigger) {
 	rawSuccessRate := l.metrics.successes.Mean()
 
 	successCI := waldConfidenceInterval(n, rawSuccessRate, 3.0)
-	srThreshold := l.slo.SuccessRate - (1-l.slo.SuccessRate)*0.1
+	srThreshold := l.slo.SuccessRate
 
 	if successCI.upper < srThreshold {
 		return true, TriggerSLOViolation
@@ -139,30 +138,28 @@ func (l *Levee) hasLatencyAnomaly() (bool, float64) {
 		return false, 0
 	}
 
-	if l.unexpectedLatencySpike(Mid) || l.unexpectedLatencySpike(Long) {
+	if l.unexpectedLatencySpike(currentLatency, currentConcurrency, Mid) || l.unexpectedLatencySpike(currentLatency, currentConcurrency, Long) {
 		return true, currentConcurrency
 	}
 	return false, 0
 }
 
-func (l *Levee) unexpectedLatencySpike(horizon StatRange) bool {
+func (l *Levee) unexpectedLatencySpike(currentLatency, currentConcurrency float64, horizon StatRange) bool {
 	const epsilon = 1e-9
 
-	currentLatency := l.metrics.latency.Mean()
-	currentConcurrency := l.metrics.latency.Stat(TMean, Base) / 1_000_000
 	historicalLatency := l.metrics.latency.Stat(Mean, horizon)
-	historicalConcurrency := l.metrics.latency.Stat(TMean, horizon) / 1_000_000
 	historicalLatencyDev := l.metrics.latency.Stat(Deviation, horizon)
 
-	currentRPS := currentConcurrency / max(currentLatency, epsilon)
-	historicalRPS := historicalConcurrency / max(historicalLatency, epsilon)
+	currentRPS := currentConcurrency / max(currentLatency, epsilon) * 1_000_000
+	historicalRPS := l.metrics.successes.Stat(TMean, horizon)
 	rpsMultiplier := currentRPS / max(historicalRPS, epsilon)
 
-	// Expected latency increase: sub-linear scaling with load
-	expectedLatencyMultiplier := 1.0
-	if rpsMultiplier >= 1.0 {
-		expectedLatencyMultiplier = 1.0 + math.Log(rpsMultiplier)
+	if rpsMultiplier < 1.0 {
+		return false
 	}
+
+	// Expected latency increase: sub-linear scaling with load
+	expectedLatencyMultiplier := 1.0 + math.Log(rpsMultiplier)
 
 	actualLatencyMultiplier := currentLatency / max(historicalLatency, epsilon)
 
@@ -172,4 +169,3 @@ func (l *Levee) unexpectedLatencySpike(horizon StatRange) bool {
 
 	return actualLatencyMultiplier > threshold
 }
-

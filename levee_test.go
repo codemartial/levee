@@ -362,34 +362,6 @@ func TestStateRoundTrip(t *testing.T) {
 	}
 }
 
-func TestExpunge(t *testing.T) {
-	slo := SLO{
-		SuccessRate: 0.99,
-		Timeout:     time.Second,
-	}
-
-	l := NewLevee(slo)
-	now := time.Now()
-
-	// Fill buffer and change state
-	for i := 0; i < 200; i++ {
-		ts := now.Add(time.Duration(i) * time.Millisecond)
-		l.Start(ts)
-		l.Fail(ts, 10*time.Millisecond)
-	}
-
-	// Expunge should reset to fresh state
-	l.Expunge()
-
-	if l.State() != CLOSED {
-		t.Errorf("Expected CLOSED after Expunge, got %v", l.State())
-	}
-
-	// Metrics should be reset
-	if l.metrics.latency.isFilled {
-		t.Error("Metrics should be reset after Expunge")
-	}
-}
 
 func TestCallFunction(t *testing.T) {
 	slo := SLO{
