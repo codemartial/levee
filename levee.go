@@ -4,7 +4,6 @@ import (
 	"errors"
 	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -18,8 +17,8 @@ type State uint8
 
 const (
 	CLOSED    State = iota
-	OPEN            // Initial cooldown, then rate-limited probing until recovery
-	THROTTLED       // Rate-limiting state based on latency anomaly detection
+	OPEN            // Tripped: block all traffic, wait for cooldown
+	THROTTLED       // Recovery: inflight-limited admission matching load to capacity
 )
 
 type Trigger error
@@ -29,238 +28,281 @@ type StateChange struct {
 	Trigger Trigger
 }
 
-var (
-	ErrCircuitOpen      = errors.New("circuit is open")
-	ErrCircuitThrottled = errors.New("circuit is throttled")
-)
-
-// Trigger constants for state changes
-var (
-	TriggerNone                 Trigger = triggerError("no state change")
-	TriggerSLOViolation         Trigger = triggerError("SLO violation")
-	TriggerLatencyAnomaly       Trigger = triggerError("latency anomaly")
-	TriggerRecoverySucceeded    Trigger = triggerError("recovery succeeded")
-	TriggerRecoveryFailed       Trigger = triggerError("recovery failed")
-	TriggerTimeoutExpired       Trigger = triggerError("timeout expired")
-	TriggerThrottlingStabilised Trigger = triggerError("throttling stabilised")
-)
-
 type triggerError string
 
 func (e triggerError) Error() string { return string(e) }
 
-// Levee is an adaptive circuit breaker
+// ErrCircuitOpen is returned by Start when the circuit breaker rejects a request.
+var ErrCircuitOpen = errors.New("circuit breaker is open")
+
+// Constants
+const (
+	ewmaHalfLife     = 3 * time.Second        // ~6s effective window
+	goodputHalfLife  = 3 * time.Second        // responsive capacity estimate
+	warmupSamples    = 50                     // arm trip after this many observations
+	tripBufferFactor = 0.05                   // tripThreshold = sloErrRate + successRate * tripBufferFactor
+	evalInterval     = 500 * time.Millisecond // inflight limit re-evaluation period
+	recoveryHoldoff  = 3 * time.Second        // minimum time in THROTTLED before CLOSED
+	minInflightLimit = 1.0                    // always allow at least 1 request through
+	openErrThreshold = 0.5                    // THROTTLED → OPEN when eval error rate exceeds this at min limit
+)
+
+// Levee is an adaptive circuit breaker and concurrency limiter.
 type Levee struct {
-	mu          sync.RWMutex
-	slo         SLO
-	metrics     metrics
-	concurrents int32
-	state       State
-	lastOpenAt  atomic.Value
+	mu  sync.Mutex
+	slo SLO
 
-	// OPEN state phases: cooldown (wait for timeout) then probing
-	cooldownComplete bool
+	// Derived thresholds (set once in constructor)
+	sloErrRate       float64
+	tripThreshold    float64
+	recoverThreshold float64
+	consecFailTrip   int
+	cooldownDuration time.Duration
 
-	// THROTTLED state: AIMD-based concurrency control
-	throttleConcurrency   atomic.Uint64 // prevailing concurrency in THROTTLED state
-	throttleTargetLatency float64       // baseline latency when throttling started
-	throttleSampleCount   int           // samples since last AIMD adjustment
-}
+	// State
+	state          State
+	stateEnteredAt time.Time
 
-func (l *Levee) loadThrottleConcurrency() float64 {
-	return math.Float64frombits(l.throttleConcurrency.Load())
-}
+	// EWMA error rate (windowed SLO signal)
+	errEWMA     float64
+	errLastTS   time.Time
+	initialized bool
+	samples     int64
 
-func (l *Levee) storeThrottleConcurrency(v float64) {
-	l.throttleConcurrency.Store(math.Float64bits(v))
+	// Consecutive failure tracking (fast trip)
+	consecFails int
+
+	// Inflight tracking
+	inflight      int64
+	inflightLimit float64
+
+	// Capacity estimation (Little's Law)
+	goodput       float64   // successes per second (EWMA)
+	avgLatency    float64   // mean success duration in seconds (EWMA)
+	lastSuccessTS time.Time // for goodput inter-arrival tracking
+
+	// THROTTLED evaluation
+	lastEvalTS    time.Time
+	evalSuccesses int64
+	evalFailures  int64
+
 }
 
 func NewLevee(slo SLO) *Levee {
-	l := &Levee{
-		slo:     slo,
-		metrics: *newMetrics(initialBufferSize),
-		state:   CLOSED,
+	sloErr := 1.0 - slo.SuccessRate
+	consecThreshold := max(int(math.Ceil(math.Log(1e-8)/math.Log(sloErr))), 5)
+
+	return &Levee{
+		slo:              slo,
+		sloErrRate:       sloErr,
+		tripThreshold:    sloErr + slo.SuccessRate*tripBufferFactor,
+		recoverThreshold: sloErr,
+		consecFailTrip:   consecThreshold,
+		cooldownDuration: slo.Timeout,
+		state:            CLOSED,
+		inflightLimit:    math.MaxFloat64,
 	}
-	l.lastOpenAt.Store(time.Time{})
-	return l
 }
 
-func (l *Levee) AddConcurrent() {
-	atomic.AddInt32(&l.concurrents, 1)
-}
-
-func (l *Levee) RemoveConcurrent() {
-	atomic.AddInt32(&l.concurrents, -1)
-}
-
-func (l *Levee) Concurrents() int32 {
-	return atomic.LoadInt32(&l.concurrents)
+// State returns the current circuit breaker state.
+func (l *Levee) State() State {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.state
 }
 
 func (l *Levee) Start(ts time.Time) (StateChange, error) {
-	state := l.State()
-	trigger := TriggerNone
-
-	// OPEN state handling (with cooldown)
-	if state == OPEN {
-		lastOpenAt := l.lastOpenAt.Load().(time.Time)
-		timeout := l.slo.Timeout
-
-		l.mu.Lock()
-		// Check cooldown phase
-		if !l.cooldownComplete {
-			if ts.Sub(lastOpenAt) < timeout {
-				l.mu.Unlock()
-				return StateChange{State: OPEN}, ErrCircuitOpen
-			}
-			// Cooldown complete, enter probing phase
-			l.cooldownComplete = true
-			trigger = TriggerTimeoutExpired
-		}
-		l.mu.Unlock()
-
-		// Probing phase: rate-limited calls via probingAllowed()
-		l.AddConcurrent()
-		if !l.probingAllowed() {
-			l.RemoveConcurrent()
-			return StateChange{State: OPEN, Trigger: trigger}, ErrCircuitOpen
-		}
-
-		return StateChange{State: OPEN, Trigger: trigger}, nil
-	}
-
-	// CLOSED/THROTTLED state handling (both are normal operational states)
-	l.AddConcurrent()
-
-	// Check if we should open circuit (SLO violation only)
-	shouldOpen, openTrigger := l.mustOpen()
-	if shouldOpen {
-		l.RemoveConcurrent()
-		l.OpenCircuit(ts)
-		return StateChange{State: OPEN, Trigger: openTrigger}, ErrCircuitOpen
-	}
-
-	// Check for latency anomaly to decide throttling
-	hasAnomaly, anomalyConcurrency := l.hasLatencyAnomaly()
-
-	// Handle CLOSED state
-	if state == CLOSED {
-		if !hasAnomaly {
-			// CLOSED → CLOSED: normal operation
-			return StateChange{State: CLOSED, Trigger: TriggerNone}, nil
-		}
-
-		// CLOSED → THROTTLED: latency anomaly detected
-		l.mu.RLock()
-		floor := l.metrics.latency.Stat(TMean, Long) / 1_000_000
-		targetLatency := l.metrics.latency.Mean()
-		l.mu.RUnlock()
-
-		ceiling := max(anomalyConcurrency, floor)
-		l.EnterThrottled(ceiling, targetLatency)
-
-		// Re-read actual ceiling (another goroutine may have set a different value)
-		ceiling = l.loadThrottleConcurrency()
-		if ceiling == 0 {
-			// Throttling was exited by another goroutine, proceed as CLOSED
-			return StateChange{State: CLOSED, Trigger: TriggerNone}, nil
-		}
-
-		if float64(l.Concurrents()) > ceiling {
-			l.RemoveConcurrent()
-			return StateChange{State: THROTTLED, Trigger: TriggerLatencyAnomaly}, ErrCircuitThrottled
-		}
-
-		return StateChange{State: THROTTLED, Trigger: TriggerLatencyAnomaly}, nil
-	}
-
-	// THROTTLED → THROTTLED: AIMD adjustment, then check exit
 	l.mu.Lock()
-	l.throttleSampleCount++
-	if l.throttleSampleCount >= 50 {
-		l.throttleSampleCount = 0
-		currentLatency := l.metrics.latency.Mean()
-		floor := l.metrics.latency.Stat(TMean, Long) / 1_000_000
-		currentCeiling := l.loadThrottleConcurrency()
+	defer l.mu.Unlock()
 
-		if currentLatency <= l.throttleTargetLatency*1.1 {
-			// Latency stable - increase ceiling
-			currentCeiling *= 1.1
-		} else if hasAnomaly {
-			// Latency elevated - decrease ceiling aggressively
-			currentCeiling *= 0.5
-			l.throttleTargetLatency = currentLatency
+	switch l.state {
+	case CLOSED:
+		l.inflight++
+		return StateChange{State: CLOSED}, nil
+
+	case OPEN:
+		if ts.Sub(l.stateEnteredAt) >= l.cooldownDuration {
+			l.enterThrottledFromOpen(ts)
+		} else {
+			return StateChange{State: OPEN}, ErrCircuitOpen
 		}
+		fallthrough
 
-		// Floor at long-term average
-		if currentCeiling < floor {
-			currentCeiling = floor
+	case THROTTLED:
+		l.maybeEvaluateLimit(ts)
+		if l.inflight >= int64(math.Ceil(l.inflightLimit)) {
+			return StateChange{State: THROTTLED}, ErrCircuitOpen
 		}
-		l.storeThrottleConcurrency(currentCeiling)
-	}
-	ceiling := l.loadThrottleConcurrency()
-	recentConcurrency := l.metrics.latency.Stat(TMean, Base) / 1_000_000
-	errorsOk := l.metrics.successes.Mean() >= l.metrics.successes.Stat(Mean, Base)
-	l.mu.Unlock()
-
-	// THROTTLED → CLOSED: ceiling has grown past demand, no anomaly, errors stable
-	if !hasAnomaly && errorsOk && ceiling > recentConcurrency*1.2 {
-		l.mu.Lock()
-		l.state = CLOSED
-		l.storeThrottleConcurrency(0)
-		l.mu.Unlock()
-		return StateChange{State: CLOSED, Trigger: TriggerThrottlingStabilised}, nil
+		l.inflight++
+		return StateChange{State: THROTTLED}, nil
 	}
 
-	if float64(l.Concurrents()) > ceiling {
-		l.RemoveConcurrent()
-		return StateChange{State: THROTTLED, Trigger: TriggerNone}, ErrCircuitThrottled
-	}
-
-	return StateChange{State: THROTTLED, Trigger: TriggerNone}, nil
+	return StateChange{State: l.state}, nil
 }
 
 func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
-	return l.processResult(ts, duration, true)
-}
-
-func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
-	return l.processResult(ts, duration, false)
-}
-
-func (l *Levee) processResult(ts time.Time, duration time.Duration, success bool) StateChange {
-	defer l.RemoveConcurrent()
-
-	successCount := 1.0
-	if !success {
-		successCount = 0.0
-	}
 	l.mu.Lock()
-	l.metrics.RecordLatency(float64(duration.Microseconds()), ts)
-	l.metrics.RecordSuccesses(successCount, ts)
+	defer l.mu.Unlock()
 
-	state := l.state
-	inProbingPhase := state == OPEN && l.cooldownComplete
-	l.mu.Unlock()
+	l.inflight--
+	l.updateErrEWMA(ts, 0.0)
+	l.samples++
+	l.consecFails = 0
+	l.updateCapacityEstimate(ts, duration)
 
-	// Check recovery during OPEN probing phase
-	if inProbingPhase {
-		newState, trigger := l.newState()
-		switch newState {
-		case OPEN:
-			if trigger == TriggerRecoveryFailed {
-				// Recovery failed, reset cooldown to wait again
-				l.resetCooldown(ts)
+	if l.state == THROTTLED {
+		l.evalSuccesses++
+		if ts.Sub(l.stateEnteredAt) >= recoveryHoldoff {
+			// Recover if error rate is low OR limit has grown well beyond usage
+			if l.errEWMA < l.recoverThreshold || l.inflightLimit > float64(l.inflight+1)*3.0 {
+				l.state = CLOSED
+				l.stateEnteredAt = ts
+				l.inflightLimit = math.MaxFloat64
 			}
-			// Otherwise continue probing (TriggerNone = not enough confidence yet)
-			return StateChange{State: OPEN, Trigger: trigger}
-		case CLOSED:
-			l.CloseCircuit()
-			return StateChange{State: CLOSED, Trigger: trigger}
 		}
 	}
 
-	return StateChange{State: state, Trigger: TriggerNone}
+	return StateChange{State: l.state}
+}
+
+func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.inflight--
+	l.updateErrEWMA(ts, 1.0)
+	l.samples++
+	l.consecFails++
+
+	switch l.state {
+	case CLOSED:
+		if l.samples >= warmupSamples {
+			if l.errEWMA > l.tripThreshold || l.consecFails >= l.consecFailTrip {
+				l.enterThrottledFromClosed(ts)
+			}
+		}
+	case THROTTLED:
+		l.evalFailures++
+	}
+
+	return StateChange{State: l.state}
+}
+
+// updateErrEWMA updates the error rate EWMA with a new sample (0=success, 1=failure).
+func (l *Levee) updateErrEWMA(ts time.Time, sample float64) {
+	if !l.initialized {
+		l.errEWMA = sample
+		l.errLastTS = ts
+		l.initialized = true
+		return
+	}
+
+	dt := ts.Sub(l.errLastTS).Seconds()
+	var alpha float64
+	if dt <= 0 {
+		alpha = 0.01
+	} else {
+		alpha = 1.0 - math.Exp(-dt*math.Ln2/ewmaHalfLife.Seconds())
+	}
+	l.errEWMA += alpha * (sample - l.errEWMA)
+	l.errLastTS = ts
+}
+
+// updateCapacityEstimate updates goodput and latency EWMAs from a success observation.
+func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
+	durSec := duration.Seconds()
+
+	if l.avgLatency == 0 {
+		l.avgLatency = durSec
+	} else {
+		dt := ts.Sub(l.lastSuccessTS).Seconds()
+		var alpha float64
+		if dt <= 0 {
+			alpha = 0.01
+		} else {
+			alpha = 1.0 - math.Exp(-dt*math.Ln2/goodputHalfLife.Seconds())
+		}
+		l.avgLatency += alpha * (durSec - l.avgLatency)
+	}
+
+	if !l.lastSuccessTS.IsZero() {
+		dt := ts.Sub(l.lastSuccessTS).Seconds()
+		if dt > 0 {
+			instantGoodput := 1.0 / dt
+			if l.goodput == 0 {
+				l.goodput = instantGoodput
+			} else {
+				alpha := 1.0 - math.Exp(-dt*math.Ln2/goodputHalfLife.Seconds())
+				l.goodput += alpha * (instantGoodput - l.goodput)
+			}
+		}
+	}
+	l.lastSuccessTS = ts
+}
+
+// enterThrottledFromClosed transitions from CLOSED to THROTTLED.
+func (l *Levee) enterThrottledFromClosed(ts time.Time) {
+	limit := max(float64(l.inflight)*0.75, minInflightLimit)
+
+	l.state = THROTTLED
+	l.stateEnteredAt = ts
+	l.inflightLimit = limit
+	l.lastEvalTS = ts
+	l.evalSuccesses = 0
+	l.evalFailures = 0
+	l.consecFails = 0
+}
+
+// enterThrottledFromOpen transitions from OPEN to THROTTLED with conservative inflight limit.
+func (l *Levee) enterThrottledFromOpen(ts time.Time) {
+	estimatedCapacity := l.goodput * l.avgLatency
+	limit := max(min(estimatedCapacity*0.25, 5), minInflightLimit)
+
+	l.state = THROTTLED
+	l.stateEnteredAt = ts
+	l.inflightLimit = limit
+	l.lastEvalTS = ts
+	l.evalSuccesses = 0
+	l.evalFailures = 0
+	l.consecFails = 0
+}
+
+// enterOpen transitions to OPEN state, blocking all traffic for cooldown.
+func (l *Levee) enterOpen(ts time.Time) {
+	l.state = OPEN
+	l.stateEnteredAt = ts
+	l.consecFails = 0
+}
+
+// maybeEvaluateLimit adjusts the inflight limit using MIMD.
+func (l *Levee) maybeEvaluateLimit(ts time.Time) {
+	if ts.Sub(l.lastEvalTS) < evalInterval {
+		return
+	}
+
+	total := l.evalSuccesses + l.evalFailures
+	if total > 0 {
+		evalErrRate := float64(l.evalFailures) / float64(total)
+
+		// If error rate is catastrophically high at minimum limit, go OPEN
+		// to stop failure accumulation entirely.
+		if evalErrRate > openErrThreshold && l.inflightLimit <= minInflightLimit {
+			l.enterOpen(ts)
+			return
+		}
+
+		if evalErrRate > l.sloErrRate {
+			// Multiplicative decrease
+			l.inflightLimit = max(l.inflightLimit*0.5, minInflightLimit)
+		} else {
+			// Multiplicative increase
+			l.inflightLimit *= 2.0
+		}
+	}
+
+	l.evalSuccesses = 0
+	l.evalFailures = 0
+	l.lastEvalTS = ts
 }
 
 func (l *Levee) Call(f func() error) (StateChange, error) {
@@ -281,65 +323,77 @@ func (l *Levee) Call(f func() error) (StateChange, error) {
 	return l.Success(end, duration), callErr
 }
 
-func (l *Levee) OpenCircuit(ts time.Time) {
+// LeveeState holds the serializable state for checkpointing.
+type LeveeState struct {
+	SLO              SLO     `json:"slo"`
+	StateVal         uint8   `json:"state"`
+	StateEnteredAtNS int64   `json:"state_entered_at_ns"`
+	ErrEWMA          float64 `json:"err_ewma"`
+	ErrLastTSNS      int64   `json:"err_last_ts_ns"`
+	Initialized      bool    `json:"initialized"`
+	Samples          int64   `json:"samples"`
+	ConsecFails      int     `json:"consec_fails"`
+	Inflight         int64   `json:"inflight"`
+	InflightLimit    float64 `json:"inflight_limit"`
+	Goodput          float64 `json:"goodput"`
+	AvgLatency       float64 `json:"avg_latency"`
+	LastSuccessTSNS  int64   `json:"last_success_ts_ns"`
+	LastEvalTSNS     int64   `json:"last_eval_ts_ns"`
+	EvalSuccesses    int64   `json:"eval_successes"`
+	EvalFailures     int64   `json:"eval_failures"`
+}
+
+// SaveState serializes the current state for checkpointing.
+func (l *Levee) SaveState() (*LeveeState, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.state == OPEN && !l.cooldownComplete {
-		return // Already in cooldown
+	return &LeveeState{
+		SLO:              l.slo,
+		StateVal:         uint8(l.state),
+		StateEnteredAtNS: l.stateEnteredAt.UnixNano(),
+		ErrEWMA:          l.errEWMA,
+		ErrLastTSNS:      l.errLastTS.UnixNano(),
+		Initialized:      l.initialized,
+		Samples:          l.samples,
+		ConsecFails:      l.consecFails,
+		Inflight:         l.inflight,
+		InflightLimit:    l.inflightLimit,
+		Goodput:          l.goodput,
+		AvgLatency:       l.avgLatency,
+		LastSuccessTSNS:  l.lastSuccessTS.UnixNano(),
+		LastEvalTSNS:     l.lastEvalTS.UnixNano(),
+		EvalSuccesses:    l.evalSuccesses,
+		EvalFailures:     l.evalFailures,
+	}, nil
+}
+
+// RestoreState creates a Levee from a saved state.
+func RestoreState(state *LeveeState) *Levee {
+	sloErr := 1.0 - state.SLO.SuccessRate
+	consecThreshold := max(int(math.Ceil(math.Log(1e-8)/math.Log(sloErr))), 5)
+
+	return &Levee{
+		slo:              state.SLO,
+		sloErrRate:       sloErr,
+		tripThreshold:    sloErr + state.SLO.SuccessRate*tripBufferFactor,
+		recoverThreshold: sloErr,
+		consecFailTrip:   consecThreshold,
+		cooldownDuration: state.SLO.Timeout,
+		state:            State(state.StateVal),
+		stateEnteredAt:   time.Unix(0, state.StateEnteredAtNS),
+		errEWMA:          state.ErrEWMA,
+		errLastTS:        time.Unix(0, state.ErrLastTSNS),
+		initialized:      state.Initialized,
+		samples:          state.Samples,
+		consecFails:      state.ConsecFails,
+		inflight:         state.Inflight,
+		inflightLimit:    state.InflightLimit,
+		goodput:          state.Goodput,
+		avgLatency:       state.AvgLatency,
+		lastSuccessTS:    time.Unix(0, state.LastSuccessTSNS),
+		lastEvalTS:       time.Unix(0, state.LastEvalTSNS),
+		evalSuccesses:    state.EvalSuccesses,
+		evalFailures:     state.EvalFailures,
 	}
-	l.metrics.Reset()
-	l.state = OPEN
-	l.cooldownComplete = false
-	l.lastOpenAt.Store(ts)
 }
-
-// resetCooldown resets the cooldown timer after a failed recovery attempt
-func (l *Levee) resetCooldown(ts time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	l.cooldownComplete = false
-	l.lastOpenAt.Store(ts)
-	l.metrics.Reset()
-}
-
-func (l *Levee) CloseCircuit() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.state == CLOSED {
-		return
-	}
-	l.state = CLOSED
-	l.cooldownComplete = false
-	l.storeThrottleConcurrency(0)
-}
-
-// EnterThrottled transitions to THROTTLED state with the given concurrency limit
-func (l *Levee) EnterThrottled(safeConcurrency, targetLatency float64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.state == THROTTLED {
-		return
-	}
-
-	l.storeThrottleConcurrency(safeConcurrency)
-	l.throttleTargetLatency = targetLatency
-	l.throttleSampleCount = 0
-	l.state = THROTTLED
-	// Note: Do NOT reset metrics here - we need to preserve history for mustOpen() checks
-}
-
-func (l *Levee) State() State {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	return l.state
-}
-
-func (l *Levee) StateUpdates() <-chan StateChange {
-	return nil
-}
-
