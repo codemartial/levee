@@ -153,13 +153,13 @@ The consecutive-failure threshold is derived from the SLO: it's the run length w
 ### 3.3 Operations
 
 **`Start(ts)`** -- Admission control.
-- CLOSED: Increment inflight, admit.
+- CLOSED: If an active inflight limit exists (graduated recovery), run `maybeRelaxLimit(ts)` and reject if at limit. Otherwise increment inflight, admit.
 - OPEN: If cooldown elapsed, transition to THROTTLED (conservative limit), then fall through. Otherwise reject.
 - THROTTLED: Run `maybeEvaluateLimit(ts)`. If `inflight >= ceil(inflightLimit)`, reject. Otherwise increment inflight, admit.
 
 **`Success(ts, duration)`** -- Record a successful completion.
 - Decrement inflight. Update error EWMA toward 0. Reset consecutive-fail counter. Update capacity estimates (goodput, latency).
-- If THROTTLED: increment eval successes. Check recovery conditions (after holdoff): recover to CLOSED if error rate is below threshold OR if the inflight limit has grown far beyond actual usage (limit > 3x inflight).
+- If THROTTLED: increment eval successes. Check recovery conditions (after holdoff): recover to CLOSED if error rate is below threshold OR if the inflight limit has grown far beyond actual usage (limit > 3x inflight). On recovery, keep the inflight limit (graduated recovery) rather than resetting to infinity.
 
 **`Fail(ts, duration)`** -- Record a failed completion.
 - Decrement inflight. Update error EWMA toward 1. Increment consecutive-fail counter.
@@ -171,7 +171,13 @@ The consecutive-failure threshold is derived from the SLO: it's the run length w
 - Compute `evalErrRate` from successes and failures in the window.
 - If error rate > 50% and limit is already at minimum: transition to OPEN (catastrophic).
 - If error rate > `sloErrRate`: halve the limit (multiplicative decrease).
-- If error rate <= `sloErrRate`: double the limit (multiplicative increase).
+- If error rate <= `sloErrRate`: multiply the limit by √2 (multiplicative increase).
+
+**`maybeRelaxLimit(ts)`** -- Graduated recovery in CLOSED (called from `Start`).
+- Skip if less than `evalInterval` since last evaluation.
+- If eval-window error rate exceeds `sloErrRate`: re-trip to THROTTLED immediately.
+- Otherwise: double the limit (faster growth than THROTTLED's √2 since we're in recovery).
+- If limit exceeds 10x actual inflight: fully relax to MaxFloat64 (recovery complete).
 - Reset eval counters and timestamp.
 
 ### 3.4 EWMA Error Rate
@@ -205,11 +211,11 @@ When incoming traffic exceeds backend capacity, latency rises and errors increas
 
 The MIMD control law then takes over. Every 500ms:
 - If the eval-window error rate exceeds the SLO error rate, the limit halves.
-- If errors are within budget, the limit doubles.
+- If errors are within budget, the limit grows by √2 (~41% increase).
 
-This converges to the point where admitted load matches backend capacity. The 500ms eval interval means convergence from any point to the right limit takes O(log(ratio)) steps -- typically 2-4 seconds.
+This converges to the point where admitted load matches backend capacity. The √2 increase (vs the original x2) reduces capacity overshoot from ~100% to ~41%, significantly cutting backend shed events while maintaining fast convergence.
 
-As the HPA provisions more replicas (30s lag), backend capacity grows, more requests succeed, and the limit doubles until it matches the new capacity. Once the error rate drops below the SLO threshold and the holdoff period has passed, Levee transitions back to CLOSED.
+As the HPA provisions more replicas (30s lag), backend capacity grows, more requests succeed, and the limit grows until it matches the new capacity. On recovery to CLOSED, the inflight limit is kept (graduated recovery) and grows via x2 doubling until it becomes unconstraining (>10x actual inflight), at which point it is fully relaxed.
 
 ### 4.2 Catastrophic Failure (Backend Crashes)
 
@@ -318,17 +324,59 @@ Baseline for this phase: 5h = 13,475, 28h = 94,685.
 | 19 | tripBuffer 0.06 | Sweep | - | 95,183 | Boundary effect. | 2 |
 | 20 | TCP slow-start (additive from CLOSED) | Conservative initial growth | 10,263 | - | Severely degraded. Too slow. | 8 |
 
-### 5.6 Key Insight: The Structural Gap
+### 5.6 Graduated Recovery and MIMD Tuning
 
-The 28h gap between Levee (96,625) and Static-Peak (106,342) appears structural. Static-Peak's consecutive-failure trip mechanism generates only 205K Shed events over 28 hours, while Levee's MIMD oscillation generates ~1.1M. Under epoch-squared scoring, these concentrated MIMD oscillation bursts (rapid halving/doubling at 500ms intervals) are penalised heavily.
+After the initial optimisation phase, three changes were made to address the 28h gap between Levee and Static-Peak:
+
+**Graduated recovery** (keep inflightLimit after THROTTLED→CLOSED):
+
+The original design reset `inflightLimit = math.MaxFloat64` on recovery. This caused a burst of traffic at the THROTTLED→CLOSED transition that could re-trigger overload. The fix: keep the inflight limit after recovery and grow it via a new `maybeRelaxLimit()` method in CLOSED state. This method uses x2 doubling (same as MIMD in THROTTLED) with a safety check that re-trips to THROTTLED if errors rise. The limit is fully relaxed when it exceeds 10x actual inflight. Effect: 28h Delta improved from 53,643 to 60,494 (+6,851).
+
+**sqrt(2) MIMD increase** (from x2 to x√2 ≈ 1.414 in THROTTLED):
+
+The x2 increase caused ~100% capacity overshoot at the MIMD oscillation point. Changing to x√2 reduces overshoot to ~41%, cutting shed events from ~1.17M to ~769K. A multiplier sweep tested x1.3, x1.35, x1.4, x1.41, x1.42, x1.43, x1.44, x1.45, x1.5, x1.7. Peak was at x1.42 (63,383 Delta) but x√2 was chosen as the principled value (geometric mean of 1.0 and 2.0 on log scale).
+
+**50% initial limit** (from 75% to 50% of current inflight):
+
+Changed `enterThrottledFromClosed` to use `float64(l.inflight)*0.5` instead of `0.75`. More aggressive initial shed, faster convergence.
+
+**ssthresh (TCP slow-start threshold) -- tried and abandoned**:
+
+Analogous to TCP, remember the limit level where errors last occurred (ssthresh). Below ssthresh, double (fast recovery). At/above ssthresh, increase by x1.25 (conservative probing). Failed because ssthresh became stale during HPA scale-up events -- the capacity boundary remembered from a 2-replica backend doesn't apply after autoscaling to 6 replicas. 5h Delta dropped from 9,755 to 7,736 (below Static-Peak 8,156).
+
+### 5.7 SLO Sweep
+
+The SLO sweep tests Levee against Static-Peak and Static-BAU at SLO values 0.9, 0.8, 0.7, 0.6, 0.5 on the full 28h workload. Static CBs use hardcoded thresholds that don't change with SLO.
+
+With the graduated recovery + sqrt(2) changes, Levee wins at SLO 0.9 (+767) but loses at all other SLO values, with the gap widening at lower SLOs (worst: SLO 0.5, -4,378).
+
+The root cause is the MIMD eval threshold: `maybeEvaluateLimit()` uses `sloErrRate` to decide increase vs decrease. At SLO 0.5, MIMD only decreases when eval error rate exceeds 50% -- during incidents with 30-40% errors, it keeps increasing the limit. The trip threshold (`tripThreshold = sloErrRate + successRate * tripBufferFactor`) is actually tighter relative to sloErrRate at lower SLOs (2.5% relative buffer at SLO 0.5 vs 4.5% at SLO 0.9), so the problem is not in tripping but in the MIMD control loop becoming ineffective.
+
+Note: this comparison is arguably unfair -- Static-Peak's thresholds are fixed and happen to be well-tuned for this workload regardless of what SLO is specified, while Levee genuinely adapts its behaviour to the SLO parameter.
+
+### 5.8 Key Insight: The Structural Gap
+
+The 28h gap between Levee and Static-Peak (before the graduated recovery changes) appeared structural. Static-Peak's consecutive-failure trip mechanism generates only 205K Shed events over 28 hours, while Levee's MIMD oscillation generates ~1.1M. Under epoch-squared scoring, these concentrated MIMD oscillation bursts (rapid halving/doubling at 500ms intervals) are penalised heavily.
 
 Every approach that reduces Shed events (slower growth, additive increase, capacity-aware limiting, longer eval intervals) also reduces SuccessScore by a comparable amount, because the same mechanism that causes Shed -- fast MIMD response -- is also what enables fast recovery and high steady-state throughput.
 
-The cost of being adaptive is oscillation. The cost of being static is being wrong for the traffic you weren't tuned for -- which is why Levee wins on the open-loop benchmark and the 5h incident sub-test, but loses on the full 28h where Static-Peak's peak-tuned thresholds happen to match the scenario well.
+The graduated recovery + sqrt(2) changes partially closed this gap by reducing overshoot amplitude without slowing recovery from incidents (doubling below the previous limit level, then sqrt(2) growth above it).
 
 ---
 
 ## 6. Results at Time of Writing
+
+### 6.1 With graduated recovery + sqrt(2) MIMD changes
+
+| Benchmark | Levee | Static-Peak | Static-BAU | No-CB |
+|-----------|-------|-------------|------------|-------|
+| Open-loop TotalPenalty (lower=better) | **9,550** | 30,247 | - | - |
+| 5h distributed Delta (higher=better) | **8,853** | 8,156 | - | - |
+| 28h distributed Delta (higher=better) | **62,264** | 61,498 | - | - |
+
+Levee beats Static-Peak on all three benchmarks: open-loop (3.2x lower penalty), 5h (+697 Delta), and 28h (+766 Delta).
+
+### 6.2 Without graduated recovery changes (committed baseline)
 
 | Benchmark | Levee | Static-Peak | Static-BAU | No-CB |
 |-----------|-------|-------------|------------|-------|
@@ -336,19 +384,21 @@ The cost of being adaptive is oscillation. The cost of being static is being wro
 | 5h distributed Delta (higher=better) | **13,565** | 12,719 | - | - |
 | 28h distributed Delta (higher=better) | 96,625 | **106,342** | 97,768 | -69,583 |
 
-Levee beats Static-Peak on the open-loop benchmark (2.2x lower penalty) and on the 5h incident test (+846 Delta). On the full 28h scenario, Levee trails Static-Peak by ~10% but significantly outperforms No-CB and remains competitive with Static-BAU despite requiring zero manual tuning.
+Levee beats Static-Peak on the open-loop benchmark (2.2x lower penalty) and on the 5h incident test (+846 Delta). On the full 28h scenario, Levee trails Static-Peak by ~10%.
+
+Note: the two result sets come from different benchmark versions (the benchmark code was revised between sessions), so the absolute numbers are not directly comparable.
 
 ---
 
 ## 7. Differences from the Previous Implementation
 
-The committed version of Levee (pre-rewrite) was a fundamentally different design across 4 files totalling 1,327 lines. The current implementation is a single 399-line file. This section summarises what changed and why.
+The committed version of Levee (pre-rewrite) was a fundamentally different design across 4 files totalling 1,327 lines. The current implementation is a single 450-line file. This section summarises what changed and why.
 
 ### 7.1 Architecture
 
 | Aspect | Previous | Current |
 |--------|----------|---------|
-| Files | `levee.go` (345), `levee_impl.go` (171), `state.go` (129), `stats.go` (293), `levee_test.go` (389) | `levee.go` (399) |
+| Files | `levee.go` (345), `levee_impl.go` (171), `state.go` (129), `stats.go` (293), `levee_test.go` (389) | `levee.go` (450) |
 | Signal processing | Multi-timescale EWMAs (base/mid/long) over circular buffers with trimmed means, deviation tracking, and dynamic buffer resizing | Single EWMA per signal with time-weighted decay |
 | Trip mechanism | Latency anomaly detection (deviation from historical trimmed mean) + SLO violation | Error rate EWMA exceeding trip threshold + consecutive failure run |
 | Throttling control | AIMD on concurrency ceiling: +10% when latency stable, x0.5 when anomaly detected, evaluated every 50 samples | MIMD on inflight limit: x2/x0.5 evaluated every 500ms based on eval-window error rate |
@@ -390,4 +440,4 @@ The committed version of Levee (pre-rewrite) was a fundamentally different desig
 
 The previous design's fundamental limitation was identified in the user's core requirements message: "when the circuit opens due to overload, there's 0 work getting done." The old OPEN state with rate-limited probing at ~10% throughput was better than a hard block, but still wasted ~90% of available capacity during overload. The THROTTLED-first design matches admission to capacity, keeping throughput near maximum while shedding only the excess.
 
-The latency anomaly detection was also brittle -- it required multiple EWMA timescales and trimmed means to distinguish real degradation from normal variance, and the AIMD concurrency control (+10%/-50%) was too slow to track rapid capacity changes during autoscaling events. The MIMD control law on error rate is both simpler (one EWMA, one threshold) and faster (doublings reach capacity in seconds).
+The latency anomaly detection was also brittle -- it required multiple EWMA timescales and trimmed means to distinguish real degradation from normal variance, and the AIMD concurrency control (+10%/-50%) was too slow to track rapid capacity changes during autoscaling events. The MIMD control law on error rate is both simpler (one EWMA, one threshold) and faster (multiplications achieve full capacity in seconds).

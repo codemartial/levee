@@ -117,6 +117,13 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 
 	switch l.state {
 	case CLOSED:
+		// If recovering with active limit, grow it via MIMD
+		if l.inflightLimit < math.MaxFloat64 {
+			l.maybeRelaxLimit(ts)
+			if l.inflight >= int64(math.Ceil(l.inflightLimit)) {
+				return StateChange{State: CLOSED}, ErrCircuitOpen
+			}
+		}
 		l.inflight++
 		return StateChange{State: CLOSED}, nil
 
@@ -150,6 +157,11 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	l.consecFails = 0
 	l.updateCapacityEstimate(ts, duration)
 
+	// Track eval counters for active limit in CLOSED
+	if l.state == CLOSED && l.inflightLimit < math.MaxFloat64 {
+		l.evalSuccesses++
+	}
+
 	if l.state == THROTTLED {
 		l.evalSuccesses++
 		if ts.Sub(l.stateEnteredAt) >= recoveryHoldoff {
@@ -157,7 +169,10 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 			if l.errEWMA < l.recoverThreshold || l.inflightLimit > float64(l.inflight+1)*3.0 {
 				l.state = CLOSED
 				l.stateEnteredAt = ts
-				l.inflightLimit = math.MaxFloat64
+				// Keep inflightLimit — it will grow via maybeRelaxLimit in CLOSED
+				l.lastEvalTS = ts
+				l.evalSuccesses = 0
+				l.evalFailures = 0
 			}
 		}
 	}
@@ -176,6 +191,9 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 
 	switch l.state {
 	case CLOSED:
+		if l.inflightLimit < math.MaxFloat64 {
+			l.evalFailures++
+		}
 		if l.samples >= warmupSamples {
 			if l.errEWMA > l.tripThreshold || l.consecFails >= l.consecFailTrip {
 				l.enterThrottledFromClosed(ts)
@@ -242,7 +260,7 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 
 // enterThrottledFromClosed transitions from CLOSED to THROTTLED.
 func (l *Levee) enterThrottledFromClosed(ts time.Time) {
-	limit := max(float64(l.inflight)*0.75, minInflightLimit)
+	limit := max(float64(l.inflight)*0.5, minInflightLimit)
 
 	l.state = THROTTLED
 	l.stateEnteredAt = ts
@@ -274,6 +292,36 @@ func (l *Levee) enterOpen(ts time.Time) {
 	l.consecFails = 0
 }
 
+// maybeRelaxLimit grows the inflight limit in CLOSED state after recovery.
+// Uses the same MIMD logic but fully relaxes when the limit is clearly unconstraining.
+func (l *Levee) maybeRelaxLimit(ts time.Time) {
+	if ts.Sub(l.lastEvalTS) < evalInterval {
+		return
+	}
+
+	total := l.evalSuccesses + l.evalFailures
+	if total > 0 {
+		evalErrRate := float64(l.evalFailures) / float64(total)
+		if evalErrRate > l.sloErrRate {
+			// Errors rising during recovery — trip to THROTTLED immediately
+			l.enterThrottledFromClosed(ts)
+			return
+		}
+	}
+
+	// Good eval window — double the limit
+	l.inflightLimit *= 2.0
+
+	// Fully relax when limit is well beyond actual usage
+	if l.inflightLimit > float64(l.inflight+1)*10.0 {
+		l.inflightLimit = math.MaxFloat64
+	}
+
+	l.evalSuccesses = 0
+	l.evalFailures = 0
+	l.lastEvalTS = ts
+}
+
 // maybeEvaluateLimit adjusts the inflight limit using MIMD.
 func (l *Levee) maybeEvaluateLimit(ts time.Time) {
 	if ts.Sub(l.lastEvalTS) < evalInterval {
@@ -296,7 +344,7 @@ func (l *Levee) maybeEvaluateLimit(ts time.Time) {
 			l.inflightLimit = max(l.inflightLimit*0.5, minInflightLimit)
 		} else {
 			// Multiplicative increase
-			l.inflightLimit *= 2.0
+			l.inflightLimit *= math.Sqrt2
 		}
 	}
 
@@ -341,6 +389,7 @@ type LeveeState struct {
 	LastEvalTSNS     int64   `json:"last_eval_ts_ns"`
 	EvalSuccesses    int64   `json:"eval_successes"`
 	EvalFailures     int64   `json:"eval_failures"`
+
 }
 
 // SaveState serializes the current state for checkpointing.
