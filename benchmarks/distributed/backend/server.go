@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"container/heap"
 	"math"
 	"sync/atomic"
 	"time"
@@ -11,6 +12,10 @@ import (
 
 // Server simulates a capacity-limited backend service with load-dependent degradation.
 // Uses logical time from request timestamps — no wall clock sleeping.
+//
+// The server is authoritative about request completion timing. Callers submit
+// requests via Submit(), and completions are delivered via callback during
+// Advance() when logical time reaches the completion point.
 type Server struct {
 	capacity *CapacityController
 	pool     *WorkerPool
@@ -22,6 +27,11 @@ type Server struct {
 	// Logical time tracking (max timestamp seen)
 	logicalTimeNS atomic.Int64
 
+	// Completion heap — requests awaiting delivery to the caller.
+	// Ordered by completionNS (earliest first). Only accessed from a
+	// single event loop goroutine, but uses heap.Interface for ordering.
+	completions completionHeap
+
 	// Metrics
 	totalRequests   atomic.Int64
 	totalSuccesses  atomic.Int64
@@ -29,6 +39,28 @@ type Server struct {
 	totalShed       atomic.Int64
 	totalQueueDrops atomic.Int64
 	totalCrashes    atomic.Int64
+}
+
+// completionEntry represents a pending request completion on the backend.
+type completionEntry struct {
+	completionNS int64
+	latency      time.Duration
+	success      bool
+}
+
+// completionHeap is a min-heap of completionEntry ordered by completionNS.
+type completionHeap []completionEntry
+
+func (h completionHeap) Len() int            { return len(h) }
+func (h completionHeap) Less(i, j int) bool  { return h[i].completionNS < h[j].completionNS }
+func (h completionHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *completionHeap) Push(x any)         { *h = append(*h, x.(completionEntry)) }
+func (h *completionHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 // NewServer creates a new backend server.
@@ -57,6 +89,7 @@ func NewServer(specs []loadgen.LoadSpec, capacityConfig CapacityControllerConfig
 		latency:         latency,
 		specs:           specs,
 		slotsPerReplica: slotsPerReplica,
+		completions:     make(completionHeap, 0, 256),
 	}
 }
 
@@ -97,10 +130,17 @@ func (s *Server) Status() ServerStatus {
 	}
 }
 
-// AdvanceTime advances the backend's logical clock and ticks the HPA without
-// recording any demand. This allows the autoscaler to evaluate scaling decisions
-// and promote pending replicas even when a circuit breaker is blocking traffic.
-func (s *Server) AdvanceTime(timestampNS int64) {
+// Advance advances the backend's logical clock, ticks the HPA, and delivers
+// completions whose logical time has elapsed via the onComplete callback.
+//
+// Called on every request (both allowed and blocked by the CB). When the CB
+// blocks traffic, this ensures the autoscaler still ticks and pending
+// completions are delivered so the CB can update its state.
+//
+// The onComplete callback is invoked synchronously and must not call back
+// into Server methods.
+func (s *Server) Advance(timestampNS int64, onComplete func(api.Completion)) {
+	// Update logical time to max of current and request timestamp
 	for {
 		current := s.logicalTimeNS.Load()
 		if timestampNS <= current {
@@ -118,44 +158,45 @@ func (s *Server) AdvanceTime(timestampNS int64) {
 			s.capacity.ResetAfterCrash()
 			s.pool.Resize(s.capacity.CurrentReplicas(), s.capacity.CurrentQueueDepth())
 		}
-		return
+	} else {
+		logicalNow := time.Unix(0, timestampNS)
+		s.capacity.Tick(logicalNow)
+		s.pool.Resize(s.capacity.CurrentReplicas(), s.capacity.CurrentQueueDepth())
 	}
 
-	logicalNow := time.Unix(0, timestampNS)
-	s.capacity.Tick(logicalNow)
-	s.pool.Resize(s.capacity.CurrentReplicas(), s.capacity.CurrentQueueDepth())
+	// Deliver completions whose logical time has elapsed
+	for s.completions.Len() > 0 && s.completions[0].completionNS <= timestampNS {
+		entry := heap.Pop(&s.completions).(completionEntry)
+		onComplete(api.Completion{
+			CompletionNS: entry.completionNS,
+			Latency:      entry.latency,
+			Success:      entry.success,
+		})
+	}
 }
 
-// Execute processes a backend request using logical time and returns the result.
-// Load-dependent degradation inflates latencies and escalates errors when the
-// backend is overloaded. Sustained extreme overload triggers node crash simulation.
-func (s *Server) Execute(req api.BackendRequest) api.BackendResponse {
+// Submit processes a backend request and schedules a completion on the
+// internal heap. The completion will be delivered via the onComplete callback
+// during a future Advance() call when logical time reaches the completion point.
+//
+// Only called for requests that the circuit breaker allowed through.
+func (s *Server) Submit(req api.BackendRequest) {
 	s.totalRequests.Add(1)
 
-	// Update logical time to max of current and request timestamp
-	for {
-		current := s.logicalTimeNS.Load()
-		if req.TimestampNS <= current {
-			break
-		}
-		if s.logicalTimeNS.CompareAndSwap(current, req.TimestampNS) {
-			break
-		}
-	}
-
 	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
+	timeoutNS := timeout.Nanoseconds()
 
 	// Check crash state — HPA is frozen during crash
 	if s.pool.IsCrashed() {
 		if !s.pool.TryRecover(req.TimestampNS) {
-			// Still crashed — don't record request or tick HPA
+			// Still crashed — schedule failure at timeout
 			s.totalFailures.Add(1)
-			return api.BackendResponse{
-				RequestID: req.RequestID,
-				LatencyUS: timeout.Microseconds(),
-				Success:   false,
-				Error:     "service unavailable: node crashed",
-			}
+			heap.Push(&s.completions, completionEntry{
+				completionNS: req.TimestampNS + timeoutNS,
+				latency:      timeout,
+				success:      false,
+			})
+			return
 		}
 		// Just recovered — reset HPA capacity and resize pool
 		s.totalCrashes.Add(1)
@@ -164,7 +205,6 @@ func (s *Server) Execute(req api.BackendRequest) api.BackendResponse {
 	}
 
 	logicalNow := time.Unix(0, req.TimestampNS)
-	timeoutNS := timeout.Nanoseconds()
 
 	// Update capacity controller with logical time
 	s.capacity.RecordRequest(logicalNow)
@@ -182,45 +222,37 @@ func (s *Server) Execute(req api.BackendRequest) api.BackendResponse {
 
 	switch result.Status {
 	case ProcessCrashed:
+		// Crash just triggered — fail all pending completions
+		s.convertPendingToFailures(timeoutNS)
 		s.totalFailures.Add(1)
-		return api.BackendResponse{
-			RequestID: req.RequestID,
-			LatencyUS: timeout.Microseconds(),
-			Success:   false,
-			Queued:    false,
-			Shed:      false,
-			Error:     "service unavailable: node crashed",
-		}
+		heap.Push(&s.completions, completionEntry{
+			completionNS: req.TimestampNS + timeoutNS,
+			latency:      timeout,
+			success:      false,
+		})
 
 	case ProcessShed:
 		s.totalShed.Add(1)
 		s.totalFailures.Add(1)
-		return api.BackendResponse{
-			RequestID: req.RequestID,
-			LatencyUS: timeout.Microseconds(),
-			Success:   false,
-			Queued:    false,
-			Shed:      true,
-			Error:     "service unavailable: queue full",
-		}
+		heap.Push(&s.completions, completionEntry{
+			completionNS: req.TimestampNS + timeoutNS,
+			latency:      timeout,
+			success:      false,
+		})
 
 	case ProcessTimeout:
 		s.totalQueueDrops.Add(1)
 		s.totalFailures.Add(1)
-		return api.BackendResponse{
-			RequestID: req.RequestID,
-			LatencyUS: timeout.Microseconds(),
-			Success:   false,
-			Queued:    result.QueueWait > 0,
-			Shed:      false,
-			Error:     "queue timeout",
-		}
+		heap.Push(&s.completions, completionEntry{
+			completionNS: req.TimestampNS + timeoutNS,
+			latency:      timeout,
+			success:      false,
+		})
 
 	case ProcessOK:
 		// Compute total latency: queue wait + degraded processing time
 		scaledProcessingNS := int64(float64(nominalProcessingNS) * result.LatencyScale)
 		totalLatencyNS := result.QueueWait + scaledProcessingNS
-		totalLatencyUS := totalLatencyNS / 1000
 
 		success := true
 
@@ -237,7 +269,7 @@ func (s *Server) Execute(req api.BackendRequest) api.BackendResponse {
 		// Check if degraded latency exceeds timeout — client would have given up
 		if totalLatencyNS >= timeoutNS {
 			success = false
-			totalLatencyUS = timeout.Microseconds()
+			totalLatencyNS = timeoutNS
 		}
 
 		if success {
@@ -246,16 +278,23 @@ func (s *Server) Execute(req api.BackendRequest) api.BackendResponse {
 			s.totalFailures.Add(1)
 		}
 
-		return api.BackendResponse{
-			RequestID: req.RequestID,
-			LatencyUS: totalLatencyUS,
-			Success:   success,
-			Queued:    result.QueueWait > 0,
-			Shed:      false,
+		heap.Push(&s.completions, completionEntry{
+			completionNS: req.TimestampNS + totalLatencyNS,
+			latency:      time.Duration(totalLatencyNS),
+			success:      success,
+		})
+	}
+}
+
+// convertPendingToFailures converts all pending successful completions to
+// failures. Called when a crash triggers to fail in-flight requests that
+// were optimistically scheduled as successes.
+func (s *Server) convertPendingToFailures(timeoutNS int64) {
+	for i := range s.completions {
+		if s.completions[i].success {
+			s.completions[i].success = false
+			s.completions[i].latency = time.Duration(timeoutNS)
+			// completionNS unchanged — ordering key preserved, no re-heapify needed
 		}
 	}
-
-	// Unreachable
-	s.totalFailures.Add(1)
-	return api.BackendResponse{RequestID: req.RequestID, Success: false, Error: "unknown status"}
 }

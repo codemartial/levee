@@ -151,14 +151,14 @@ func runSingleCB(t *testing.T, cbName string, specs []loadgen.LoadSpec, slo leve
 	// Create backend (dedicated for this CB)
 	backendServer := backend.NewServer(specs, capacityConfig, seed)
 
-	// Create orchestrator with direct backend call
+	// Create orchestrator with backend advance/submit calls
 	orchestrator := app.NewOrchestrator(app.OrchestratorConfig{
-		CallBackend: backendServer.Execute,
-		AdvanceTime: backendServer.AdvanceTime,
-		SLO:         slo,
-		Specs:       specs,
-		StartTime:   time.Unix(0, 0),
-		CBName:      cbName,
+		Advance:   backendServer.Advance,
+		Submit:    backendServer.Submit,
+		SLO:       slo,
+		Specs:     specs,
+		StartTime: time.Unix(0, 0),
+		CBName:    cbName,
 	})
 
 	// Create dispatcher with direct orchestrator call

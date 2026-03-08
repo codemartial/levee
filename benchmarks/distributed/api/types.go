@@ -1,6 +1,8 @@
 // Package api defines shared types for the distributed benchmark system.
 package api
 
+import "time"
+
 // AppRequest is sent from Load Generator to Application container.
 type AppRequest struct {
 	RequestID   string `json:"request_id"`
@@ -17,11 +19,8 @@ type AppResponse struct {
 
 // CBResult contains the result of a single circuit breaker's handling of a request.
 type CBResult struct {
-	Allowed   bool   `json:"allowed"`
-	State     string `json:"state"`
-	LatencyUS int64  `json:"latency_us"`
-	Success   bool   `json:"success"`
-	Error     string `json:"error,omitempty"`
+	Allowed bool   `json:"allowed"`
+	State   string `json:"state"`
 }
 
 // BackendRequest is sent from Application to Backend container.
@@ -33,25 +32,13 @@ type BackendRequest struct {
 	SpecIndex   int    `json:"spec_index"`
 }
 
-// BackendResponse is returned from Backend to Application.
-type BackendResponse struct {
-	RequestID string `json:"request_id"`
-	LatencyUS int64  `json:"latency_us"`
-	Success   bool   `json:"success"`
-	Queued    bool   `json:"queued"`
-	Shed      bool   `json:"shed"`
-	Error     string `json:"error,omitempty"`
-}
-
-// BackendStatus is returned by GET /status on the backend.
-type BackendStatus struct {
-	CurrentReplicas int     `json:"current_replicas"`
-	PendingReplicas int     `json:"pending_replicas"`
-	CapacityRPS     int     `json:"capacity_rps"`
-	QueueDepth      int     `json:"queue_depth"`
-	QueueMax        int     `json:"queue_max"`
-	CurrentRPS      float64 `json:"current_rps"`
-	SpecIndex       int     `json:"spec_index"`
+// Completion represents the outcome of a backend request, delivered when
+// the request's logical completion time has elapsed. The backend is
+// authoritative about when and how requests complete.
+type Completion struct {
+	CompletionNS int64
+	Latency      time.Duration
+	Success      bool
 }
 
 // AppMetrics is returned by GET /metrics on the application.
