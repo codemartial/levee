@@ -1,13 +1,7 @@
 package backend
 
 import (
-	"encoding/json"
-	"fmt"
-	"log"
-	"net"
-	"net/http"
-	"os"
-	"sync"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -15,15 +9,15 @@ import (
 	"github.com/codemartial/loadgen"
 )
 
-// Server is the backend HTTP server that simulates a capacity-limited service.
-// Uses logical time from request timestamps - no wall clock sleeping.
+// Server simulates a capacity-limited backend service with load-dependent degradation.
+// Uses logical time from request timestamps — no wall clock sleeping.
 type Server struct {
 	capacity *CapacityController
-	queue    *RequestQueue
+	pool     *WorkerPool
 	latency  *LatencyGenerator
 	specs    []loadgen.LoadSpec
 
-	mu sync.Mutex
+	slotsPerReplica int
 
 	// Logical time tracking (max timestamp seen)
 	logicalTimeNS atomic.Int64
@@ -34,39 +28,108 @@ type Server struct {
 	totalFailures   atomic.Int64
 	totalShed       atomic.Int64
 	totalQueueDrops atomic.Int64
-
-	// Wall time tracking (for throughput reporting)
-	wallStartTime time.Time
+	totalCrashes    atomic.Int64
 }
 
 // NewServer creates a new backend server.
 func NewServer(specs []loadgen.LoadSpec, capacityConfig CapacityControllerConfig, seed uint64) *Server {
 	capacity := NewCapacityController(capacityConfig)
-	queue := NewRequestQueue(capacity.CurrentQueueDepth())
 	latency := NewLatencyGenerator(specs, seed)
 
+	// Compute slots per replica using Little's Law:
+	// concurrency = throughput × mean_latency
+	meanLatencyMS := latency.GetProfile(0).MeanLatencyMS()
+	meanLatencyS := meanLatencyMS / 1000.0
+	slotsPerReplica := int(math.Ceil(float64(capacityConfig.BaseShape.ThroughputRPS) * meanLatencyS))
+	if slotsPerReplica < 1 {
+		slotsPerReplica = 1
+	}
+
+	pool := NewWorkerPool(
+		slotsPerReplica,
+		capacity.CurrentReplicas(),
+		capacity.CurrentQueueDepth(),
+	)
+
 	return &Server{
-		capacity:      capacity,
-		queue:         queue,
-		latency:       latency,
-		specs:         specs,
-		wallStartTime: time.Now(),
+		capacity:        capacity,
+		pool:            pool,
+		latency:         latency,
+		specs:           specs,
+		slotsPerReplica: slotsPerReplica,
 	}
 }
 
-// HandleExecute handles POST /execute requests using logical time.
-func (s *Server) HandleExecute(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+// Stats returns backend processing statistics.
+type ServerStats struct {
+	TotalRequests   int64
+	TotalSuccesses  int64
+	TotalFailures   int64
+	TotalShed       int64
+	TotalQueueDrops int64
+	TotalCrashes    int64
+}
+
+func (s *Server) Stats() ServerStats {
+	return ServerStats{
+		TotalRequests:   s.totalRequests.Load(),
+		TotalSuccesses:  s.totalSuccesses.Load(),
+		TotalFailures:   s.totalFailures.Load(),
+		TotalShed:       s.totalShed.Load(),
+		TotalQueueDrops: s.totalQueueDrops.Load(),
+		TotalCrashes:    s.totalCrashes.Load(),
+	}
+}
+
+// ServerStatus provides real-time backend status for tracing.
+type ServerStatus struct {
+	Replicas   int
+	EWMALoad   float64
+	CurrentRPS float64
+}
+
+// Status returns the current real-time backend status.
+func (s *Server) Status() ServerStatus {
+	return ServerStatus{
+		Replicas:   s.capacity.CurrentReplicas(),
+		EWMALoad:   s.pool.EWMALoad(),
+		CurrentRPS: s.capacity.GetCurrentRPS(),
+	}
+}
+
+// AdvanceTime advances the backend's logical clock and ticks the HPA without
+// recording any demand. This allows the autoscaler to evaluate scaling decisions
+// and promote pending replicas even when a circuit breaker is blocking traffic.
+func (s *Server) AdvanceTime(timestampNS int64) {
+	for {
+		current := s.logicalTimeNS.Load()
+		if timestampNS <= current {
+			break
+		}
+		if s.logicalTimeNS.CompareAndSwap(current, timestampNS) {
+			break
+		}
+	}
+
+	// During crash, HPA is frozen — only attempt recovery
+	if s.pool.IsCrashed() {
+		if s.pool.TryRecover(timestampNS) {
+			s.totalCrashes.Add(1)
+			s.capacity.ResetAfterCrash()
+			s.pool.Resize(s.capacity.CurrentReplicas(), s.capacity.CurrentQueueDepth())
+		}
 		return
 	}
 
-	var req api.BackendRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
+	logicalNow := time.Unix(0, timestampNS)
+	s.capacity.Tick(logicalNow)
+	s.pool.Resize(s.capacity.CurrentReplicas(), s.capacity.CurrentQueueDepth())
+}
 
+// Execute processes a backend request using logical time and returns the result.
+// Load-dependent degradation inflates latencies and escalates errors when the
+// backend is overloaded. Sustained extreme overload triggers node crash simulation.
+func (s *Server) Execute(req api.BackendRequest) api.BackendResponse {
 	s.totalRequests.Add(1)
 
 	// Update logical time to max of current and request timestamp
@@ -80,200 +143,119 @@ func (s *Server) HandleExecute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	logicalNow := time.Unix(0, req.TimestampNS)
 	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
+
+	// Check crash state — HPA is frozen during crash
+	if s.pool.IsCrashed() {
+		if !s.pool.TryRecover(req.TimestampNS) {
+			// Still crashed — don't record request or tick HPA
+			s.totalFailures.Add(1)
+			return api.BackendResponse{
+				RequestID: req.RequestID,
+				LatencyUS: timeout.Microseconds(),
+				Success:   false,
+				Error:     "service unavailable: node crashed",
+			}
+		}
+		// Just recovered — reset HPA capacity and resize pool
+		s.totalCrashes.Add(1)
+		s.capacity.ResetAfterCrash()
+		s.pool.Resize(s.capacity.CurrentReplicas(), s.capacity.CurrentQueueDepth())
+	}
+
+	logicalNow := time.Unix(0, req.TimestampNS)
+	timeoutNS := timeout.Nanoseconds()
 
 	// Update capacity controller with logical time
 	s.capacity.RecordRequest(logicalNow)
 	s.capacity.Tick(logicalNow)
 
-	// Update queue max depth based on current capacity
-	s.queue.UpdateMaxDepth(s.capacity.CurrentQueueDepth())
+	// Reconcile worker pool with current HPA state
+	s.pool.Resize(s.capacity.CurrentReplicas(), s.capacity.CurrentQueueDepth())
 
-	// Check current load vs capacity
-	capacity := s.capacity.CurrentCapacity()
-	currentRPS := s.capacity.GetCurrentRPS()
-
-	// Generate processing latency (no sleeping - just calculate)
+	// Sample nominal latency from spec profile (healthyLatencyLookup applied internally)
 	latencyMS := s.latency.Sample(req.SpecIndex)
-	processingTime := time.Duration(latencyMS * float64(time.Millisecond))
+	nominalProcessingNS := int64(latencyMS * float64(time.Millisecond))
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Process through the worker pool (applies degradation)
+	result := s.pool.TryProcess(req.TimestampNS, nominalProcessingNS, timeoutNS)
 
-	if currentRPS >= float64(capacity) {
-		// Over capacity - try to queue
-		queueResult := s.queue.TryQueue(logicalNow, timeout, processingTime)
+	switch result.Status {
+	case ProcessCrashed:
+		s.totalFailures.Add(1)
+		return api.BackendResponse{
+			RequestID: req.RequestID,
+			LatencyUS: timeout.Microseconds(),
+			Success:   false,
+			Queued:    false,
+			Shed:      false,
+			Error:     "service unavailable: node crashed",
+		}
 
-		switch queueResult.Status {
-		case QueueStatusShed:
-			// Queue full - immediate 503
-			s.totalShed.Add(1)
-			resp := api.BackendResponse{
-				RequestID: req.RequestID,
-				LatencyUS: 0,
-				Success:   false,
-				Queued:    false,
-				Shed:      true,
-				Error:     "service unavailable: queue full",
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(resp)
-			return
+	case ProcessShed:
+		s.totalShed.Add(1)
+		s.totalFailures.Add(1)
+		return api.BackendResponse{
+			RequestID: req.RequestID,
+			LatencyUS: timeout.Microseconds(),
+			Success:   false,
+			Queued:    false,
+			Shed:      true,
+			Error:     "service unavailable: queue full",
+		}
 
-		case QueueStatusTimeout:
-			// Would timeout in queue - 504
-			s.totalQueueDrops.Add(1)
+	case ProcessTimeout:
+		s.totalQueueDrops.Add(1)
+		s.totalFailures.Add(1)
+		return api.BackendResponse{
+			RequestID: req.RequestID,
+			LatencyUS: timeout.Microseconds(),
+			Success:   false,
+			Queued:    result.QueueWait > 0,
+			Shed:      false,
+			Error:     "queue timeout",
+		}
+
+	case ProcessOK:
+		// Compute total latency: queue wait + degraded processing time
+		scaledProcessingNS := int64(float64(nominalProcessingNS) * result.LatencyScale)
+		totalLatencyNS := result.QueueWait + scaledProcessingNS
+		totalLatencyUS := totalLatencyNS / 1000
+
+		success := true
+
+		// Check load-driven errors (from degradation curve)
+		if result.LoadErrorRate > 0 && s.latency.RollFloat64() < result.LoadErrorRate {
+			success = false
+		}
+
+		// Check baseline errors (independent of load, follows BAU degradation)
+		if success && s.latency.ShouldError(req.SpecIndex) {
+			success = false
+		}
+
+		// Check if degraded latency exceeds timeout — client would have given up
+		if totalLatencyNS >= timeoutNS {
+			success = false
+			totalLatencyUS = timeout.Microseconds()
+		}
+
+		if success {
+			s.totalSuccesses.Add(1)
+		} else {
 			s.totalFailures.Add(1)
-			resp := api.BackendResponse{
-				RequestID: req.RequestID,
-				LatencyUS: timeout.Microseconds(),
-				Success:   false,
-				Queued:    true,
-				Shed:      false,
-				Error:     "queue timeout",
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusGatewayTimeout)
-			json.NewEncoder(w).Encode(resp)
-			return
+		}
 
-		case QueueStatusProcessed:
-			// Successfully queued and processed
-			totalLatency := queueResult.QueueWait + processingTime
-			success := totalLatency < timeout
-
-			// Inject baseline errors independent of capacity/latency
-			if success && s.latency.ShouldError(req.SpecIndex) {
-				success = false
-			}
-
-			if success {
-				s.totalSuccesses.Add(1)
-			} else {
-				s.totalFailures.Add(1)
-			}
-
-			resp := api.BackendResponse{
-				RequestID: req.RequestID,
-				LatencyUS: totalLatency.Microseconds(),
-				Success:   success,
-				Queued:    true,
-				Shed:      false,
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if success {
-				w.WriteHeader(http.StatusOK)
-			} else {
-				w.WriteHeader(http.StatusGatewayTimeout)
-			}
-			json.NewEncoder(w).Encode(resp)
-			return
+		return api.BackendResponse{
+			RequestID: req.RequestID,
+			LatencyUS: totalLatencyUS,
+			Success:   success,
+			Queued:    result.QueueWait > 0,
+			Shed:      false,
 		}
 	}
 
-	// Under capacity - process immediately
-	success := processingTime < timeout
-
-	// Inject baseline errors independent of capacity/latency
-	// This simulates the inherent error rate of the backend service
-	if success && s.latency.ShouldError(req.SpecIndex) {
-		success = false
-	}
-
-	if success {
-		s.totalSuccesses.Add(1)
-	} else {
-		s.totalFailures.Add(1)
-	}
-
-	resp := api.BackendResponse{
-		RequestID: req.RequestID,
-		LatencyUS: processingTime.Microseconds(),
-		Success:   success,
-		Queued:    false,
-		Shed:      false,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if success {
-		w.WriteHeader(http.StatusOK)
-	} else {
-		w.WriteHeader(http.StatusGatewayTimeout)
-	}
-	json.NewEncoder(w).Encode(resp)
-}
-
-// HandleStatus handles GET /status requests.
-func (s *Server) HandleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	status := s.capacity.Status()
-
-	resp := api.BackendStatus{
-		CurrentReplicas: status.CurrentReplicas,
-		PendingReplicas: status.PendingReplicas,
-		CapacityRPS:     status.CapacityRPS,
-		QueueDepth:      s.queue.Len(),
-		QueueMax:        s.queue.MaxDepth(),
-		CurrentRPS:      status.CurrentRPS,
-		SpecIndex:       0, // Not tracked in logical time mode
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// Handler returns an http.Handler for the backend server.
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/execute", s.HandleExecute)
-	mux.HandleFunc("/status", s.HandleStatus)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
-	return mux
-}
-
-// Run starts the HTTP server. If addr starts with "/", it's treated as a Unix socket path.
-func (s *Server) Run(addr string) error {
-	srv := &http.Server{
-		Handler: s.Handler(),
-	}
-
-	// Check if this is a Unix socket path
-	if len(addr) > 0 && addr[0] == '/' {
-		return s.runUnix(srv, addr)
-	}
-
-	// TCP listener
-	srv.Addr = addr
-	log.Printf("Backend server starting on %s (logical time mode, TCP)", addr)
-	return srv.ListenAndServe()
-}
-
-// runUnix starts the server on a Unix socket.
-func (s *Server) runUnix(srv *http.Server, socketPath string) error {
-	// Remove existing socket file
-	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove existing socket: %w", err)
-	}
-
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return fmt.Errorf("failed to listen on unix socket: %w", err)
-	}
-
-	log.Printf("Backend server starting on %s (logical time mode, Unix socket)", socketPath)
-	return srv.Serve(listener)
-}
-
-// Shutdown gracefully shuts down the server (no-op in logical time mode).
-func (s *Server) Shutdown() {
-	// No background goroutines to stop in logical time mode
+	// Unreachable
+	s.totalFailures.Add(1)
+	return api.BackendResponse{RequestID: req.RequestID, Success: false, Error: "unknown status"}
 }

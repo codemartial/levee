@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"math"
 	"math/rand/v2"
 	"sync"
 
@@ -56,6 +57,28 @@ func NewLatencyProfile(p50, p99, timeout float64) LatencyProfile {
 	lp.b = p50 * (1 - 0.5*lp.c)
 
 	return lp
+}
+
+// MeanLatencyMS returns the analytical mean latency in milliseconds.
+// Integrates the piecewise distribution: rational function over [0, 0.99]
+// and linear tail over [0.99, 1.0].
+func (lp LatencyProfile) MeanLatencyMS() float64 {
+	// Integral of (a + b*x/(1-c*x)) from 0 to 0.99
+	var rationalIntegral float64
+	if math.Abs(lp.c) < 1e-10 {
+		// c ≈ 0: y = a + b*x, integral = a*0.99 + b*0.99²/2
+		rationalIntegral = lp.a*0.99 + lp.b*0.99*0.99/2.0
+	} else {
+		// ∫(a + b*x/(1-c*x))dx = a*x + b*[-x/c - ln(1-c*x)/c²]
+		rationalIntegral = lp.a*0.99 + lp.b*(-0.99/lp.c-math.Log(1-0.99*lp.c)/(lp.c*lp.c))
+	}
+
+	// Integral of linear tail from 0.99 to 1.0
+	// y = P99 + slope*(x - 0.99), slope = (Timeout - P99) / 0.01
+	slope := (lp.TimeoutMS - lp.P99MS) / 0.01
+	tailIntegral := lp.P99MS*0.01 + slope*0.00005
+
+	return rationalIntegral + tailIntegral
 }
 
 // LatencyGenerator generates realistic latencies using the rational function distribution.
@@ -209,4 +232,12 @@ func (lg *LatencyGenerator) GetBaselineErrorRate(specIndex int) float64 {
 		return healthyErrorRate
 	}
 	return lg.baselineErrorRates[specIndex]
+}
+
+// RollFloat64 returns a random float64 in [0, 1). Thread-safe.
+func (lg *LatencyGenerator) RollFloat64() float64 {
+	lg.mu.Lock()
+	r := lg.rng.Float64()
+	lg.mu.Unlock()
+	return r
 }

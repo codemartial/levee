@@ -9,14 +9,14 @@ import (
 // BaseShape defines the capacity of a single replica.
 type BaseShape struct {
 	ThroughputRPS int // e.g., 150 RPS per replica
-	QueueDepth    int // e.g., 15 (10% of throughput)
+	QueueDepth    int // e.g., 50 (per-replica queue slots)
 }
 
-// DefaultBaseShape returns the default base shape (150 RPS + 15 queue).
+// DefaultBaseShape returns the default base shape (150 RPS + 50 queue).
 func DefaultBaseShape() BaseShape {
 	return BaseShape{
 		ThroughputRPS: 150,
-		QueueDepth:    15,
+		QueueDepth:    50,
 	}
 }
 
@@ -28,6 +28,7 @@ type CapacityControllerConfig struct {
 	TargetUtilization      float64       // e.g., 0.70 for 70%
 	EvaluationInterval     time.Duration // e.g., 15s
 	ScaleDownStabilization time.Duration // e.g., 300s (5 minutes)
+	ScaleDownDelay         time.Duration // minimum time after scale-up before scale-down is allowed
 	ProvisioningLag        time.Duration // e.g., 30s
 }
 
@@ -40,6 +41,7 @@ func DefaultCapacityControllerConfig() CapacityControllerConfig {
 		TargetUtilization:      0.70,
 		EvaluationInterval:     15 * time.Second,
 		ScaleDownStabilization: 300 * time.Second,
+		ScaleDownDelay:         600 * time.Second,
 		ProvisioningLag:        30 * time.Second,
 	}
 }
@@ -60,6 +62,7 @@ type CapacityController struct {
 
 	// State tracking
 	lastEvaluation     time.Time
+	lastScaleUpTime    time.Time
 	utilizationHistory []utilizationSample
 	pendingReadyAt     time.Time
 
@@ -191,8 +194,13 @@ func (c *CapacityController) Tick(now time.Time) {
 		toAdd := targetReplicas - totalReplicas
 		c.pendingReplicas += toAdd
 		c.pendingReadyAt = now.Add(c.config.ProvisioningLag)
+		c.lastScaleUpTime = now
 
 	} else if targetReplicas < c.currentReplicas {
+		// Scale down cooldown: don't scale down too soon after a scale-up
+		if !c.lastScaleUpTime.IsZero() && now.Sub(c.lastScaleUpTime) < c.config.ScaleDownDelay {
+			return
+		}
 		// Scale down: only if ALL samples in window are below threshold
 		maxUtil := 0.0
 		for _, s := range c.utilizationHistory {
@@ -206,6 +214,21 @@ func (c *CapacityController) Tick(now time.Time) {
 			}
 		}
 	}
+}
+
+// ResetAfterCrash simulates pod loss after a backend crash.
+// Replicas drop to MinReplicas (pods are gone), pending provisioning is cleared,
+// but the HPA controller retains its RPS estimate and utilization history so it
+// can immediately start scaling back up on the next Tick.
+func (c *CapacityController) ResetAfterCrash() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.currentReplicas = c.config.MinReplicas
+	c.pendingReplicas = 0
+	c.pendingReadyAt = time.Time{}
+	c.lastScaleUpTime = time.Time{}
+	// Keep currentRPS and utilizationHistory — HPA remembers pre-crash demand
 }
 
 // Status returns the current autoscaler status for monitoring.

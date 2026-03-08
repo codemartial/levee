@@ -2,13 +2,8 @@
 package app
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
+	"container/heap"
 	"math"
-	"net"
-	"net/http"
 	"sync"
 	"time"
 
@@ -26,11 +21,42 @@ type CircuitBreaker interface {
 	State() levee.State
 }
 
+// cbRequest is sent from callers to per-CB event loops.
+type cbRequest struct {
+	req    api.AppRequest
+	ts     time.Time
+	result chan<- api.CBResult
+}
+
+// pendingCompletion represents a backend call that has completed but hasn't been
+// reported to the CB yet. Completions are processed in logical-time order.
+type pendingCompletion struct {
+	completionNS int64
+	latency      time.Duration
+	success      bool
+}
+
+// completionHeap is a min-heap of pendingCompletion ordered by completionNS.
+type completionHeap []pendingCompletion
+
+func (h completionHeap) Len() int            { return len(h) }
+func (h completionHeap) Less(i, j int) bool  { return h[i].completionNS < h[j].completionNS }
+func (h completionHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *completionHeap) Push(x any)         { *h = append(*h, x.(pendingCompletion)) }
+func (h *completionHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
 // CBEntry holds a circuit breaker and its name.
 type CBEntry struct {
-	Name    string
-	CB      CircuitBreaker
-	Metrics *CBMetrics
+	Name     string
+	CB       CircuitBreaker
+	Metrics  *CBMetrics
+	requests chan cbRequest
 }
 
 // CBMetrics tracks per-CB metrics.
@@ -42,6 +68,10 @@ type CBMetrics struct {
 	TotalFailures    int64
 	StateTransitions int
 	LastState        levee.State
+
+	// Concurrency tracking (only while NOT OPEN)
+	currentConcurrency int64 // currently in-flight requests for this CB
+	maxConcurrency     int64 // max observed while state != OPEN
 
 	// Epoch-based scoring (200ms = 200_000_000 ns)
 	currentEpoch    int64   // timestampNS / 200_000_000
@@ -55,8 +85,8 @@ type CBMetrics struct {
 type Orchestrator struct {
 	mu            sync.RWMutex
 	cbs           []CBEntry
-	backendHost   string
-	httpClient    *http.Client
+	callBackendFn func(api.BackendRequest) api.BackendResponse
+	advanceTimeFn func(int64)
 	specs         []loadgen.LoadSpec
 	slo           levee.SLO
 	startTime     time.Time
@@ -64,6 +94,10 @@ type Orchestrator struct {
 
 	// Logical time tracking (max timestamp seen)
 	maxLogicalTimeNS int64
+
+	// Event loop lifecycle
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // RecordResult updates epoch-based scoring for a result.
@@ -102,7 +136,8 @@ func (m *CBMetrics) Finalize() {
 
 // OrchestratorConfig holds configuration for the orchestrator.
 type OrchestratorConfig struct {
-	BackendHost string
+	CallBackend func(api.BackendRequest) api.BackendResponse
+	AdvanceTime func(int64) // Advances backend logical clock without recording demand
 	SLO         levee.SLO
 	Specs       []loadgen.LoadSpec
 	StartTime   time.Time
@@ -113,36 +148,12 @@ type OrchestratorConfig struct {
 // If CBName is set, only that CB is tested (for isolated benchmarking).
 // If CBName is empty, all 3 CBs are tested (for comparison, but with shared backend).
 func NewOrchestrator(config OrchestratorConfig) *Orchestrator {
-	// Create HTTP transport - use Unix socket if backend host starts with "/"
-	var transport *http.Transport
-	if len(config.BackendHost) > 0 && config.BackendHost[0] == '/' {
-		// Unix socket transport
-		transport = &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", config.BackendHost)
-			},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		}
-	} else {
-		// TCP transport
-		transport = &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		}
-	}
-
 	o := &Orchestrator{
-		backendHost: config.BackendHost,
-		specs:       config.Specs,
-		slo:         config.SLO,
-		startTime:   config.StartTime,
-		httpClient: &http.Client{
-			Timeout:   time.Duration(config.SLO.Timeout.Milliseconds()*2) * time.Millisecond,
-			Transport: transport,
-		},
+		callBackendFn: config.CallBackend,
+		advanceTimeFn: config.AdvanceTime,
+		specs:         config.Specs,
+		slo:           config.SLO,
+		startTime:     config.StartTime,
 	}
 
 	// Initialize circuit breakers based on config
@@ -185,11 +196,21 @@ func NewOrchestrator(config OrchestratorConfig) *Orchestrator {
 		o.cbs = allCBs
 	}
 
+	// Start per-CB event loops
+	for i := range o.cbs {
+		o.cbs[i].requests = make(chan cbRequest, 64)
+		o.wg.Add(1)
+		go func(entry *CBEntry) {
+			defer o.wg.Done()
+			o.cbEventLoop(entry)
+		}(&o.cbs[i])
+	}
+
 	return o
 }
 
 // HandleRequest processes a request through all circuit breakers.
-func (o *Orchestrator) HandleRequest(ctx context.Context, req api.AppRequest) api.AppResponse {
+func (o *Orchestrator) HandleRequest(req api.AppRequest) api.AppResponse {
 	o.mu.Lock()
 	o.totalRequests++
 	// Track max logical time for metrics
@@ -200,13 +221,17 @@ func (o *Orchestrator) HandleRequest(ctx context.Context, req api.AppRequest) ap
 
 	ts := time.Unix(0, req.TimestampNS)
 
-	results := make(map[string]api.CBResult)
-
-	// Process each CB
+	// Send to all CB event loops and collect results
+	resultChs := make([]chan api.CBResult, len(o.cbs))
 	for i := range o.cbs {
-		entry := &o.cbs[i]
-		result := o.processCB(ctx, entry, req, ts)
-		results[entry.Name] = result
+		ch := make(chan api.CBResult, 1)
+		resultChs[i] = ch
+		o.cbs[i].requests <- cbRequest{req: req, ts: ts, result: ch}
+	}
+
+	results := make(map[string]api.CBResult)
+	for i := range o.cbs {
+		results[o.cbs[i].Name] = <-resultChs[i]
 	}
 
 	return api.AppResponse{
@@ -215,135 +240,148 @@ func (o *Orchestrator) HandleRequest(ctx context.Context, req api.AppRequest) ap
 	}
 }
 
-// processCB handles a single CB's processing of a request.
-func (o *Orchestrator) processCB(ctx context.Context, entry *CBEntry, req api.AppRequest, ts time.Time) api.CBResult {
-	// Call CB.Start
-	sc, err := entry.CB.Start(ts)
+// cbEventLoop processes CB lifecycle events in logical-time order.
+// Each CB has its own event loop goroutine. A min-heap of pending completions
+// ensures Success()/Fail() are called in logical completion time order.
+func (o *Orchestrator) cbEventLoop(entry *CBEntry) {
+	var h completionHeap
+	var concurrency int64
+	var maxConcurrency int64
 
-	// Track state transitions
-	entry.Metrics.mu.Lock()
-	if sc.State != entry.Metrics.LastState {
-		entry.Metrics.StateTransitions++
-		entry.Metrics.LastState = sc.State
-	}
-	entry.Metrics.mu.Unlock()
+	drainCompletion := func(c pendingCompletion) {
+		completionTime := time.Unix(0, c.completionNS)
+		if c.success {
+			entry.CB.Success(completionTime, c.latency)
+		} else {
+			entry.CB.Fail(completionTime, c.latency)
+		}
+		concurrency--
 
-	if err != nil {
-		// CB blocked the request
 		entry.Metrics.mu.Lock()
-		entry.Metrics.TotalBlocked++
+		if c.success {
+			entry.Metrics.TotalSuccesses++
+		} else {
+			entry.Metrics.TotalFailures++
+		}
+		entry.Metrics.currentConcurrency = concurrency
 		entry.Metrics.mu.Unlock()
 
-		return api.CBResult{
-			Allowed:   false,
-			State:     stateString(sc.State),
-			LatencyUS: 0,
-			Success:   false,
-			Error:     "circuit open",
+		entry.Metrics.RecordResult(c.completionNS, c.success)
+	}
+
+	for req := range entry.requests {
+		// Advance backend's logical clock so HPA can tick even when CB blocks traffic.
+		// This simulates the real-world behavior where the autoscaler runs on its own
+		// clock, independent of whether traffic reaches the backend.
+		if o.advanceTimeFn != nil {
+			o.advanceTimeFn(req.req.TimestampNS)
+		}
+
+		// Drain completions that logically finished before this request's start
+		for h.Len() > 0 && h[0].completionNS <= req.req.TimestampNS {
+			drainCompletion(heap.Pop(&h).(pendingCompletion))
+		}
+
+		// Process the new request
+		sc, err := entry.CB.Start(req.ts)
+
+		// Track state transitions
+		entry.Metrics.mu.Lock()
+		if sc.State != entry.Metrics.LastState {
+			entry.Metrics.StateTransitions++
+			entry.Metrics.LastState = sc.State
+		}
+		entry.Metrics.mu.Unlock()
+
+		if err != nil {
+			// CB blocked the request
+			entry.Metrics.mu.Lock()
+			entry.Metrics.TotalBlocked++
+			entry.Metrics.mu.Unlock()
+
+			req.result <- api.CBResult{
+				Allowed:   false,
+				State:     stateString(sc.State),
+				LatencyUS: 0,
+				Success:   false,
+				Error:     "circuit open",
+			}
+			continue
+		}
+
+		// CB allowed - track concurrency
+		concurrency++
+		entry.Metrics.mu.Lock()
+		entry.Metrics.TotalAllowed++
+		entry.Metrics.currentConcurrency = concurrency
+		if sc.State != levee.OPEN && concurrency > maxConcurrency {
+			maxConcurrency = concurrency
+			entry.Metrics.maxConcurrency = maxConcurrency
+		}
+		entry.Metrics.mu.Unlock()
+
+		// Direct backend call
+		backendResp := o.callBackend(req.req, entry.Name)
+
+		// Queue completion for logical-time-ordered processing
+		latency := time.Duration(backendResp.LatencyUS) * time.Microsecond
+		completionNS := req.req.TimestampNS + latency.Nanoseconds()
+		heap.Push(&h, pendingCompletion{
+			completionNS: completionNS,
+			latency:      latency,
+			success:      backendResp.Success,
+		})
+
+		// Build and send result back to caller
+		var resultErr string
+		if !backendResp.Success {
+			resultErr = backendResp.Error
+		}
+
+		req.result <- api.CBResult{
+			Allowed:   true,
+			State:     stateString(entry.CB.State()),
+			LatencyUS: backendResp.LatencyUS,
+			Success:   backendResp.Success,
+			Error:     resultErr,
 		}
 	}
 
-	// CB allowed - make backend call
-	entry.Metrics.mu.Lock()
-	entry.Metrics.TotalAllowed++
-	entry.Metrics.mu.Unlock()
-
-	backendResp, latency, backendErr := o.callBackend(ctx, req, entry.Name)
-
-	var success bool
-	var resultErr string
-
-	if backendErr != nil {
-		success = false
-		resultErr = backendErr.Error()
-		entry.CB.Fail(ts.Add(latency), latency)
-		entry.Metrics.mu.Lock()
-		entry.Metrics.TotalFailures++
-		entry.Metrics.mu.Unlock()
-	} else if backendResp != nil && !backendResp.Success {
-		success = false
-		resultErr = backendResp.Error
-		entry.CB.Fail(ts.Add(latency), latency)
-		entry.Metrics.mu.Lock()
-		entry.Metrics.TotalFailures++
-		entry.Metrics.mu.Unlock()
-	} else {
-		success = true
-		entry.CB.Success(ts.Add(latency), latency)
-		entry.Metrics.mu.Lock()
-		entry.Metrics.TotalSuccesses++
-		entry.Metrics.mu.Unlock()
+	// Drain remaining completions after channel closes
+	for h.Len() > 0 {
+		drainCompletion(heap.Pop(&h).(pendingCompletion))
 	}
 
-	// Record result for epoch-based scoring
-	entry.Metrics.RecordResult(req.TimestampNS, success)
-
-	var latencyUS int64
-	if backendResp != nil {
-		latencyUS = backendResp.LatencyUS
-	} else {
-		latencyUS = latency.Microseconds()
-	}
-
-	return api.CBResult{
-		Allowed:   true,
-		State:     stateString(entry.CB.State()),
-		LatencyUS: latencyUS,
-		Success:   success,
-		Error:     resultErr,
-	}
+	// Finalize epoch scoring
+	entry.Metrics.Finalize()
 }
 
-// callBackend makes an HTTP call to the backend.
-// Returns the logical latency from the backend response (not wall clock).
-func (o *Orchestrator) callBackend(ctx context.Context, req api.AppRequest, cbName string) (*api.BackendResponse, time.Duration, error) {
-	backendReq := api.BackendRequest{
+// Close shuts down all per-CB event loops and drains remaining completions.
+func (o *Orchestrator) Close() {
+	o.closeOnce.Do(func() {
+		for i := range o.cbs {
+			close(o.cbs[i].requests)
+		}
+		o.wg.Wait()
+	})
+}
+
+// callBackend makes a direct call to the backend.
+func (o *Orchestrator) callBackend(req api.AppRequest, cbName string) api.BackendResponse {
+	return o.callBackendFn(api.BackendRequest{
 		RequestID:   req.RequestID,
 		CBName:      cbName,
 		TimestampNS: req.TimestampNS,
 		TimeoutMS:   req.TimeoutMS,
 		SpecIndex:   req.SpecIndex,
-	}
-
-	body, err := json.Marshal(backendReq)
-	if err != nil {
-		// On error, return timeout as the latency (logical)
-		return nil, time.Duration(req.TimeoutMS) * time.Millisecond, fmt.Errorf("marshal error: %w", err)
-	}
-
-	// For Unix sockets, use a dummy host since the transport handles the connection
-	var url string
-	if len(o.backendHost) > 0 && o.backendHost[0] == '/' {
-		url = "http://unix/execute"
-	} else {
-		url = fmt.Sprintf("http://%s/execute", o.backendHost)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, time.Duration(req.TimeoutMS) * time.Millisecond, fmt.Errorf("request creation error: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := o.httpClient.Do(httpReq)
-	if err != nil {
-		// On HTTP error, assume timeout (logical)
-		return nil, time.Duration(req.TimeoutMS) * time.Millisecond, fmt.Errorf("http error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var backendResp api.BackendResponse
-	if err := json.NewDecoder(resp.Body).Decode(&backendResp); err != nil {
-		return nil, time.Duration(req.TimeoutMS) * time.Millisecond, fmt.Errorf("decode error: %w", err)
-	}
-
-	// Use the logical latency from the backend response
-	logicalLatency := time.Duration(backendResp.LatencyUS) * time.Microsecond
-
-	return &backendResp, logicalLatency, nil
+	})
 }
 
 // GetMetrics returns the current metrics for all CBs.
 func (o *Orchestrator) GetMetrics() api.AppMetrics {
+	// Drain event loops before reporting final metrics
+	o.Close()
+
 	o.mu.RLock()
 	totalRequests := o.totalRequests
 	maxLogicalTimeNS := o.maxLogicalTimeNS
@@ -364,6 +402,7 @@ func (o *Orchestrator) GetMetrics() api.AppMetrics {
 			StateTransitions: entry.Metrics.StateTransitions,
 			SuccessScore:     math.Sqrt(entry.Metrics.successScoreSum),
 			FailureScore:     math.Sqrt(entry.Metrics.failureScoreSum),
+			MaxConcurrency:   entry.Metrics.maxConcurrency,
 		}
 		entry.Metrics.mu.RUnlock()
 	}

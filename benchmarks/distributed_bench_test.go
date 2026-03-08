@@ -2,12 +2,6 @@ package benchmarks_test
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"net"
-	"net/http"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -21,13 +15,13 @@ import (
 	"github.com/codemartial/loadgen"
 )
 
-// TestDistributedBenchmark runs the full distributed benchmark in-process using Unix sockets.
+// TestDistributedBenchmark runs the full distributed benchmark in-process.
 // This test simulates 28 hours of Cyber Monday traffic.
 //
 // Architecture (each CB runs in isolation):
 //
-//	[Load Generator] --unix--> [App Server] --unix--> [Backend Server]
-//	                           (1 CB)                 (dedicated capacity)
+//	[Dispatcher] --> [Orchestrator] --> [Backend]
+//	                 (1 CB)            (dedicated capacity)
 //
 // Run with: go test -v ./benchmarks -run TestDistributedBenchmark -timeout 120m
 //
@@ -54,12 +48,24 @@ func TestDistributedBenchmarkShort(t *testing.T) {
 	runDistributedBenchmark(t, specs)
 }
 
+// TestDistributedBenchmarkFirstIncident runs through the first incident.
+// Simulates 5 hours: 4 hours of calm + the midnight spike and recovery.
+// Completes in approximately 5-7 minutes.
+//
+// Run with: go test -v ./benchmarks -run TestDistributedBenchmarkFirstIncident -timeout 15m
+func TestDistributedBenchmarkFirstIncident(t *testing.T) {
+	allSpecs := benchmarks.GenerateCyberMondayWorkload()
+	specs := allSpecs[:8] // 4h calm + 1h midnight incident
+	runDistributedBenchmark(t, specs)
+}
+
 // cbResult holds the result from running a single CB benchmark.
 type cbResult struct {
-	Name     string
-	Metrics  api.CBMetrics
-	WallTime time.Duration
-	Err      error
+	Name         string
+	Metrics      api.CBMetrics
+	BackendStats backend.ServerStats
+	WallTime     time.Duration
+	Err          error
 }
 
 // runDistributedBenchmark runs each CB in isolation with its own backend.
@@ -77,13 +83,14 @@ func runDistributedBenchmark(t *testing.T, specs []loadgen.LoadSpec) {
 	capacityConfig := backend.CapacityControllerConfig{
 		BaseShape: backend.BaseShape{
 			ThroughputRPS: 150,
-			QueueDepth:    15, // 10% of throughput
+			QueueDepth:    50, // absorb burst arrivals from exponential inter-arrival
 		},
 		MinReplicas:            1,
 		MaxReplicas:            8,
 		TargetUtilization:      0.70,
 		EvaluationInterval:     15 * time.Second,
 		ScaleDownStabilization: 300 * time.Second,
+		ScaleDownDelay:         600 * time.Second,
 		ProvisioningLag:        30 * time.Second,
 	}
 
@@ -99,12 +106,13 @@ func runDistributedBenchmark(t *testing.T, specs []loadgen.LoadSpec) {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			metrics, wallTime, err := runSingleCB(t, name, specs, slo, capacityConfig, seed)
+			metrics, bStats, wallTime, err := runSingleCB(t, name, specs, slo, capacityConfig, seed)
 			results <- cbResult{
-				Name:     name,
-				Metrics:  metrics,
-				WallTime: wallTime,
-				Err:      err,
+				Name:         name,
+				Metrics:      metrics,
+				BackendStats: bStats,
+				WallTime:     wallTime,
+				Err:          err,
 			}
 		}(cbName)
 	}
@@ -116,6 +124,7 @@ func runDistributedBenchmark(t *testing.T, specs []loadgen.LoadSpec) {
 
 	// Collect results
 	allMetrics := make(map[string]api.CBMetrics)
+	allBackendStats := make(map[string]backend.ServerStats)
 	var maxWallTime time.Duration
 	var totalRequests int64
 
@@ -125,6 +134,7 @@ func runDistributedBenchmark(t *testing.T, specs []loadgen.LoadSpec) {
 			continue
 		}
 		allMetrics[result.Name] = result.Metrics
+		allBackendStats[result.Name] = result.BackendStats
 		totalRequests += result.Metrics.TotalAllowed + result.Metrics.TotalBlocked
 		if result.WallTime > maxWallTime {
 			maxWallTime = result.WallTime
@@ -133,121 +143,50 @@ func runDistributedBenchmark(t *testing.T, specs []loadgen.LoadSpec) {
 	}
 
 	// Print combined results
-	printResults(t, allMetrics, totalRequests, calculateTotalHours(specs), overallElapsed)
+	printResults(t, allMetrics, allBackendStats, totalRequests, calculateTotalHours(specs), overallElapsed)
 }
 
 // runSingleCB runs a single CB benchmark in isolation.
-func runSingleCB(t *testing.T, cbName string, specs []loadgen.LoadSpec, slo levee.SLO, capacityConfig backend.CapacityControllerConfig, seed uint64) (api.CBMetrics, time.Duration, error) {
-	// Create temp directory for this CB's Unix sockets
-	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("levee-bench-%s-*", cbName))
-	if err != nil {
-		return api.CBMetrics{}, 0, fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	backendSocket := filepath.Join(tmpDir, "backend.sock")
-	appSocket := filepath.Join(tmpDir, "app.sock")
-
-	// Start backend server (dedicated for this CB)
+func runSingleCB(t *testing.T, cbName string, specs []loadgen.LoadSpec, slo levee.SLO, capacityConfig backend.CapacityControllerConfig, seed uint64) (api.CBMetrics, backend.ServerStats, time.Duration, error) {
+	// Create backend (dedicated for this CB)
 	backendServer := backend.NewServer(specs, capacityConfig, seed)
-	go func() {
-		if err := backendServer.Run(backendSocket); err != nil {
-			t.Logf("[%s] Backend server error: %v", cbName, err)
-		}
-	}()
 
-	// Wait for backend socket to be ready
-	if err := waitForSocket(backendSocket, 5*time.Second); err != nil {
-		return api.CBMetrics{}, 0, fmt.Errorf("backend socket not ready: %w", err)
-	}
-
-	// Start app server with only this CB
-	appServer := app.NewServer(app.ServerConfig{
-		BackendHost: backendSocket,
+	// Create orchestrator with direct backend call
+	orchestrator := app.NewOrchestrator(app.OrchestratorConfig{
+		CallBackend: backendServer.Execute,
+		AdvanceTime: backendServer.AdvanceTime,
 		SLO:         slo,
 		Specs:       specs,
-		CBName:      cbName, // Run only this CB
+		StartTime:   time.Unix(0, 0),
+		CBName:      cbName,
 	})
-	go func() {
-		if err := appServer.Run(appSocket); err != nil {
-			t.Logf("[%s] App server error: %v", cbName, err)
-		}
-	}()
 
-	// Wait for app socket to be ready
-	if err := waitForSocket(appSocket, 5*time.Second); err != nil {
-		return api.CBMetrics{}, 0, fmt.Errorf("app socket not ready: %w", err)
-	}
-
-	// Create and run the load generator
+	// Create dispatcher with direct orchestrator call
 	dispatcher := distloadgen.NewDispatcher(distloadgen.DispatcherConfig{
-		AppHost: appSocket,
-		Specs:   specs,
-		Seed:    seed,
+		HandleRequest: orchestrator.HandleRequest,
+		Specs:         specs,
+		Seed:          seed,
 	})
 
 	startTime := time.Now()
 
 	ctx := context.Background()
 	if err := dispatcher.Run(ctx); err != nil && err != context.Canceled {
-		return api.CBMetrics{}, 0, fmt.Errorf("dispatcher error: %w", err)
+		return api.CBMetrics{}, backend.ServerStats{}, 0, err
 	}
 
 	elapsed := time.Since(startTime)
 
-	// Fetch metrics from app
-	metrics, err := fetchMetrics(appSocket)
-	if err != nil {
-		return api.CBMetrics{}, elapsed, fmt.Errorf("failed to fetch metrics: %w", err)
-	}
+	// Get metrics directly
+	metrics := orchestrator.GetMetrics()
+	bStats := backendServer.Stats()
 
-	// Extract this CB's metrics
 	cbMetrics, ok := metrics.CircuitBreakers[cbName]
 	if !ok {
-		return api.CBMetrics{}, elapsed, fmt.Errorf("metrics not found for %s", cbName)
+		return api.CBMetrics{}, bStats, elapsed, nil
 	}
 
-	return cbMetrics, elapsed, nil
-}
-
-// waitForSocket waits for a Unix socket to become available.
-func waitForSocket(socketPath string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.Dial("unix", socketPath)
-		if err == nil {
-			conn.Close()
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return fmt.Errorf("socket %s not ready after %v", socketPath, timeout)
-}
-
-// fetchMetrics fetches metrics from the app server via Unix socket.
-func fetchMetrics(socketPath string) (*api.AppMetrics, error) {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return net.Dial("unix", socketPath)
-		},
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   5 * time.Second,
-	}
-
-	resp, err := client.Get("http://unix/metrics")
-	if err != nil {
-		return nil, fmt.Errorf("HTTP error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var metrics api.AppMetrics
-	if err := json.NewDecoder(resp.Body).Decode(&metrics); err != nil {
-		return nil, fmt.Errorf("decode error: %w", err)
-	}
-
-	return &metrics, nil
+	return cbMetrics, bStats, elapsed, nil
 }
 
 // calculateTotalHours returns the total duration of all specs in hours.
@@ -260,21 +199,22 @@ func calculateTotalHours(specs []loadgen.LoadSpec) float64 {
 }
 
 // printResults prints the formatted results table.
-func printResults(t *testing.T, cbMetrics map[string]api.CBMetrics, totalRequests int64, logicalHours float64, wallTime time.Duration) {
+func printResults(t *testing.T, cbMetrics map[string]api.CBMetrics, backendStats map[string]backend.ServerStats, totalRequests int64, logicalHours float64, wallTime time.Duration) {
 	t.Log("")
 	t.Logf("Isolated Benchmark Results (%.0f hours simulated in %.1fs wall time)",
 		logicalHours, wallTime.Seconds())
-	t.Log("=" + repeatString("=", 119))
+	t.Log("=" + repeatString("=", 136))
 	t.Log("")
 
 	// Header
-	t.Logf("%-15s | %10s | %10s | %10s | %9s | %12s | %12s | %10s",
+	t.Logf("%-15s | %10s | %10s | %10s | %9s | %12s | %12s | %10s | %14s",
 		"Candidate", "Blocked", "Allowed", "Successes", "Failures",
-		"SuccessScore", "FailureScore", "Delta")
+		"SuccessScore", "FailureScore", "Delta", "MaxConcurrency")
 	t.Log(repeatString("-", 16) + "+" + repeatString("-", 12) + "+" +
 		repeatString("-", 12) + "+" + repeatString("-", 12) + "+" +
 		repeatString("-", 11) + "+" + repeatString("-", 14) + "+" +
-		repeatString("-", 14) + "+" + repeatString("-", 11))
+		repeatString("-", 14) + "+" + repeatString("-", 11) + "+" +
+		repeatString("-", 16))
 
 	// Data rows - ordered: No-CB, Levee, Static-BAU, Static-Peak
 	cbOrder := []string{"No-CB", "Levee", "Static-BAU", "Static-Peak"}
@@ -284,10 +224,12 @@ func printResults(t *testing.T, cbMetrics map[string]api.CBMetrics, totalRequest
 			continue
 		}
 
-		// Delta = SuccessScore - FailureScore
-		delta := cb.SuccessScore - cb.FailureScore
+		// Delta = (SuccessScore - FailureScore) * Allowed/(Allowed+Blocked)
+		rawDelta := cb.SuccessScore - cb.FailureScore
+		allowedRatio := float64(cb.TotalAllowed) / float64(cb.TotalAllowed+cb.TotalBlocked)
+		delta := rawDelta * allowedRatio
 
-		t.Logf("%-15s | %10d | %10d | %10d | %9d | %12.2f | %12.2f | %10.2f",
+		t.Logf("%-15s | %10d | %10d | %10d | %9d | %12.2f | %12.2f | %10.2f | %14d",
 			name,
 			cb.TotalBlocked,
 			cb.TotalAllowed,
@@ -295,11 +237,30 @@ func printResults(t *testing.T, cbMetrics map[string]api.CBMetrics, totalRequest
 			cb.TotalFailures,
 			cb.SuccessScore,
 			cb.FailureScore,
-			delta)
+			delta,
+			cb.MaxConcurrency)
 	}
 
 	t.Log("")
-	t.Log("Delta = SuccessScore - FailureScore  [higher is better]")
+	t.Log("Delta = (SuccessScore - FailureScore) * Allowed/(Allowed+Blocked)  [higher is better]")
+	t.Log("")
+
+	// Backend stats
+	t.Log("Backend Processing Stats:")
+	t.Logf("%-15s | %10s | %10s | %10s | %10s | %10s | %10s",
+		"Candidate", "Requests", "Successes", "Failures", "Shed", "QueueDrops", "Crashes")
+	t.Log(repeatString("-", 16) + "+" + repeatString("-", 12) + "+" +
+		repeatString("-", 12) + "+" + repeatString("-", 12) + "+" +
+		repeatString("-", 12) + "+" + repeatString("-", 12) + "+" +
+		repeatString("-", 12))
+	for _, name := range cbOrder {
+		bs, ok := backendStats[name]
+		if !ok {
+			continue
+		}
+		t.Logf("%-15s | %10d | %10d | %10d | %10d | %10d | %10d",
+			name, bs.TotalRequests, bs.TotalSuccesses, bs.TotalFailures, bs.TotalShed, bs.TotalQueueDrops, bs.TotalCrashes)
+	}
 	t.Log("")
 	t.Logf("Total requests across all CBs: %d", totalRequests)
 }

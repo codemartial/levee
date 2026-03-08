@@ -69,8 +69,9 @@ type CBMetrics struct {
 	TotalSuccesses   int64   `json:"total_successes"`
 	TotalFailures    int64   `json:"total_failures"`
 	StateTransitions int     `json:"state_transitions"`
-	SuccessScore     float64 `json:"success_score"`  // sqrt(sum of epoch scores)
-	FailureScore     float64 `json:"failure_score"`  // sqrt(sum of epoch scores)
+	SuccessScore     float64 `json:"success_score"`     // sqrt(sum of epoch scores)
+	FailureScore     float64 `json:"failure_score"`     // sqrt(sum of epoch scores)
+	MaxConcurrency   int64   `json:"max_concurrency"`   // max in-flight while NOT OPEN
 }
 
 // LoadGenStatus is returned by GET /status on the load generator.

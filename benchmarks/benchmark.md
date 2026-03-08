@@ -95,10 +95,10 @@ The benchmark produces a comparative summary:
 ```
 Candidate       |    Blocked |    Allowed | Flap | FalseAlarm | LateDetect |   BadTraffic | LostBusiness | TotalPenalty
 ----------------------------------------------------------------------------------------------------------------------------------
-Prescient       |     773829 |   55749793 |    0 |          0 |          0 |            0 |            0 |            0
-Levee           |    4183613 |   52340009 |    7 |          9 |          0 |         2428 |        13866 |        16294
-Static-BAU      |    4193491 |   52329110 |   32 |         10 |          3 |        13482 |        23648 |        37130
-Static-Peak     |    3713193 |   52805124 |    4 |          0 |          4 |        26897 |         6655 |        33552
+Prescient       |     773832 |   55751328 |    0 |          0 |          0 |            0 |            0 |            0
+Levee           |    3989544 |   52535616 |    1 |          3 |          0 |         1679 |         4435 |         6114
+Static-Peak     |    3737675 |   52787485 |    4 |          0 |          1 |        24363 |         5623 |        29986
+Static-BAU      |    4249310 |   52275850 |   35 |          8 |          0 |        13032 |        29844 |        42875
 ```
 
 ## The Candidates
@@ -126,26 +126,21 @@ Static-Peak     |    3713193 |   52805124 |    4 |          0 |          4 |    
 
 ## Ranking
 
-The results illustrates the **sensitivity vs. specificity trade-off** that static configurations fail at.
+The results illustrate the **sensitivity vs. specificity trade-off** that static configurations fail at.
 
-- **Levee**: Fast detection (up to 10x lower BadTraffic) while still
-  preventing loss of business (up to 3x lower LostBusiness) 
+- **Levee**: Low flapping and false alarms. No late detection.
+  Lowest BadTraffic (13x lower than Static-Peak, 7x lower than Static-BAU).
+  Lowest TotalPenalty at 6,114 — almost 5x better than Static-Peak, ~ 7x better than Static-BAU.
 - **Static-Peak**: Conservative (low LostBusiness, minimal flapping)
-  but slow to detect (high BadTraffic)
+  but slow to detect (high BadTraffic at ~ 24k)
 - **Static-BAU**: The most likely configuration is also the worst
-  performer with highest flapping and false alarms
+  performer with highest flapping, false alarms, and TotalPenalty
 
-## Further Improvements
+## Limitations
 
-The evaluation benchmark is an *open-loop*, which means the actions of
-the circuit breakers do not influence the state of the upstream caller
-or the downstream dependency. This specifically fails to capture the
-benefits of concurrency limiting aspects of Levee. In a real
-situation, Levee's actions should lead to more reliable operations
-through micro adjustments and throttling of traffic during periods of
-stress.
+This benchmark is *open-loop*: circuit breaker actions do not influence the state of the upstream caller or the downstream dependency. This specifically fails to capture the benefits of Levee's concurrency limiting. The [distributed benchmark](distributed_benchmark.md) addresses this with a closed-loop simulation where CB decisions affect backend load, autoscaling, and crash behaviour — revealing that Levee's concurrency control (1,913 max concurrent vs 7,000+ for static CBs) prevents backend crashes that this benchmark cannot capture.
 
-As with all things automated, explanability and predictability are
+As with all things automated, explainability and predictability are
 inversely proportional to the decision-making capacity of the
 agent. You are advised to use simulation testing to determine
 real-world suitability, as well as focus on relevant real-world
