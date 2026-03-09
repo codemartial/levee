@@ -45,6 +45,7 @@ const (
 	recoveryHoldoff  = 3 * time.Second        // minimum time in THROTTLED before CLOSED
 	minInflightLimit = 1.0                    // always allow at least 1 request through
 	openErrThreshold = 0.5                    // THROTTLED → OPEN when eval error rate exceeds this at min limit
+	maxOpenBackoff   = 4                      // max OPEN cooldown exponent: 2^(4-1) = 8× base cooldown
 )
 
 // Levee is an adaptive circuit breaker and concurrency limiter.
@@ -86,6 +87,8 @@ type Levee struct {
 	evalSuccesses int64
 	evalFailures  int64
 
+	// OPEN backoff
+	openStreak int // consecutive OPEN entries without full CLOSED recovery
 }
 
 func NewLevee(slo SLO) *Levee {
@@ -128,7 +131,9 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		return StateChange{State: CLOSED}, nil
 
 	case OPEN:
-		if ts.Sub(l.stateEnteredAt) >= l.cooldownDuration {
+		shift := min(l.openStreak, maxOpenBackoff) - 1
+		dynamicCooldown := l.cooldownDuration << shift
+		if ts.Sub(l.stateEnteredAt) >= dynamicCooldown {
 			l.enterThrottledFromOpen(ts)
 		} else {
 			return StateChange{State: OPEN}, ErrCircuitOpen
@@ -169,6 +174,7 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 			if l.errEWMA < l.recoverThreshold || l.inflightLimit > float64(l.inflight+1)*3.0 {
 				l.state = CLOSED
 				l.stateEnteredAt = ts
+				l.openStreak = 0
 				// Keep inflightLimit — it will grow via maybeRelaxLimit in CLOSED
 				l.lastEvalTS = ts
 				l.evalSuccesses = 0
@@ -286,14 +292,17 @@ func (l *Levee) enterThrottledFromOpen(ts time.Time) {
 }
 
 // enterOpen transitions to OPEN state, blocking all traffic for cooldown.
+// Each consecutive OPEN without full recovery doubles the cooldown (exponential backoff).
 func (l *Levee) enterOpen(ts time.Time) {
+	l.openStreak++
 	l.state = OPEN
 	l.stateEnteredAt = ts
 	l.consecFails = 0
 }
 
 // maybeRelaxLimit grows the inflight limit in CLOSED state after recovery.
-// Uses the same MIMD logic but fully relaxes when the limit is clearly unconstraining.
+// If the limit is already well above actual usage (low-traffic or cooperative scenario),
+// relaxes immediately. Otherwise grows via 2x MIMD to prevent post-recovery burst.
 func (l *Levee) maybeRelaxLimit(ts time.Time) {
 	if ts.Sub(l.lastEvalTS) < evalInterval {
 		return
@@ -309,12 +318,13 @@ func (l *Levee) maybeRelaxLimit(ts time.Time) {
 		}
 	}
 
-	// Good eval window — double the limit
-	l.inflightLimit *= 2.0
-
-	// Fully relax when limit is well beyond actual usage
-	if l.inflightLimit > float64(l.inflight+1)*10.0 {
+	// If limit is already not constraining traffic, relax immediately.
+	// This helps cooperative scenarios where per-instance inflight is low.
+	if l.inflightLimit > float64(l.inflight+1)*3.0 {
 		l.inflightLimit = math.MaxFloat64
+	} else {
+		// Good eval window — double the limit
+		l.inflightLimit *= 2.0
 	}
 
 	l.evalSuccesses = 0
@@ -389,7 +399,7 @@ type LeveeState struct {
 	LastEvalTSNS     int64   `json:"last_eval_ts_ns"`
 	EvalSuccesses    int64   `json:"eval_successes"`
 	EvalFailures     int64   `json:"eval_failures"`
-
+	OpenStreak       int     `json:"open_streak"`
 }
 
 // SaveState serializes the current state for checkpointing.
@@ -414,6 +424,7 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 		LastEvalTSNS:     l.lastEvalTS.UnixNano(),
 		EvalSuccesses:    l.evalSuccesses,
 		EvalFailures:     l.evalFailures,
+		OpenStreak:       l.openStreak,
 	}, nil
 }
 
@@ -444,5 +455,6 @@ func RestoreState(state *LeveeState) *Levee {
 		lastEvalTS:       time.Unix(0, state.LastEvalTSNS),
 		evalSuccesses:    state.EvalSuccesses,
 		evalFailures:     state.EvalFailures,
+		openStreak:       state.OpenStreak,
 	}
 }
