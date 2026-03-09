@@ -99,6 +99,52 @@ func (m *CBMetrics) RecordResult(timestampNS int64, success bool) {
 	}
 }
 
+// RecordBlocked increments the blocked counter.
+func (m *CBMetrics) RecordBlocked() {
+	m.mu.Lock()
+	m.TotalBlocked++
+	m.mu.Unlock()
+}
+
+// RecordAllowed increments the allowed counter and tracks concurrency.
+func (m *CBMetrics) RecordAllowed(concurrency int64, state levee.State) {
+	m.mu.Lock()
+	m.TotalAllowed++
+	m.currentConcurrency = concurrency
+	if state != levee.OPEN && concurrency > m.maxConcurrency {
+		m.maxConcurrency = concurrency
+	}
+	m.mu.Unlock()
+}
+
+// RecordCompletion updates success/failure counts and concurrency.
+func (m *CBMetrics) RecordCompletion(success bool, concurrency int64) {
+	m.mu.Lock()
+	if success {
+		m.TotalSuccesses++
+	} else {
+		m.TotalFailures++
+	}
+	m.currentConcurrency = concurrency
+	m.mu.Unlock()
+}
+
+// Snapshot returns a point-in-time copy of the metrics as api.CBMetrics.
+func (m *CBMetrics) Snapshot() api.CBMetrics {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return api.CBMetrics{
+		TotalAllowed:     m.TotalAllowed,
+		TotalBlocked:     m.TotalBlocked,
+		TotalSuccesses:   m.TotalSuccesses,
+		TotalFailures:    m.TotalFailures,
+		StateTransitions: m.StateTransitions,
+		SuccessScore:     math.Sqrt(m.successScoreSum),
+		FailureScore:     math.Sqrt(m.failureScoreSum),
+		MaxConcurrency:   m.maxConcurrency,
+	}
+}
+
 // Finalize flushes the last epoch's scores.
 func (m *CBMetrics) Finalize() {
 	m.mu.Lock()

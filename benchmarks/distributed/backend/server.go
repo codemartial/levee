@@ -46,6 +46,7 @@ type completionEntry struct {
 	completionNS int64
 	latency      time.Duration
 	success      bool
+	tag          int
 }
 
 // completionHeap is a min-heap of completionEntry ordered by completionNS.
@@ -171,6 +172,7 @@ func (s *Server) Advance(timestampNS int64, onComplete func(api.Completion)) {
 			CompletionNS: entry.completionNS,
 			Latency:      entry.latency,
 			Success:      entry.success,
+			Tag:          entry.tag,
 		})
 	}
 }
@@ -195,6 +197,7 @@ func (s *Server) Submit(req api.BackendRequest) {
 				completionNS: req.TimestampNS + timeoutNS,
 				latency:      timeout,
 				success:      false,
+				tag:          req.Tag,
 			})
 			return
 		}
@@ -229,6 +232,7 @@ func (s *Server) Submit(req api.BackendRequest) {
 			completionNS: req.TimestampNS + timeoutNS,
 			latency:      timeout,
 			success:      false,
+			tag:          req.Tag,
 		})
 
 	case ProcessShed:
@@ -238,6 +242,7 @@ func (s *Server) Submit(req api.BackendRequest) {
 			completionNS: req.TimestampNS + timeoutNS,
 			latency:      timeout,
 			success:      false,
+			tag:          req.Tag,
 		})
 
 	case ProcessTimeout:
@@ -247,6 +252,7 @@ func (s *Server) Submit(req api.BackendRequest) {
 			completionNS: req.TimestampNS + timeoutNS,
 			latency:      timeout,
 			success:      false,
+			tag:          req.Tag,
 		})
 
 	case ProcessOK:
@@ -282,6 +288,7 @@ func (s *Server) Submit(req api.BackendRequest) {
 			completionNS: req.TimestampNS + totalLatencyNS,
 			latency:      time.Duration(totalLatencyNS),
 			success:      success,
+			tag:          req.Tag,
 		})
 	}
 }

@@ -15,7 +15,7 @@ import (
 func TestSLOSweep(t *testing.T) {
 	specs := benchmarks.GenerateCyberMondayWorkload()
 
-	sloValues := []float64{0.9, 0.8, 0.7, 0.6, 0.5}
+	sloValues := []float64{0.99, 0.95, 0.9, 0.8, 0.7}
 	cbNames := []string{"Levee", "Static-BAU", "Static-Peak"}
 
 	const seed uint64 = 20241225

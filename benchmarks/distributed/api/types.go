@@ -30,6 +30,7 @@ type BackendRequest struct {
 	TimestampNS int64  `json:"timestamp_ns"`
 	TimeoutMS   int    `json:"timeout_ms"`
 	SpecIndex   int    `json:"spec_index"`
+	Tag         int    `json:"tag,omitempty"` // Identifies caller instance for routing completions
 }
 
 // Completion represents the outcome of a backend request, delivered when
@@ -39,6 +40,7 @@ type Completion struct {
 	CompletionNS int64
 	Latency      time.Duration
 	Success      bool
+	Tag          int // Copied from BackendRequest.Tag for routing completions
 }
 
 // AppMetrics is returned by GET /metrics on the application.
