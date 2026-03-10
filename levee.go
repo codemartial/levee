@@ -18,7 +18,8 @@ type State uint8
 const (
 	CLOSED    State = iota
 	OPEN            // Tripped: block all traffic, wait for cooldown
-	THROTTLED       // Recovery: inflight-limited admission matching load to capacity
+	THROTTLED       // SLO breach: inflight-limited admission, MIMD toward capacity
+	HALF_OPEN       // Post-OPEN probe: conservative admission, adaptive eval interval
 )
 
 type Trigger error
@@ -37,15 +38,26 @@ var ErrCircuitOpen = errors.New("circuit breaker is open")
 
 // Constants
 const (
-	ewmaHalfLife     = 3 * time.Second        // ~6s effective window
-	goodputHalfLife  = 3 * time.Second        // responsive capacity estimate
-	warmupSamples    = 50                     // arm trip after this many observations
-	tripBufferFactor = 0.05                   // tripThreshold = sloErrRate + successRate * tripBufferFactor
-	evalInterval     = 500 * time.Millisecond // inflight limit re-evaluation period
-	recoveryHoldoff  = 3 * time.Second        // minimum time in THROTTLED before CLOSED
-	minInflightLimit = 1.0                    // always allow at least 1 request through
-	openErrThreshold = 0.5                    // THROTTLED → OPEN when eval error rate exceeds this at min limit
-	maxOpenBackoff   = 4                      // max OPEN cooldown exponent: 2^(4-1) = 8× base cooldown
+	ewmaHalfLife     = 3 * time.Second // ~6s effective window
+	goodputHalfLife  = 3 * time.Second // responsive capacity estimate
+	warmupSamples    = 50              // arm trip after this many observations
+	tripBufferFactor = 0.05            // tripThreshold = sloErrRate + successRate * tripBufferFactor
+
+	// Eval interval adapts to observed latency: avgLatency * targetSamplesPerEval,
+	// clamped to [minEvalInterval, maxEvalInterval]. At 100ms latency this produces
+	// 500ms — same as the original fixed value.
+	targetSamplesPerEval = 5
+	minEvalInterval      = 100 * time.Millisecond
+	maxEvalInterval      = 5 * time.Second
+
+	// Recovery holdoff = baseEvalInterval * holdoffEvalMultiplier, floored.
+	// At 100ms latency: 500ms * 6 = 3s — same as the original fixed value.
+	holdoffEvalMultiplier = 6
+	minRecoveryHoldoff    = 1 * time.Second
+
+	minInflightLimit = 1.0 // always allow at least 1 request through
+	openErrThreshold = 0.5 // THROTTLED → OPEN when eval error rate exceeds this at min limit
+	maxOpenBackoff   = 4   // max OPEN cooldown exponent: 2^(4-1) = 8× base cooldown
 )
 
 // Levee is an adaptive circuit breaker and concurrency limiter.
@@ -56,7 +68,7 @@ type Levee struct {
 	// Derived thresholds (set once in constructor)
 	sloErrRate       float64
 	tripThreshold    float64
-	recoverThreshold float64
+	recoverThreshold float64 // max(sloErrRate, floor) — operational threshold for MIMD and recovery
 	consecFailTrip   int
 	cooldownDuration time.Duration
 
@@ -89,17 +101,26 @@ type Levee struct {
 
 	// OPEN backoff
 	openStreak int // consecutive OPEN entries without full CLOSED recovery
+
 }
 
 func NewLevee(slo SLO) *Levee {
 	sloErr := 1.0 - slo.SuccessRate
 	consecThreshold := max(int(math.Ceil(math.Log(1e-8)/math.Log(sloErr))), 5)
 
+	// For tight SLOs (error rate < ~10%), use a floor of 10% for MIMD/recovery
+	// thresholds to prevent over-blocking. The 0.095 cutoff avoids IEEE 754
+	// float issues at SLO=0.90 where 1.0-0.9 = 0.09999999999999998.
+	recoverTh := sloErr
+	if sloErr < 0.095 {
+		recoverTh = 0.10
+	}
+
 	return &Levee{
 		slo:              slo,
 		sloErrRate:       sloErr,
 		tripThreshold:    sloErr + slo.SuccessRate*tripBufferFactor,
-		recoverThreshold: sloErr,
+		recoverThreshold: recoverTh,
 		consecFailTrip:   consecThreshold,
 		cooldownDuration: slo.Timeout,
 		state:            CLOSED,
@@ -134,19 +155,31 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		shift := min(l.openStreak, maxOpenBackoff) - 1
 		dynamicCooldown := l.cooldownDuration << shift
 		if ts.Sub(l.stateEnteredAt) >= dynamicCooldown {
-			l.enterThrottledFromOpen(ts)
+			l.enterHalfOpen(ts)
 		} else {
 			return StateChange{State: OPEN}, ErrCircuitOpen
 		}
 		fallthrough
 
-	case THROTTLED:
+	case HALF_OPEN, THROTTLED:
 		l.maybeEvaluateLimit(ts)
+		if l.state == OPEN {
+			return StateChange{State: OPEN}, ErrCircuitOpen
+		}
+		// At minimum limit, allow only one probe per eval window.
+		// This adapts probe frequency to the eval interval, which itself
+		// scales with openStreak — reducing aggregate probe pressure
+		// when many instances share a degraded backend.
+		if l.inflightLimit <= minInflightLimit && l.inflight == 0 {
+			if (l.evalSuccesses + l.evalFailures) > 0 {
+				return StateChange{State: l.state}, ErrCircuitOpen
+			}
+		}
 		if l.inflight >= int64(math.Ceil(l.inflightLimit)) {
-			return StateChange{State: THROTTLED}, ErrCircuitOpen
+			return StateChange{State: l.state}, ErrCircuitOpen
 		}
 		l.inflight++
-		return StateChange{State: THROTTLED}, nil
+		return StateChange{State: l.state}, nil
 	}
 
 	return StateChange{State: l.state}, nil
@@ -162,14 +195,15 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	l.consecFails = 0
 	l.updateCapacityEstimate(ts, duration)
 
-	// Track eval counters for active limit in CLOSED
-	if l.state == CLOSED && l.inflightLimit < math.MaxFloat64 {
+	switch l.state {
+	case CLOSED:
+		// Track eval counters for active limit in CLOSED
+		if l.inflightLimit < math.MaxFloat64 {
+			l.evalSuccesses++
+		}
+	case THROTTLED, HALF_OPEN:
 		l.evalSuccesses++
-	}
-
-	if l.state == THROTTLED {
-		l.evalSuccesses++
-		if ts.Sub(l.stateEnteredAt) >= recoveryHoldoff {
+		if ts.Sub(l.stateEnteredAt) >= l.effectiveRecoveryHoldoff() {
 			// Recover if error rate is low OR limit has grown well beyond usage
 			if l.errEWMA < l.recoverThreshold || l.inflightLimit > float64(l.inflight+1)*3.0 {
 				l.state = CLOSED
@@ -202,10 +236,10 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 		}
 		if l.samples >= warmupSamples {
 			if l.errEWMA > l.tripThreshold || l.consecFails >= l.consecFailTrip {
-				l.enterThrottledFromClosed(ts)
+				l.enterThrottled(ts)
 			}
 		}
-	case THROTTLED:
+	case THROTTLED, HALF_OPEN:
 		l.evalFailures++
 	}
 
@@ -222,12 +256,7 @@ func (l *Levee) updateErrEWMA(ts time.Time, sample float64) {
 	}
 
 	dt := ts.Sub(l.errLastTS).Seconds()
-	var alpha float64
-	if dt <= 0 {
-		alpha = 0.01
-	} else {
-		alpha = 1.0 - math.Exp(-dt*math.Ln2/ewmaHalfLife.Seconds())
-	}
+	alpha := l.ewmaAlpha(dt, ewmaHalfLife)
 	l.errEWMA += alpha * (sample - l.errEWMA)
 	l.errLastTS = ts
 }
@@ -240,12 +269,7 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 		l.avgLatency = durSec
 	} else {
 		dt := ts.Sub(l.lastSuccessTS).Seconds()
-		var alpha float64
-		if dt <= 0 {
-			alpha = 0.01
-		} else {
-			alpha = 1.0 - math.Exp(-dt*math.Ln2/goodputHalfLife.Seconds())
-		}
+		alpha := l.ewmaAlpha(dt, goodputHalfLife)
 		l.avgLatency += alpha * (durSec - l.avgLatency)
 	}
 
@@ -256,7 +280,7 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 			if l.goodput == 0 {
 				l.goodput = instantGoodput
 			} else {
-				alpha := 1.0 - math.Exp(-dt*math.Ln2/goodputHalfLife.Seconds())
+				alpha := l.ewmaAlpha(dt, goodputHalfLife)
 				l.goodput += alpha * (instantGoodput - l.goodput)
 			}
 		}
@@ -264,8 +288,8 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 	l.lastSuccessTS = ts
 }
 
-// enterThrottledFromClosed transitions from CLOSED to THROTTLED.
-func (l *Levee) enterThrottledFromClosed(ts time.Time) {
+// enterThrottled transitions from CLOSED to THROTTLED on SLO breach.
+func (l *Levee) enterThrottled(ts time.Time) {
 	limit := max(float64(l.inflight)*0.5, minInflightLimit)
 
 	l.state = THROTTLED
@@ -277,18 +301,61 @@ func (l *Levee) enterThrottledFromClosed(ts time.Time) {
 	l.consecFails = 0
 }
 
-// enterThrottledFromOpen transitions from OPEN to THROTTLED with conservative inflight limit.
-func (l *Levee) enterThrottledFromOpen(ts time.Time) {
+// enterHalfOpen transitions from OPEN to HALF_OPEN with conservative inflight limit.
+func (l *Levee) enterHalfOpen(ts time.Time) {
 	estimatedCapacity := l.goodput * l.avgLatency
-	limit := max(min(estimatedCapacity*0.25, 5), minInflightLimit)
+	limit := max(min(estimatedCapacity*0.25, 1), minInflightLimit)
 
-	l.state = THROTTLED
+	l.state = HALF_OPEN
 	l.stateEnteredAt = ts
 	l.inflightLimit = limit
 	l.lastEvalTS = ts
 	l.evalSuccesses = 0
 	l.evalFailures = 0
 	l.consecFails = 0
+}
+
+// baseEvalInterval returns the adaptive eval interval based on observed latency.
+// At 100ms latency with targetSamplesPerEval=5, this produces 500ms.
+func (l *Levee) baseEvalInterval() time.Duration {
+	if l.avgLatency <= 0 {
+		return minEvalInterval
+	}
+	adaptive := time.Duration(l.avgLatency * float64(targetSamplesPerEval) * float64(time.Second))
+	if adaptive < minEvalInterval {
+		return minEvalInterval
+	}
+	if adaptive > maxEvalInterval {
+		return maxEvalInterval
+	}
+	return adaptive
+}
+
+// effectiveRecoveryHoldoff returns the recovery holdoff scaled to the eval interval.
+// At 100ms latency: 500ms * 6 = 3s.
+func (l *Levee) effectiveRecoveryHoldoff() time.Duration {
+	holdoff := l.baseEvalInterval() * holdoffEvalMultiplier
+	if holdoff < minRecoveryHoldoff {
+		return minRecoveryHoldoff
+	}
+	return holdoff
+}
+
+// ewmaAlpha computes a time-weighted EWMA alpha, capped so that idle periods
+// (dt >> inter-observation interval) don't erase history in a single update.
+func (l *Levee) ewmaAlpha(dt float64, halfLife time.Duration) float64 {
+	if dt <= 0 {
+		return 0.01
+	}
+	alpha := 1.0 - math.Exp(-dt*math.Ln2/halfLife.Seconds())
+	if l.goodput > 0 {
+		maxDt := 1.0 / l.goodput
+		maxAlpha := 1.0 - math.Exp(-maxDt*math.Ln2/halfLife.Seconds())
+		if alpha > maxAlpha {
+			alpha = maxAlpha
+		}
+	}
+	return alpha
 }
 
 // enterOpen transitions to OPEN state, blocking all traffic for cooldown.
@@ -304,16 +371,16 @@ func (l *Levee) enterOpen(ts time.Time) {
 // If the limit is already well above actual usage (low-traffic or cooperative scenario),
 // relaxes immediately. Otherwise grows via 2x MIMD to prevent post-recovery burst.
 func (l *Levee) maybeRelaxLimit(ts time.Time) {
-	if ts.Sub(l.lastEvalTS) < evalInterval {
+	if ts.Sub(l.lastEvalTS) < l.baseEvalInterval() {
 		return
 	}
 
 	total := l.evalSuccesses + l.evalFailures
 	if total > 0 {
 		evalErrRate := float64(l.evalFailures) / float64(total)
-		if evalErrRate > l.sloErrRate {
+		if evalErrRate > l.recoverThreshold {
 			// Errors rising during recovery — trip to THROTTLED immediately
-			l.enterThrottledFromClosed(ts)
+			l.enterThrottled(ts)
 			return
 		}
 	}
@@ -333,8 +400,19 @@ func (l *Levee) maybeRelaxLimit(ts time.Time) {
 }
 
 // maybeEvaluateLimit adjusts the inflight limit using MIMD.
+// In HALF_OPEN at minimum limit, the eval interval scales exponentially
+// with openStreak — adapting probe frequency to failure history.
+// Note: this uses the same maxOpenBackoff cap and exponential base as the
+// OPEN cooldown in Start(). The coupling is intentional — both mechanisms
+// should back off in lockstep — but changing one requires reviewing the other.
 func (l *Levee) maybeEvaluateLimit(ts time.Time) {
-	if ts.Sub(l.lastEvalTS) < evalInterval {
+	base := l.baseEvalInterval()
+	effectiveInterval := base
+	if l.state == HALF_OPEN && l.inflightLimit <= minInflightLimit {
+		shift := min(l.openStreak, maxOpenBackoff)
+		effectiveInterval = base << shift
+	}
+	if ts.Sub(l.lastEvalTS) < effectiveInterval {
 		return
 	}
 
@@ -349,7 +427,7 @@ func (l *Levee) maybeEvaluateLimit(ts time.Time) {
 			return
 		}
 
-		if evalErrRate > l.sloErrRate {
+		if evalErrRate > l.recoverThreshold {
 			// Multiplicative decrease
 			l.inflightLimit = max(l.inflightLimit*0.5, minInflightLimit)
 		} else {
@@ -399,7 +477,7 @@ type LeveeState struct {
 	LastEvalTSNS     int64   `json:"last_eval_ts_ns"`
 	EvalSuccesses    int64   `json:"eval_successes"`
 	EvalFailures     int64   `json:"eval_failures"`
-	OpenStreak       int     `json:"open_streak"`
+	OpenStreak int `json:"open_streak"`
 }
 
 // SaveState serializes the current state for checkpointing.
@@ -424,7 +502,7 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 		LastEvalTSNS:     l.lastEvalTS.UnixNano(),
 		EvalSuccesses:    l.evalSuccesses,
 		EvalFailures:     l.evalFailures,
-		OpenStreak:       l.openStreak,
+		OpenStreak: l.openStreak,
 	}, nil
 }
 
@@ -433,11 +511,16 @@ func RestoreState(state *LeveeState) *Levee {
 	sloErr := 1.0 - state.SLO.SuccessRate
 	consecThreshold := max(int(math.Ceil(math.Log(1e-8)/math.Log(sloErr))), 5)
 
+	recoverTh := sloErr
+	if sloErr < 0.095 {
+		recoverTh = 0.10
+	}
+
 	return &Levee{
 		slo:              state.SLO,
 		sloErrRate:       sloErr,
 		tripThreshold:    sloErr + state.SLO.SuccessRate*tripBufferFactor,
-		recoverThreshold: sloErr,
+		recoverThreshold: recoverTh,
 		consecFailTrip:   consecThreshold,
 		cooldownDuration: state.SLO.Timeout,
 		state:            State(state.StateVal),
@@ -455,6 +538,6 @@ func RestoreState(state *LeveeState) *Levee {
 		lastEvalTS:       time.Unix(0, state.LastEvalTSNS),
 		evalSuccesses:    state.EvalSuccesses,
 		evalFailures:     state.EvalFailures,
-		openStreak:       state.OpenStreak,
+		openStreak: state.OpenStreak,
 	}
 }
