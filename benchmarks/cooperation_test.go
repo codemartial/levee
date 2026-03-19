@@ -46,7 +46,7 @@ func TestCooperationBenchmark(t *testing.T) {
 	}
 
 	specs := benchmarks.GenerateCyberMondayWorkload()
-	runCooperationBenchmark(t, specs, 10)
+	runCooperationBenchmark(t, specs, 100)
 }
 
 // TestCooperationBenchmarkFirstIncident runs the cooperation test for the first incident only.
@@ -55,7 +55,7 @@ func TestCooperationBenchmark(t *testing.T) {
 func TestCooperationBenchmarkFirstIncident(t *testing.T) {
 	allSpecs := benchmarks.GenerateCyberMondayWorkload()
 	specs := allSpecs[:8] // 4h calm + 1h midnight incident
-	runCooperationBenchmark(t, specs, 10)
+	runCooperationBenchmark(t, specs, 100)
 }
 
 

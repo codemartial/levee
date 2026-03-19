@@ -139,7 +139,7 @@ func TestSLOSweep(t *testing.T) {
 		if lead > 0 {
 			marker = " <-- Levee wins"
 		}
-		t.Logf("%-6.1f | %12.2f | %12.2f | %12.2f%s", sloRate, leveeDelta, peakDelta, lead, marker)
+		t.Logf("%-6.2f | %12.2f | %12.2f | %12.2f%s", sloRate, leveeDelta, peakDelta, lead, marker)
 	}
 
 	// Print raw data for easy extraction
