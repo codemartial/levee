@@ -44,7 +44,7 @@ func TestClosedUncapped(t *testing.T) {
 	// for the unlimited-limit sentinel: int64(math.Ceil(MaxFloat64)) overflows to
 	// MinInt64 on amd64, which made the breaker reject every request.
 	start := time.Unix(100, 0)
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		ts := start.Add(time.Duration(i) * time.Microsecond)
 		if _, err := l.Start(ts); err != nil {
 			t.Fatalf("Start #%d on healthy CLOSED breaker rejected: %v", i, err)
@@ -97,7 +97,7 @@ func TestTrips(t *testing.T) {
 
 	start := time.Unix(100, 0)
 	rejected := false
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		ts := start.Add(time.Duration(i) * 10 * time.Millisecond)
 		sc, err := l.Start(ts)
 		if err != nil {
@@ -126,7 +126,7 @@ func TestRejectNeedsNoCompletion(t *testing.T) {
 	})
 
 	rejectAt := tripWithFailures(t, l)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		_, err := l.Start(rejectAt.Add(time.Duration(i) * time.Millisecond))
 		if !errors.Is(err, ErrCircuitOpen) {
 			t.Fatalf("rejected Start #%d error = %v, want ErrCircuitOpen", i, err)
@@ -142,7 +142,7 @@ func TestSaveRestore(t *testing.T) {
 	l := NewLevee(slo)
 	start := time.Unix(100, 0)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		ts := start.Add(time.Duration(i) * time.Millisecond)
 		if _, err := l.Start(ts); err != nil {
 			t.Fatalf("Start before save returned error: %v", err)
@@ -271,7 +271,7 @@ func TestRecovers(t *testing.T) {
 	// -> CLOSED or THROTTLED -> CLOSED).
 	ts := tripAt
 	recovered := false
-	for i := 0; i < 4000; i++ {
+	for range 4000 {
 		ts = ts.Add(50 * time.Millisecond)
 		if _, err := l.Start(ts); err == nil {
 			l.Success(ts.Add(5*time.Millisecond), 5*time.Millisecond)
@@ -333,11 +333,11 @@ func TestConcurrentUse(t *testing.T) {
 		iters   = 500
 	)
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(seed int) {
 			defer wg.Done()
-			for i := 0; i < iters; i++ {
+			for i := range iters {
 				fail := (seed+i)%3 == 0
 				_, _ = l.Call(func() error {
 					if fail {
@@ -360,11 +360,44 @@ func TestConcurrentUse(t *testing.T) {
 	_, _ = l.Call(func() error { return nil })
 }
 
+// BenchmarkThroughput measures how many requests Levee can admit and complete
+// per second on a single CPU. It drives the steady-state healthy path
+// (Start -> Success on a CLOSED breaker) using a synthetic, monotonically
+// advancing clock, so the figure reflects the breaker's own overhead rather
+// than the cost of reading the OS clock.
+//
+// Pin it to one CPU and read the reqs/sec metric:
+//
+//	go test -run '^$' -bench BenchmarkThroughput -cpu 1
+func BenchmarkThroughput(b *testing.B) {
+	l := NewLevee(SLO{
+		SuccessRate: 0.90,
+		Timeout:     time.Second,
+	})
+
+	ts := time.Unix(0, 0)
+	const step = 100 * time.Microsecond // event-time spacing between requests
+	const dur = 5 * time.Millisecond    // simulated call latency
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		ts = ts.Add(step)
+		if _, err := l.Start(ts); err != nil {
+			b.Fatalf("healthy CLOSED breaker rejected request at iter %d: %v", i, err)
+		}
+		l.Success(ts.Add(dur), dur)
+	}
+	b.StopTimer()
+
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "reqs/sec")
+}
+
 func tripWithFailures(t *testing.T, l *Levee) time.Time {
 	t.Helper()
 
 	start := time.Unix(200, 0)
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		ts := start.Add(time.Duration(i) * 10 * time.Millisecond)
 		_, err := l.Start(ts)
 		if err != nil {
@@ -384,7 +417,7 @@ func tripToOpen(t *testing.T, l *Levee) {
 	t.Helper()
 
 	start := time.Now()
-	for i := 0; i < 5000; i++ {
+	for i := range 5000 {
 		ts := start.Add(time.Duration(i) * 20 * time.Millisecond)
 		if _, err := l.Start(ts); err == nil {
 			l.Fail(ts.Add(5*time.Millisecond), 5*time.Millisecond)

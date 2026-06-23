@@ -2,9 +2,13 @@
 
 > lev·ee /ˈlevi/ _noun_
 >
-> 1. An embankment built to prevent the overflow of a river or body of water; specifically: an artificial bank confining a river channel or limiting adjacent areas subject to flooding.
->
-> 2. A continuous dike or ridge (as of earth) for confining the irrigation areas of land to be flooded.
+> An embankment built to prevent the overflow of a river or body of water; specifically: an artificial bank confining a river channel or limiting adjacent areas subject to flooding.
+
+Levee keeps more of your business flowing under dynamic conditions than any other circuit-breaker and rate-limiter combination.
+
+
+- 248 bytes memory overhead (yes, under a quarter of a kB)
+- multi-million request processing capacity -- per CPU core
 
 ## What is Levee?
 
@@ -14,7 +18,7 @@ Levee is a self-tuning circuit breaker and concurrency-based rate limiter for Go
 - Fully self-contained, 100% in-process operation
 - No external dependencies
 
-Use a circuit breaker on outbound requests to prevent cascading failures from degraded or faulty dependencies. Use a rate limiter on incoming requests to prevent failure due to overload.
+Works as a circuit breaker on outbound requests to prevent cascading failures from degraded or faulty dependencies. Works as a rate limiter on incoming requests to prevent failure due to overload.
 
 Levee is designed to be dead simple to integrate and take the guesswork out of configuring operational parameters.
 
@@ -124,11 +128,21 @@ func main() {
 
 ## Benchmark
 
-Levee outperforms meticulously configured static circuit breakers by
-up to 4x in decision-making quality, both while preventing overload (up to
-10x better) and preventing unwanted loss of business (up to 3x better).
+Levee is validated in a closed-loop distributed simulation where circuit-breaker
+decisions shape backend load, autoscaling, and queue backpressure. Across seven
+traffic and error-rate variations, Levee beats a meticulously tuned static breaker
+in every one, with its widest margins under extreme overload: where a binary
+open/close cannot keep up, Levee's concurrency control matches admission to
+available capacity.
 
-Run with: `go test -bench=BenchmarkCyberMondayPrescient -benchtime=1x -v`
+See [benchmarks/distributed_benchmark.md](benchmarks/distributed_benchmark.md) for
+the full methodology and results.
+
+Run with (from the `benchmarks/` directory):
+
+```
+go test -v -run TestDistributedBenchmarkFirstIncident -timeout 15m
+```
 
 ## TODO
 Levee is still a work in progress. Here are some of the things that need to be done:
