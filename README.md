@@ -135,8 +135,7 @@ in every one, with its widest margins under extreme overload: where a binary
 open/close cannot keep up, Levee's concurrency control matches admission to
 available capacity.
 
-See [benchmarks/distributed_benchmark.md](benchmarks/distributed_benchmark.md) for
-the full methodology and results.
+See [benchmarks/](benchmarks/) for the full methodology and results.
 
 Run with (from the `benchmarks/` directory):
 
