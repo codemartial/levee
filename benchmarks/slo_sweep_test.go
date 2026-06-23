@@ -13,6 +13,10 @@ import (
 )
 
 func TestSLOSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping SLO sweep in short mode")
+	}
+
 	specs := benchmarks.GenerateCyberMondayWorkload()
 
 	sloValues := []float64{0.99, 0.95, 0.9, 0.8, 0.7}

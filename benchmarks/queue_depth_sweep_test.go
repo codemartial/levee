@@ -11,6 +11,10 @@ import (
 )
 
 func TestQueueDepthSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping queue depth sweep in short mode")
+	}
+
 	specs := benchmarks.GenerateCyberMondayWorkload()
 
 	// Queue depth multipliers: 0.2x, 0.5x, 1x, 1.4x, 2x of baseline (50)

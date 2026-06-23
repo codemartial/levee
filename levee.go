@@ -95,7 +95,17 @@ func deriveThresholds(slo SLO) (tripTh, recoverTh float64, consecTrip int) {
 	return
 }
 
+func validateSLO(slo SLO) {
+	if math.IsNaN(slo.SuccessRate) || slo.SuccessRate <= 0 || slo.SuccessRate >= 1 {
+		panic("levee: SLO.SuccessRate must be > 0 and < 1")
+	}
+	if slo.Timeout <= 0 {
+		panic("levee: SLO.Timeout must be > 0")
+	}
+}
+
 func NewLevee(slo SLO) *Levee {
+	validateSLO(slo)
 	tripTh, recoverTh, consecTrip := deriveThresholds(slo)
 	return &Levee{
 		slo:              slo,
@@ -361,12 +371,16 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 }
 
 func RestoreState(s *LeveeState) *Levee {
+	if s == nil {
+		panic("levee: nil LeveeState")
+	}
+	validateSLO(s.SLO)
 	tripTh, recoverTh, consecTrip := deriveThresholds(s.SLO)
 	return &Levee{
 		slo: s.SLO, tripThreshold: tripTh, recoverThreshold: recoverTh, consecFailTrip: consecTrip,
 		cooldownDuration: s.SLO.Timeout, state: State(s.StateVal), stateEnteredAt: time.Unix(0, s.StateEnteredAtNS),
 		errEWMA: s.ErrEWMA, errLastTS: time.Unix(0, s.ErrLastTSNS), initialized: s.Initialized,
-		samples: s.Samples, consecFails: s.ConsecFails, inflight: s.Inflight, inflightLimit: s.InflightLimit,
+		samples: s.Samples, consecFails: s.ConsecFails, inflightLimit: s.InflightLimit,
 		goodput: s.Goodput, avgLatency: s.AvgLatency, lastSuccessTS: time.Unix(0, s.LastSuccessTSNS),
 		lastEvalTS: time.Unix(0, s.LastEvalTSNS), evalSuccesses: s.EvalSuccesses, evalFailures: s.EvalFailures, openStreak: s.OpenStreak,
 	}

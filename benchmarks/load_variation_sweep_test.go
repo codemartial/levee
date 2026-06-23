@@ -16,12 +16,16 @@ import (
 //
 // Run with: go test -v -run TestLoadVariationSweep -timeout 120m
 func TestLoadVariationSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping load variation sweep in short mode")
+	}
+
 	baseSpecs := benchmarks.GenerateCyberMondayWorkload()
 
 	type loadVariation struct {
-		Name         string
-		RPMScale     float64 // multiplier on all RPM values
-		ErrScale     float64 // multiplier on all error rates (capped at 0.95)
+		Name     string
+		RPMScale float64 // multiplier on all RPM values
+		ErrScale float64 // multiplier on all error rates (capped at 0.95)
 	}
 
 	variations := []loadVariation{
