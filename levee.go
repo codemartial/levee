@@ -153,7 +153,10 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		}
 	}
 
-	if l.inflight >= int64(math.Ceil(l.inflightLimit)) {
+	// inflightLimit == MaxFloat64 means "unlimited". Guard the cast: int64 of a
+	// value beyond int64 range is implementation-defined in Go and yields MinInt64
+	// on amd64 (saturates to MaxInt64 on arm64), which would reject every request.
+	if l.inflightLimit < math.MaxFloat64 && l.inflight >= int64(math.Ceil(l.inflightLimit)) {
 		return StateChange{State: l.state}, ErrCircuitOpen
 	}
 	l.inflight++
