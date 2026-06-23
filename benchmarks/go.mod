@@ -4,7 +4,7 @@ go 1.25.4
 
 require (
 	github.com/codemartial/levee v0.3.0
-	github.com/codemartial/loadgen v0.1.0
+	github.com/codemartial/loadgen v0.2.0
 )
 
 replace (
