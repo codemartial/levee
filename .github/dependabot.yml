@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # The root module has no external dependencies today, but keep it watched so a
+  # future one is tracked automatically. The benchmarks module pulls in loadgen.
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: "/benchmarks"
+    schedule:
+      interval: weekly

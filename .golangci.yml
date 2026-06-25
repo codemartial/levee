@@ -1,0 +1,37 @@
+version: "2"
+
+# Strict-but-green static analysis for the levee library. The benchmarks/
+# directory is a separate module and is not linted here.
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - revive # style + enforces godoc on exported symbols
+    - misspell
+    - unconvert
+    - errorlint
+    - gosec
+  settings:
+    revive:
+      rules:
+        # LeveeState is established public API; keep the godoc enforcement from
+        # the exported rule but do not flag the (intentional) name stutter.
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+        - name: package-comments
+    gosec:
+      excludes:
+        # The float->int admission cap and the State<->uint8 snapshot casts are
+        # intentional and guarded; see levee.go. G115 only adds noise here.
+        - G115
+  exclusions:
+    rules:
+      # Tests use math/rand for deterministic property/fuzz inputs (not crypto).
+      - path: _test\.go
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

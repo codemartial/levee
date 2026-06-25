@@ -1,82 +1,85 @@
-# Levee v0.3.0
+# Changelog
 
-## Architecture Simplification
+## Unreleased
 
-**Removed:**
-- `ICircuitBreaker` interface
-- `CircuitBreaker` struct (separate from Levee)
-- `WarmupCB` struct and warmup phase
-- `INIT` and `HALF_OPEN` states
-- `SLO.Warmup` field
-- `revised_slo` field (only `slo` remains)
+### Engineering hardening
 
-**Levee is now self-contained** - all circuit breaker logic lives directly in `Levee` struct.
+- Continuous integration on GitHub Actions: build, `go vet`, race-enabled tests,
+  and coverage, run on both amd64 and arm64 to catch architecture-specific bugs.
+- golangci-lint and govulncheck wired into CI; a nightly job fuzzes the admission
+  and numeric paths.
+- Native Go fuzz tests (`FuzzAdmission`, `FuzzInvNormCDF`, `FuzzWilson`),
+  reference-value tests for the numeric core, and state-machine invariant tests.
+- Full godoc on the exported API, runnable examples, and a `State` stringer.
+- Contributor docs: CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, issue/PR templates,
+  and a Makefile that mirrors the CI gate.
 
----
+### Fixes and tuning
 
-## State Model Changes
+- Fixed an amd64-only admission regression: converting the "unlimited" inflight
+  cap (`math.MaxFloat64`) to int64 is implementation-defined and yields MinInt64
+  on amd64, which made a healthy CLOSED breaker reject all traffic. The cast is
+  now guarded, and `TestClosedUncapped` exercises it on both architectures.
+- Reduced hard-coded magic in threshold derivation and improved handling of
+  extreme SLOs and traffic.
 
-| Trunk | v0.3.0 |
-|-------|--------|
-| INIT → CLOSED → OPEN → HALF_OPEN → CLOSED | CLOSED ↔ OPEN ↔ THROTTLED |
+## v0.3.0
 
-**OPEN state** now has two phases:
-1. **Cooldown**: Zero traffic until timeout expires
-2. **Probing**: Rate-limited calls via `probingAllowed()`
+This release made Levee fully self-contained and replaced the earlier
+latency-anomaly / AIMD design with an error-rate-driven MIMD control law. (An
+earlier draft of these notes described that superseded design; see EVOLUTION.md
+for the full rationale of why it changed.)
 
-**THROTTLED state** (new): AIMD-based concurrency control triggered by latency anomalies before SLO breach.
+### Architecture simplification
 
----
+All circuit-breaker logic now lives directly in the `Levee` struct, behind a
+single mutex, with no external dependencies. Removed: the `ICircuitBreaker`
+interface, the separate `CircuitBreaker` and `WarmupCB` types, the `INIT` state
+and explicit warmup phase, the `SLO.Warmup` field, and the standalone metrics
+subsystem (ring buffers and trimmed-mean latency analysis).
 
-## Probing Logic (`probingAllowed()`)
+### State model
 
-```go
-hConcurrency := l.metrics.concurrency.Stat(Mean, Mid)  // Historical EWMA
-floor := min(1.0, 0.1*hConcurrency)                    // 10% of baseline, capped at 1
-allowedConcurrency := max((1-hErrors)*hConcurrency, floor)
-```
+Four states, driven by the error rate and inflight concurrency:
 
-**Key features:**
-- Uses historical EWMA for concurrency (preserved across cooldown)
-- Fresh error data from probing phase (raw Mean if < 100 samples)
-- Probabilistic admission when `allowedConcurrency < 1`
-- Fleet-friendly: ~10% of baseline throughput fleet-wide
+| State     | Behaviour                                                        |
+| --------- | ---------------------------------------------------------------- |
+| CLOSED    | Healthy; all traffic admitted uncapped.                          |
+| THROTTLED | Adaptive inflight limit (MIMD) converging to observed capacity.  |
+| OPEN      | All traffic rejected; cooldown backs off exponentially.          |
+| HALF_OPEN | Post-OPEN probe at the minimum limit on an adaptive interval.    |
 
----
+### Control logic
 
-## THROTTLED State (New)
+- Tripping (CLOSED -> THROTTLED): the Wilson lower confidence bound on the error
+  EWMA (confidence = the SLO success rate) crossing the SLO error budget, or a
+  run of consecutive failures (cold-start outage detection).
+- THROTTLED (MIMD): the inflight limit is seeded from observed capacity
+  (goodput x latency) and, each evaluation window, multiplied by sqrt(2) when the
+  window error rate is within SLO or halved when above, floored at one inflight.
+- Tripping to OPEN: error rate above 50% while already at the minimum limit. The
+  cooldown is `SLO.Timeout`, backing off up to 16x across repeated trips.
+- HALF_OPEN: after cooldown, one probe per (stretched) evaluation window at the
+  minimum limit; recovers to CLOSED once the error EWMA falls below the recovery
+  threshold (or capacity headroom is ample) past a recovery holdoff.
+- Relaxing (CLOSED): an existing limit grows 2x per window and is removed
+  entirely once observed capacity shows 3x headroom.
 
-Triggered by latency anomaly detection (not SLO breach):
-- **Entry**: `hasLatencyAnomaly()` detects unexpected latency spike
-- **AIMD control**: Every 50 samples, adjust ceiling (1.1x up / 0.5x down)
-- **Exit**: `throttlingStabilised()` when errors drop to baseline + 2σ
-- **Floor**: Long-term average concurrency
+Evaluation windows are adaptive: roughly `clamp(avgLatency x 5, 100ms, 5s)`.
 
----
+### Statistical core
 
-## Other Changes
+- Error rate tracked as an EWMA with a 3-second half-life.
+- Trip confidence derived from the SLO via the inverse normal CDF
+  (`tripZ = invNormCDF(SuccessRate)`), applied as a Wilson score lower bound.
+- Capacity estimated from goodput and average-latency EWMAs.
 
-**stats.go:**
-- Added dynamic buffer sizing infrastructure (constants, fields)
-- `RecordAt()` now takes timestamp parameter
-- Added `RecordConcurrency()` with timestamp
+### Persistence and reporting
 
-**state.go:**
-- Simplified `SaveState()`/`RestoreState()` - no more `CircuitBreaker` type assertions
-- Direct access to `l.metrics` instead of `cb.metrics`
-
-**Atomic concurrency control:**
-- `throttleConcurrency` is `atomic.Uint64` (float64 bits)
-- Helper methods: `loadThrottleConcurrency()`, `storeThrottleConcurrency()`
-
----
-
-## Trigger Constants
-
-| Removed | Added |
-|---------|-------|
-| `TriggerWarmupComplete` | `TriggerLatencyAnomaly` |
-| | `TriggerThrottlingStabilised` |
+- `SaveState()` / `RestoreState()` snapshot the learned signals so a restart
+  resumes warm; the live inflight count is intentionally dropped on restore.
+- Every admission and completion call returns a `StateChange` carrying the
+  resulting `State`. Its `Trigger` field is reserved for future use (nil today).
 
 ---
 

@@ -1,0 +1,50 @@
+name: Bug report
+description: Report incorrect or unexpected behaviour in Levee.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please run against the latest tag first, and
+        include enough detail to reproduce.
+  - type: input
+    id: version
+    attributes:
+      label: Levee version
+      description: Tag or commit you observed this on.
+      placeholder: v0.3.0
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: go version go1.25.4 ...
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      description: Levee's numeric paths can differ across architectures.
+      options:
+        - amd64
+        - arm64
+        - other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A minimal code snippet or test that shows the problem.
+      render: go
+    validations:
+      required: true

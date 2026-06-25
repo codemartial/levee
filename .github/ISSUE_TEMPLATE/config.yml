@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or discussion
+    url: https://github.com/codemartial/levee/discussions
+    about: Ask usage questions or discuss design here rather than opening an issue.
+  - name: Security report
+    url: https://github.com/codemartial/levee/security/advisories/new
+    about: Report a vulnerability privately. Do not open a public issue.

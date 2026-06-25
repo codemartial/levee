@@ -3,30 +3,72 @@ package levee
 import (
 	"errors"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 )
 
+// SLO is the service-level objective a [Levee] defends. All of a Levee's
+// behaviour is self-tuned from these two fields; there are no other knobs.
 type SLO struct {
+	// SuccessRate is the target fraction of successful calls, exclusive in
+	// (0, 1). For example 0.95 means "tolerate up to a 5% error rate". A Levee
+	// trips only once it is statistically confident the budget is breached.
 	SuccessRate float64
-	Timeout     time.Duration
+	// Timeout is the base cooldown applied while the circuit is OPEN before the
+	// next probe. It must be > 0. Repeated trips back off exponentially from it.
+	Timeout time.Duration
 }
 
+// State is the admission state of a [Levee].
 type State uint8
 
 const (
-	CLOSED    State = iota
-	OPEN            // Tripped: block all traffic, wait for cooldown
-	THROTTLED       // SLO breach: inflight-limited admission, MIMD toward capacity
-	HALF_OPEN       // Post-OPEN probe: conservative admission, adaptive eval interval
+	// CLOSED is the healthy state: all traffic is admitted uncapped.
+	CLOSED State = iota
+	// OPEN is the tripped state: all traffic is rejected with [ErrCircuitOpen]
+	// until the cooldown elapses and the breaker probes via HALF_OPEN.
+	OPEN
+	// THROTTLED is the overload state: admission is capped by an adaptive
+	// inflight limit that converges toward observed capacity (MIMD control).
+	THROTTLED
+	// HALF_OPEN is the post-OPEN probe state: admission resumes at the minimum
+	// inflight limit on an adaptive evaluation interval to test recovery.
+	HALF_OPEN
 )
 
+// String returns the state's name, e.g. "CLOSED".
+func (s State) String() string {
+	switch s {
+	case CLOSED:
+		return "CLOSED"
+	case OPEN:
+		return "OPEN"
+	case THROTTLED:
+		return "THROTTLED"
+	case HALF_OPEN:
+		return "HALF_OPEN"
+	default:
+		return "State(" + strconv.Itoa(int(s)) + ")"
+	}
+}
+
+// Trigger describes why a state change happened. It is reserved for future use:
+// it is currently always nil, and callers must not depend on it being set.
 type Trigger error
+
+// StateChange is returned by every admission and completion call to report the
+// circuit state observed after the call.
 type StateChange struct {
-	State   State
+	// State is the circuit state after the call.
+	State State
+	// Trigger is reserved for future use and is currently always nil.
 	Trigger Trigger
 }
 
+// ErrCircuitOpen is returned by [Levee.Start] (and [Levee.Call]) when a request
+// is rejected, either because the circuit is OPEN or because the adaptive
+// inflight limit is already saturated.
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
 // Constants
@@ -43,6 +85,9 @@ const (
 	warmupConsecTrip     = 5 // consecutive failures that trip even during warmup (cold-start outage)
 )
 
+// Levee is a self-tuning circuit breaker and concurrency limiter. The zero value
+// is not usable; construct one with [NewLevee] or [RestoreState]. All methods are
+// safe for concurrent use.
 type Levee struct {
 	mu  sync.Mutex
 	slo SLO
@@ -122,6 +167,9 @@ func validateSLO(slo SLO) {
 	}
 }
 
+// NewLevee returns a Levee that defends the given [SLO], starting in the CLOSED
+// state. It panics if the SLO is invalid (SuccessRate not in (0, 1), or
+// Timeout <= 0), since that is a programming error rather than a runtime fault.
 func NewLevee(slo SLO) *Levee {
 	validateSLO(slo)
 	tripZ, recoverTh, consecTrip := deriveThresholds(slo)
@@ -136,12 +184,18 @@ func NewLevee(slo SLO) *Levee {
 	}
 }
 
+// State returns the current circuit [State].
 func (l *Levee) State() State {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.state
 }
 
+// Start requests admission for one call at time ts. If it returns a nil error the
+// call was admitted and the caller must report its outcome exactly once with
+// [Levee.Success] or [Levee.Fail]. If it returns [ErrCircuitOpen] the call was
+// rejected and must not be reported. ts is the caller's clock, letting the breaker
+// be driven from a real, simulated, or externally-sourced time.
 func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -178,6 +232,9 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	return StateChange{State: l.state}, nil
 }
 
+// Success reports that an admitted call completed successfully at time ts after
+// taking the given duration. Call it exactly once per call that [Levee.Start]
+// admitted with a nil error.
 func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -207,6 +264,9 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	return StateChange{State: l.state}
 }
 
+// Fail reports that an admitted call failed at time ts after taking the given
+// duration. Call it exactly once per admitted call. Sustained failures move the
+// breaker out of CLOSED toward THROTTLED and, if they persist, OPEN.
 func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -378,6 +438,11 @@ func (l *Levee) effectiveRecoveryHoldoff() time.Duration {
 	return max(ewmaHalfLife, l.baseEvalInterval()*2)
 }
 
+// Call is the in-band convenience wrapper: it admits a call, runs f if admitted,
+// and reports the outcome, timing f with the wall clock. If admission is rejected
+// it returns [ErrCircuitOpen] without running f. Otherwise it returns f's error
+// (if any). Use the explicit [Levee.Start]/[Levee.Success]/[Levee.Fail] API when
+// you need to control timing or run work out of band.
 func (l *Levee) Call(f func() error) (StateChange, error) {
 	start := time.Now()
 	sc, err := l.Start(start)
@@ -392,6 +457,11 @@ func (l *Levee) Call(f func() error) (StateChange, error) {
 	return l.Success(end, end.Sub(start)), nil
 }
 
+// LeveeState is a serializable snapshot of a [Levee], produced by
+// [Levee.SaveState] and consumed by [RestoreState]. It carries the learned
+// signals (error EWMA, capacity estimate, inflight limit, circuit state) so a
+// restarted process can resume without re-learning from a cold start. The live
+// inflight count is intentionally not restored.
 type LeveeState struct {
 	SLO              SLO     `json:"slo"`
 	StateVal         uint8   `json:"state"`
@@ -412,6 +482,9 @@ type LeveeState struct {
 	OpenStreak       int     `json:"open_streak"`
 }
 
+// SaveState returns a snapshot of the breaker suitable for serialization (for
+// example as JSON). The error is always nil today; it is part of the signature so
+// future encoding work can fail without a breaking API change.
 func (l *Levee) SaveState() (*LeveeState, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -425,6 +498,10 @@ func (l *Levee) SaveState() (*LeveeState, error) {
 	}, nil
 }
 
+// RestoreState rebuilds a Levee from a snapshot taken by [Levee.SaveState]. The
+// live inflight count is deliberately dropped (reset to zero): the calls it
+// represented did not survive the restart, so counting them would wedge admission.
+// It panics if s is nil or carries an invalid SLO.
 func RestoreState(s *LeveeState) *Levee {
 	if s == nil {
 		panic("levee: nil LeveeState")

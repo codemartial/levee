@@ -1,5 +1,10 @@
 # Levee: Self Tuning Circuit Breaker and Concurrency Limiter
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/codemartial/levee.svg)](https://pkg.go.dev/github.com/codemartial/levee)
+[![CI](https://github.com/codemartial/levee/actions/workflows/ci.yml/badge.svg)](https://github.com/codemartial/levee/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/codemartial/levee)](https://goreportcard.com/report/github.com/codemartial/levee)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 > lev·ee /ˈlevi/ _noun_
 >
 > An embankment built to prevent the overflow of a river or body of water; specifically: an artificial bank confining a river channel or limiting adjacent areas subject to flooding.
