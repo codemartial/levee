@@ -126,7 +126,7 @@ func main() {
 ```
 
 
-## Benchmark
+## Benchmarks
 
 Levee is validated in a closed-loop distributed simulation where circuit-breaker
 decisions shape backend load, autoscaling, and queue backpressure. Across seven
@@ -143,11 +143,3 @@ Run with (from the `benchmarks/` directory):
 go test -v -run TestDistributedBenchmarkFirstIncident -timeout 15m
 ```
 
-## TODO
-Levee is still a work in progress. Here are some of the things that need to be done:
-1. ~~Implement concurrent access~~ (done)
-2. ~~Implement save state and restore state capability~~ (done)
-3. Implement state updates over channels
-4. Implement system load monitoring
-
-*The last one is rather tricky. There is no standard way to access the environment load in Go. The best I may be able to do is to make it Linux specific. Even that is complicated being split between VM/BM and containers.*

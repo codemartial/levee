@@ -34,13 +34,13 @@ const (
 	ewmaHalfLife         = 3 * time.Second
 	goodputHalfLife      = 3 * time.Second
 	warmupSamples        = 50
-	tripBufferFactor     = 0.05
 	targetSamplesPerEval = 5
 	minEvalInterval      = 100 * time.Millisecond
 	maxEvalInterval      = 5 * time.Second
 	minInflightLimit     = 1.0
 	openErrThreshold     = 0.5
 	maxOpenBackoff       = 4
+	warmupConsecTrip     = 5 // consecutive failures that trip even during warmup (cold-start outage)
 )
 
 type Levee struct {
@@ -48,7 +48,7 @@ type Levee struct {
 	slo SLO
 
 	// Derived thresholds
-	tripThreshold    float64
+	tripZ            float64 // one-sided z for the trip confidence bound, = invNormCDF(SuccessRate)
 	recoverThreshold float64
 	consecFailTrip   int
 	cooldownDuration time.Duration
@@ -84,15 +84,33 @@ type Levee struct {
 	openStreak int
 }
 
-func deriveThresholds(slo SLO) (tripTh, recoverTh float64, consecTrip int) {
+func deriveThresholds(slo SLO) (tripZ, recoverTh float64, consecTrip int) {
 	sloErr := 1.0 - slo.SuccessRate
-	consecTrip = max(int(math.Ceil(math.Log(1e-8)/math.Log(sloErr))), 5)
+	consecTrip = int(math.Ceil(math.Log(1e-8) / math.Log(sloErr)))
 	recoverTh = sloErr
 	if sloErr < 0.095 {
 		recoverTh = 0.10
 	}
-	tripTh = sloErr + (slo.SuccessRate * tripBufferFactor)
+	// Confidence to trip = the SLO: a 0.99 SLO trips only when 99% sure the
+	// budget is breached. Floor at 0.5 (z >= 0) for the degenerate SLO < 0.5.
+	conf := slo.SuccessRate
+	if conf < 0.5 {
+		conf = 0.5
+	}
+	tripZ = invNormCDF(conf)
 	return
+}
+
+// inverse standard-normal CDF (probit), used once at construction to turn the
+// SLO success rate into the trip confidence z.
+func invNormCDF(p float64) float64 {
+	if p <= 0 {
+		return math.Inf(-1)
+	}
+	if p >= 1 {
+		return math.Inf(1)
+	}
+	return math.Sqrt2 * math.Erfinv(2*p-1)
 }
 
 func validateSLO(slo SLO) {
@@ -106,10 +124,10 @@ func validateSLO(slo SLO) {
 
 func NewLevee(slo SLO) *Levee {
 	validateSLO(slo)
-	tripTh, recoverTh, consecTrip := deriveThresholds(slo)
+	tripZ, recoverTh, consecTrip := deriveThresholds(slo)
 	return &Levee{
 		slo:              slo,
-		tripThreshold:    tripTh,
+		tripZ:            tripZ,
 		recoverThreshold: recoverTh,
 		consecFailTrip:   consecTrip,
 		cooldownDuration: slo.Timeout,
@@ -153,9 +171,6 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 		}
 	}
 
-	// inflightLimit == MaxFloat64 means "unlimited". Guard the cast: int64 of a
-	// value beyond int64 range is implementation-defined in Go and yields MinInt64
-	// on amd64 (saturates to MaxInt64 on arm64), which would reject every request.
 	if l.inflightLimit < math.MaxFloat64 && l.inflight >= int64(math.Ceil(l.inflightLimit)) {
 		return StateChange{State: l.state}, ErrCircuitOpen
 	}
@@ -181,6 +196,11 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 				l.stateEnteredAt = ts
 				l.openStreak = 0
 				l.resetEval(ts)
+				// restart warmup if we tripped during warmup
+				if l.samples < warmupSamples {
+					l.samples = 0
+					l.errEWMA = 0.0
+				}
 			}
 		}
 	}
@@ -199,8 +219,14 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 	if l.state != OPEN && l.inflightLimit < math.MaxFloat64 {
 		l.evalFailures++
 	}
-	if l.state == CLOSED && l.samples >= warmupSamples {
-		if l.errEWMA > l.tripThreshold || l.consecFails >= l.consecFailTrip {
+	if l.state == CLOSED {
+		consecThresh := l.consecFailTrip
+		// Use a more conservative threshold during warmup
+		if l.samples < warmupSamples && consecThresh > warmupConsecTrip {
+			consecThresh = warmupConsecTrip
+		}
+		sloErr := 1.0 - l.slo.SuccessRate
+		if (l.samples >= warmupSamples && l.errLowerBound() > sloErr) || l.consecFails >= consecThresh {
 			l.enterThrottled(ts)
 		}
 	}
@@ -242,7 +268,9 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 
 func (l *Levee) enterThrottled(ts time.Time) {
 	l.state, l.stateEnteredAt = THROTTLED, ts
-	l.inflightLimit = max(float64(l.inflight)*0.5, minInflightLimit)
+	// Seed the limit from observed capacity
+	capacity := l.goodput * l.avgLatency
+	l.inflightLimit = max(max(capacity, float64(l.inflight))*0.5, minInflightLimit)
 	l.consecFails = 0
 	l.resetEval(ts)
 }
@@ -268,6 +296,30 @@ func (l *Levee) ewmaAlpha(dt float64, halfLife time.Duration) float64 {
 		alpha = min(alpha, maxAlpha)
 	}
 	return alpha
+}
+
+// requestRate estimates total events/sec, recovered from the success-only
+// goodput EWMA (denominator guarded near a full outage).
+func (l *Levee) requestRate() float64 {
+	return l.goodput / max(1.0-l.errEWMA, 0.05)
+}
+
+// effectiveSamples is errEWMA's sample mass: ~2 half-lives of traffic.
+func (l *Levee) effectiveSamples() float64 {
+	return max(2.0*l.requestRate()*ewmaHalfLife.Seconds()/math.Ln2, 1.0)
+}
+
+// errLowerBound is the Wilson lower bound on the error rate at confidence tripZ.
+func (l *Levee) errLowerBound() float64 {
+	p := l.errEWMA
+	if l.goodput <= 0 {
+		return p
+	}
+	n := l.effectiveSamples()
+	z2 := l.tripZ * l.tripZ
+	center := p + z2/(2.0*n)
+	margin := l.tripZ * math.Sqrt(p*(1.0-p)/n+z2/(4.0*n*n))
+	return (center - margin) / (1.0 + z2/n)
 }
 
 func (l *Levee) maybeRelaxLimit(ts time.Time) {
@@ -378,9 +430,9 @@ func RestoreState(s *LeveeState) *Levee {
 		panic("levee: nil LeveeState")
 	}
 	validateSLO(s.SLO)
-	tripTh, recoverTh, consecTrip := deriveThresholds(s.SLO)
+	tripZ, recoverTh, consecTrip := deriveThresholds(s.SLO)
 	return &Levee{
-		slo: s.SLO, tripThreshold: tripTh, recoverThreshold: recoverTh, consecFailTrip: consecTrip,
+		slo: s.SLO, tripZ: tripZ, recoverThreshold: recoverTh, consecFailTrip: consecTrip,
 		cooldownDuration: s.SLO.Timeout, state: State(s.StateVal), stateEnteredAt: time.Unix(0, s.StateEnteredAtNS),
 		errEWMA: s.ErrEWMA, errLastTS: time.Unix(0, s.ErrLastTSNS), initialized: s.Initialized,
 		samples: s.Samples, consecFails: s.ConsecFails, inflightLimit: s.InflightLimit,

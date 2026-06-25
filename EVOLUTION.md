@@ -278,9 +278,59 @@ EWMA behaviour across all states:
 | `sloErrRate` | `1 - slo.SuccessRate` | 0.10 |
 | `tripThreshold` | `sloErrRate + slo.SuccessRate * tripBufferFactor` | 0.145 |
 | `recoverThreshold` | `max(sloErrRate, 0.10)` if `sloErrRate < 0.095`, else `sloErrRate` | 0.10 |
-| `consecFailTrip` | `max(ceil(log(1e-8) / log(sloErrRate)), 5)` | 77 |
+| `consecFailTrip` | `ceil(log(1e-8) / log(sloErrRate))` | 8 |
 | `baseEvalInterval` | `clamp(avgLatency * targetSamplesPerEval, minEvalInterval, maxEvalInterval)` | 500ms |
 | `recoveryHoldoff` | `max(baseEvalInterval * holdoffEvalMultiplier, minRecoveryHoldoff)` | 3s |
+
+### 3.7 Phase 4: De-fitting the Trip Threshold; Cold-Start and Low-Concurrency Fixes
+
+A review against the anti-fitting constraint (section 1.3) found three places where the Phase 1-3 design carried a benchmark-tuned constant or left a regime the benchmark never exercises.
+
+**1. Cold-start outage blindness.** The trip path is gated on `samples >= warmupSamples` (50). A fresh breaker (process start, deploy, autoscale-up) whose dependency is already down therefore passes the first 49 calls unprotected -- neither the EWMA nor the consecutive-failure trip can fire before warmup. A rolling deploy or scale-out *during* an incident adds 49 unguarded failures per instance. Fix: the consecutive-failure trip now fires during warmup too, capped at `warmupConsecTrip = 5` so a relaxed SLO's large `consecFailTrip` cannot disable cold-start protection. The EWMA trip keeps its warmup gate (it needs the sample mass).
+
+Because the bypass lets the breaker trip on minimal data, warmup is *restarted* when a warmup-period trip recovers: on the transition back to CLOSED, if `samples < warmupSamples`, both `samples` and `errEWMA` are reset, so the statistical trip re-arms only after a clean post-recovery baseline is established (the consecutive path still guards the re-warm window). The reset is applied at recovery, not at the trip, so the new baseline is built from healthy samples rather than incident-era ones. Its one gap: a long warmup-period incident whose throttled-probe completions push `samples` past the threshold before recovery -- there the reset is skipped, and warmup completes on contaminated samples. Closing that gap would need a dedicated "tripped during warmup" flag (a byte of state); the recovery-time check is the memory-neutral approximation. A post-warmup trip never resets (its baseline is already valid), so normal incidents are unaffected.
+
+**2. Low-concurrency collapse to limit 1.** `enterThrottled` seeded the inflight limit from the post-fail inflight count (`inflight * 0.5`). For a sequential or low-QPS caller, inflight at trip time is ~0-1, so the seed collapses to `minInflightLimit` and the service is throttled to one probe per eval window -- a disruption far larger than the blip that tripped it. Fix: seed from observed capacity via Little's Law, `max(goodput * avgLatency, inflight) * 0.5`. Because `goodput` and `avgLatency` are success-only EWMAs (section 3.4), they hold the last-healthy operating point through a failure burst, so the seed reflects real concurrency rather than the post-fail trough. High-concurrency services are unaffected (inflight already exceeds the capacity estimate).
+
+**3. The fitted trip buffer.** `tripThreshold = sloErrRate + slo.SuccessRate * tripBufferFactor`, with `tripBufferFactor = 0.05`, was a Phase 1 sweep winner (section 5.5) chosen to ride out the benchmark's degradation-hour error excursions. It is a constant fit to one workload, and it has a structural side effect: for any strict SLO the `successRate * 0.05` term dominates, flooring the trip threshold near 5% error regardless of the target. Levee could not enforce any SLO stricter than ~95% -- it tolerated ~5% error whether the SLO was 0.99 or 0.99999. That is precisely the benchmark-anchoring the design set out to avoid (section 1.4).
+
+The fix removes the constant and derives the trip margin from statistics. Treat `errEWMA` as a binomial estimate of the error rate and trip only when its **lower confidence bound exceeds the SLO error budget**:
+
+```
+trip when  wilsonLowerBound(errEWMA, N_eff, z) > sloErrRate
+  z           = invNormCDF(slo.SuccessRate)     // confidence to act = reliability promised
+  N_eff       = 2 * tau * requestRate           // tau = ewmaHalfLife / ln2
+  requestRate = goodput / (1 - errEWMA)          // errEWMA updates on every request
+```
+
+Three choices, all anti-fitting:
+- **z from the SLO, not a sweep.** The confidence required to take the drastic action of opening equals the reliability the SLO promises: a 0.99 SLO trips only when 99% sure the budget is breached. Opening is proportionally more drastic at stricter SLOs (a tiny budget jumps to a near-total block), so demanding more confidence there is the right asymmetry. When running exactly at budget, the per-decision false-trip probability works out to `sloErrRate` -- false-trip tolerance scales with the budget, mirroring the SLO itself.
+- **Wilson, not Wald.** The error rate lives near zero, where the textbook Wald interval degenerates (negative bounds; zero width at `p_hat = 0`). Wilson stays well-behaved at low rates and small samples and converges to Wald at high throughput.
+- **N_eff from total request rate.** The EWMA updates on every request, so its effective sample count is total requests over ~2 time-constants, not just successes. Sizing the interval by request rate keeps the margin tight when traffic is high (trip just above budget) and wide when it is sparse (demand a clearer breach) -- adaptive precision with no constant. The trip is a CLOSED-state decision, where RPS is unthrottled, so this rate is the full offered load.
+
+The trip margin now has zero fitted parameters: only the declared SLO (through `z`) and the live request rate (through `N_eff`). Memory-neutral -- the now-unused `tripThreshold` field became `tripZ`.
+
+**Results (current Delta metric, Levee vs the no-fix baseline; distributed suite + sweeps):**
+
+| Scenario | dDelta | Rank |
+|----------|--------|------|
+| SLO sweep 0.99 | +5.4% | #1 |
+| SLO sweep 0.95 | +2.5% | #1 |
+| Cyber Monday 28h (SLO 0.90) | -0.6% | #1 |
+| SLO sweep 0.80 | +0.3% | #1 |
+| SLO sweep 0.70 | -0.3% | #1 |
+| queue-depth / load variations | -3.6% .. +3.0% | #1 |
+
+Levee holds rank #1 on all 18 scenario/config points; the mean change is +0.3%. The strict-SLO gain (0.99: +5.4%) is the buffer removal paying off -- Levee tracks the declared SLO instead of a 5% floor. The one config past -2% is `load/half-RPM` (-3.6%), a low-throughput case where the widest interval and sparsest recovery samples make Levee over-block good traffic; failure counts there are unchanged (467,346 vs 467,332), so it is an efficiency cost at low traffic, not reduced protection.
+
+**Rejected on the way (section 5 discipline):**
+
+| Attempt | Result | Why dropped |
+|---------|--------|-------------|
+| Constant EWMA alpha cap (replace the goodput-tied cap with a fixed 0.05) to cure the high-throughput EWMA "freeze" | 28h -9.7% | The goodput-tied cap's stickiness is what stabilises recovery; a constant cap caused close/re-trip oscillation. The freeze is also largely symbolic -- flow recovers via MIMD independent of the frozen EWMA, so admitted throughput stays near offered. |
+| Debounced trip (require the breach to persist one eval window before tripping) | 28h -5% to -10% | The eval window is latency-coupled and balloons during incidents, delaying every real-incident trip by up to a full window. |
+
+Both were reverted: the freeze and the transient-trip concerns did not justify their cost.
 
 ---
 
@@ -295,11 +345,11 @@ This section documents the final behaviour of each operation for reference.
 
 **`Success(ts, duration)`** -- Record a successful completion.
 - Decrement inflight. Update error EWMA toward 0 (with event-clock alpha cap). Reset consecutive-fail counter. Update capacity estimates (goodput, latency).
-- If THROTTLED or HALF_OPEN: increment eval successes. Check recovery conditions (after `effectiveRecoveryHoldoff()`): recover to CLOSED if error rate is below `recoverThreshold` OR if the inflight limit has grown far beyond actual usage (limit > 3x inflight). On recovery, keep the inflight limit (graduated recovery) and reset `openStreak`.
+- If THROTTLED or HALF_OPEN: increment eval successes. Check recovery conditions (after `effectiveRecoveryHoldoff()`): recover to CLOSED if error rate is below `recoverThreshold` OR if the inflight limit has grown far beyond actual usage (limit > 3x inflight). On recovery, keep the inflight limit (graduated recovery) and reset `openStreak`. If `samples < warmupSamples` at recovery (the trip happened during warmup), reset `samples` and `errEWMA` to restart warmup on a clean post-recovery baseline -- see 3.7.
 
 **`Fail(ts, duration)`** -- Record a failed completion.
 - Decrement inflight. Update error EWMA toward 1 (with event-clock alpha cap). Increment consecutive-fail counter.
-- If CLOSED: Check trip conditions (EWMA > tripThreshold OR consecutive fails exceeded). Trip to THROTTLED.
+- If CLOSED: Trip to THROTTLED when the error rate's lower confidence bound exceeds the SLO error budget (Wilson bound; `z = invNormCDF(SuccessRate)`, `N_eff` from request rate -- see 3.7), OR when consecutive fails reach the threshold. The consecutive path also fires during warmup (capped at `warmupConsecTrip`) for cold-start protection; the confidence path keeps the warmup gate. On trip, the THROTTLED limit is seeded from observed capacity, `max(goodput*avgLatency, inflight)*0.5`, not the post-fail inflight count.
 - If THROTTLED or HALF_OPEN: Increment eval failures. (The OPEN transition is handled in `maybeEvaluateLimit`, not here.)
 
 **`maybeEvaluateLimit(ts)`** -- MIMD control law (called from `Start`).
