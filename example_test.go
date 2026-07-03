@@ -1,7 +1,6 @@
 package levee_test
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -43,23 +42,5 @@ func ExampleLevee_Start() {
 	// ... perform the protected work, which took 10ms and succeeded ...
 	sc := l.Success(now.Add(10*time.Millisecond), 10*time.Millisecond)
 	fmt.Println(sc.State)
-	// Output: CLOSED
-}
-
-// A breaker can be snapshotted and restored across a process restart so the
-// service resumes with its learned signals instead of a cold start. The live
-// inflight count is intentionally dropped on restore.
-func ExampleLevee_SaveState() {
-	l := levee.NewLevee(levee.SLO{SuccessRate: 0.95, Timeout: 100 * time.Millisecond})
-
-	snap, _ := l.SaveState()
-	blob, _ := json.Marshal(snap)
-
-	// ... process restarts; reload the snapshot bytes ...
-	var restored levee.LeveeState
-	_ = json.Unmarshal(blob, &restored)
-	l2 := levee.RestoreState(&restored)
-
-	fmt.Println(l2.State())
 	// Output: CLOSED
 }

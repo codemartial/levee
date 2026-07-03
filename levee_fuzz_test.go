@@ -58,8 +58,8 @@ func FuzzAdmission(f *testing.F) {
 				outstanding--
 			}
 
-			if l.inflight != int64(outstanding) {
-				t.Fatalf("inflight = %d, want %d outstanding", l.inflight, outstanding)
+			if l.inflight.Load() != int64(outstanding) {
+				t.Fatalf("inflight = %d, want %d outstanding", l.inflight.Load(), outstanding)
 			}
 			if (l.state == THROTTLED || l.state == HALF_OPEN) && l.inflightLimit < minInflightLimit {
 				t.Fatalf("inflightLimit %v below floor in state %v", l.inflightLimit, l.state)

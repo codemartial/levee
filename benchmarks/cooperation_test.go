@@ -58,7 +58,6 @@ func TestCooperationBenchmarkFirstIncident(t *testing.T) {
 	runCooperationBenchmark(t, specs, 100)
 }
 
-
 func runCooperationBenchmark(t *testing.T, specs []loadgen.LoadSpec, numInstances int) {
 	t.Logf("Cooperation benchmark: %d instances sharing 1 backend, %.1f hours",
 		numInstances, calculateTotalHours(specs))

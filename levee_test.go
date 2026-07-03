@@ -39,10 +39,8 @@ func TestClosedUncapped(t *testing.T) {
 		Timeout:     time.Second,
 	})
 
-	// A healthy CLOSED breaker imposes no in-flight limit. Admit many requests
-	// without completing them; none should be rejected for capacity. Regression
-	// for the unlimited-limit sentinel: int64(math.Ceil(MaxFloat64)) overflows to
-	// MinInt64 on amd64, which made the breaker reject every request.
+	// A healthy CLOSED breaker imposes no inflight limit: admit many requests
+	// without completing them; none should be rejected. Guards the amd64 regression.
 	start := time.Unix(100, 0)
 	for i := range 1000 {
 		ts := start.Add(time.Duration(i) * time.Microsecond)
@@ -134,73 +132,6 @@ func TestRejectNeedsNoCompletion(t *testing.T) {
 	}
 }
 
-func TestSaveRestore(t *testing.T) {
-	slo := SLO{
-		SuccessRate: 0.90,
-		Timeout:     time.Second,
-	}
-	l := NewLevee(slo)
-	start := time.Unix(100, 0)
-
-	for i := range 10 {
-		ts := start.Add(time.Duration(i) * time.Millisecond)
-		if _, err := l.Start(ts); err != nil {
-			t.Fatalf("Start before save returned error: %v", err)
-		}
-		l.Success(ts.Add(10*time.Millisecond), 10*time.Millisecond)
-	}
-
-	saved, err := l.SaveState()
-	if err != nil {
-		t.Fatalf("SaveState returned error: %v", err)
-	}
-
-	restored := RestoreState(saved)
-	if restored.State() != l.State() {
-		t.Fatalf("restored state = %v, want %v", restored.State(), l.State())
-	}
-
-	ts := start.Add(time.Second)
-	if _, err := restored.Start(ts); err != nil {
-		t.Fatalf("restored breaker Start returned error: %v", err)
-	}
-	restored.Success(ts.Add(10*time.Millisecond), 10*time.Millisecond)
-}
-
-func TestRestoreDropsInflight(t *testing.T) {
-	slo := SLO{
-		SuccessRate: 0.90,
-		Timeout:     time.Second,
-	}
-	now := time.Unix(100, 0)
-
-	l := NewLevee(slo)
-	l.mu.Lock()
-	l.state = THROTTLED
-	l.stateEnteredAt = now
-	l.lastEvalTS = now
-	l.inflight = 1
-	l.inflightLimit = 1
-	l.mu.Unlock()
-
-	saved, err := l.SaveState()
-	if err != nil {
-		t.Fatalf("SaveState returned error: %v", err)
-	}
-	if saved.Inflight != 1 {
-		t.Fatalf("expected saved in-flight count to reflect runtime state, got %d", saved.Inflight)
-	}
-
-	restored := RestoreState(saved)
-	if restored.inflight != 0 {
-		t.Fatalf("restored in-flight count = %d, want 0", restored.inflight)
-	}
-
-	if _, err := restored.Start(now.Add(time.Second)); err != nil {
-		t.Fatalf("restored breaker should admit a request after dropping stale in-flight count: %v", err)
-	}
-}
-
 func TestInvalidSLOPanics(t *testing.T) {
 	tests := []struct {
 		name string
@@ -242,16 +173,6 @@ func TestInvalidSLOPanics(t *testing.T) {
 			_ = NewLevee(tt.slo)
 		})
 	}
-}
-
-func TestRestoreNilPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("expected panic")
-		}
-	}()
-
-	_ = RestoreState(nil)
 }
 
 func TestRecovers(t *testing.T) {
@@ -389,6 +310,38 @@ func BenchmarkThroughput(b *testing.B) {
 		l.Success(ts.Add(dur), dur)
 	}
 	b.StopTimer()
+
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "reqs/sec")
+}
+
+// BenchmarkContended measures admission throughput when many goroutines hammer
+// the same breaker, exposing contention on the single internal mutex. Each
+// goroutine drives the healthy CLOSED path with its own local synthetic clock,
+// so the figure reflects lock contention rather than time.Now or scheduling.
+// Compare across -cpu values to see whether throughput scales with cores:
+//
+//	go test -run '^$' -bench BenchmarkContended -cpu 1,2,4,8
+func BenchmarkContended(b *testing.B) {
+	l := NewLevee(SLO{
+		SuccessRate: 0.90,
+		Timeout:     time.Second,
+	})
+
+	const step = 100 * time.Microsecond // event-time spacing between requests
+	const dur = 5 * time.Millisecond    // simulated call latency
+
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		ts := time.Unix(0, 0)
+		for pb.Next() {
+			ts = ts.Add(step)
+			if _, err := l.Start(ts); err != nil {
+				b.Errorf("healthy CLOSED breaker rejected request: %v", err)
+				return
+			}
+			l.Success(ts.Add(dur), dur)
+		}
+	})
 
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "reqs/sec")
 }

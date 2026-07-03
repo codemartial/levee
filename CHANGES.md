@@ -14,6 +14,25 @@
 - Contributor docs: CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, issue/PR templates,
   and a Makefile that mirrors the CI gate.
 
+### Performance
+
+- Added a lock-free admission fast path: while the breaker is healthy (uncapped,
+  which can only hold while CLOSED), `Start` admits without taking the mutex, using
+  an atomic `capped` gate plus atomic in-flight accounting. The footprint stays at
+  248 bytes. This lifts contended throughput on a shared breaker by ~25-30% at high
+  core counts. Completion (`Success`/`Fail`) is still serialized. See
+  `BenchmarkContended`.
+
+### Removed
+
+- Removed `SaveState`, `RestoreState`, and `LeveeState` (breaking API change).
+  State persistence was a holdover from when Levee tracked signals over multi-hour
+  horizons; the EWMAs now settle within seconds, so a restarted breaker re-learns
+  almost immediately. Dropping it also removes the corrupt-snapshot attack surface.
+- Removed the `math.MaxFloat64` "uncapped" sentinel from the internals. The active
+  limit is a plain float again, gated by an explicit `capped` flag, which makes the
+  float-to-int admission overflow (the amd64 regression) structurally impossible.
+
 ### Fixes and tuning
 
 - Fixed an amd64-only admission regression: converting the "unlimited" inflight

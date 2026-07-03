@@ -46,7 +46,8 @@ type StaticCB struct {
 //   - Expected latencies: P50 ~ 50ms, P99 ~ 150ms
 //
 // For consecutive-failure CB, expected requests until T consecutive failures at error rate p:
-//   E[n] ≈ 1 / (p^T × (1-p))
+//
+//	E[n] ≈ 1 / (p^T × (1-p))
 //
 // Goal: Don't trip at SLO boundary (10%), trip quickly at ≥15-20% errors
 var (

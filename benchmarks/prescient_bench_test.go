@@ -1,7 +1,6 @@
 package benchmarks
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -1363,96 +1362,7 @@ func runCandidateBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, breaker Circ
 	return runBenchmark(slo, specs, breaker, BenchmarkConfig{Seed: seed})
 }
 
-// buildLeveeStateUntil feeds events to Levee until the specified time offset
-func buildLeveeStateUntil(slo levee.SLO, specs []loadgen.LoadSpec, untilOffset time.Duration, seed uint64) *levee.Levee {
-	lev := levee.NewLevee(slo)
-	gen := loadgen.NewLoadGeneratorWithSeed(specs, seed)
-	stream := loadgen.NewEventStream(gen)
-
-	type pendingRequest struct {
-		startTime time.Time
-	}
-	pending := make(map[int64]pendingRequest)
-
-	var startTime time.Time
-
-	for {
-		event, err := stream.Next()
-		if err != nil {
-			break
-		}
-
-		if startTime.IsZero() {
-			startTime = event.Timestamp
-		}
-
-		elapsed := event.Timestamp.Sub(startTime)
-		if elapsed >= untilOffset {
-			break
-		}
-
-		switch event.Status {
-		case loadgen.EventStart:
-			if _, err := lev.Start(event.Timestamp); err == nil {
-				pending[event.EventID] = pendingRequest{startTime: event.Timestamp}
-			}
-		case loadgen.EventSuccess:
-			if req, ok := pending[event.EventID]; ok {
-				duration := event.Timestamp.Sub(req.startTime)
-				lev.Success(event.Timestamp, duration)
-				delete(pending, event.EventID)
-			}
-		case loadgen.EventError:
-			if req, ok := pending[event.EventID]; ok {
-				duration := event.Timestamp.Sub(req.startTime)
-				lev.Fail(event.Timestamp, duration)
-				delete(pending, event.EventID)
-			}
-		}
-	}
-
-	return lev
-}
-
-// BenchmarkGenerateStateFile builds Levee state up to h+03:59 and saves to file
-func BenchmarkGenerateStateFile(b *testing.B) {
-	const benchmarkSeed uint64 = 20241225 // Fixed seed for deterministic results
-
-	slo := levee.SLO{
-		SuccessRate: 0.90,
-		Timeout:     1500 * time.Millisecond,
-	}
-
-	specs := generateCyberMondayWorkload()
-
-	b.Logf("Building Levee state until h+03:59...")
-	leveeAtCutoff := buildLeveeStateUntil(slo, specs, 3*time.Hour+59*time.Minute, benchmarkSeed)
-
-	b.Logf("Levee state at h+03:59: %s", stateString(leveeAtCutoff.State()))
-
-	savedState, err := leveeAtCutoff.SaveState()
-	if err != nil {
-		b.Fatalf("Failed to save Levee state: %v", err)
-	}
-	if savedState == nil {
-		b.Fatalf("Saved state is nil - Levee may not be in CLOSED state or still in warmup")
-	}
-
-	// Save to file
-	data, err := json.MarshalIndent(savedState, "", "  ")
-	if err != nil {
-		b.Fatalf("Failed to marshal state: %v", err)
-	}
-
-	err = os.WriteFile("levee_state_h03_59.json", data, 0644)
-	if err != nil {
-		b.Fatalf("Failed to write state file: %v", err)
-	}
-
-	b.Logf("Successfully saved Levee state to levee_state_h03_59.json")
-}
-
-// BenchmarkCyberMondayPrescientTruncated runs truncated benchmark from h+04:00 to h+04:20
+// BenchmarkCyberMondayPrescientTruncated runs the benchmark over h+03:59 to h+04:20.
 func BenchmarkCyberMondayPrescientTruncated(b *testing.B) {
 	const benchmarkSeed uint64 = 20241225 // Fixed seed for deterministic results
 
@@ -1463,22 +1373,8 @@ func BenchmarkCyberMondayPrescientTruncated(b *testing.B) {
 
 	specs := generateCyberMondayWorkload()
 
-	// Load saved state from file
-	data, err := os.ReadFile("levee_state_h03_59.json")
-	if err != nil {
-		b.Fatalf("Failed to read state file: %v. Run BenchmarkGenerateStateFile first.", err)
-	}
-
-	var savedState levee.LeveeState
-	err = json.Unmarshal(data, &savedState)
-	if err != nil {
-		b.Fatalf("Failed to unmarshal state: %v", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "Loaded Levee state from file\n")
-
 	// Run the truncated benchmark
-	metrics := runTruncatedPrescientBenchmark(slo, specs, &savedState, 4*time.Hour, 4*time.Hour+20*time.Minute, benchmarkSeed)
+	metrics := runTruncatedPrescientBenchmark(slo, specs, 3*time.Hour+59*time.Minute, 4*time.Hour+20*time.Minute, benchmarkSeed)
 
 	// Build unified result and generate reports
 	results := []CandidateResult{{Name: "Levee", Metrics: metrics}}
@@ -1490,9 +1386,10 @@ func BenchmarkCyberMondayPrescientTruncated(b *testing.B) {
 	}
 }
 
-// runTruncatedPrescientBenchmark runs benchmark in a specific time window using restored state
-func runTruncatedPrescientBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, savedState *levee.LeveeState, startOffset, endOffset time.Duration, seed uint64) *PrescientMetrics {
-	breaker := levee.RestoreState(savedState)
+// runTruncatedPrescientBenchmark runs the benchmark in a specific time window using
+// a fresh breaker.
+func runTruncatedPrescientBenchmark(slo levee.SLO, specs []loadgen.LoadSpec, startOffset, endOffset time.Duration, seed uint64) *PrescientMetrics {
+	breaker := levee.NewLevee(slo)
 	return runBenchmark(slo, specs, breaker, BenchmarkConfig{
 		StartOffset: startOffset,
 		EndOffset:   endOffset,

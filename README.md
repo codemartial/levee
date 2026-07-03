@@ -13,7 +13,7 @@ Levee keeps more of your business flowing under dynamic conditions than any othe
 
 
 - 248 bytes memory overhead (yes, under a quarter of a kB)
-- multi-million request processing capacity -- per CPU core
+- multi-million request processing capacity
 
 ## What is Levee?
 

@@ -5,15 +5,15 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // SLO is the service-level objective a [Levee] defends. All of a Levee's
 // behaviour is self-tuned from these two fields; there are no other knobs.
 type SLO struct {
-	// SuccessRate is the target fraction of successful calls, exclusive in
-	// (0, 1). For example 0.95 means "tolerate up to a 5% error rate". A Levee
-	// trips only once it is statistically confident the budget is breached.
+	// SuccessRate is the target success fraction, in (0, 1) exclusive. The breaker
+	// trips only when statistically confident the budget is breached.
 	SuccessRate float64
 	// Timeout is the base cooldown applied while the circuit is OPEN before the
 	// next probe. It must be > 0. Repeated trips back off exponentially from it.
@@ -66,9 +66,8 @@ type StateChange struct {
 	Trigger Trigger
 }
 
-// ErrCircuitOpen is returned by [Levee.Start] (and [Levee.Call]) when a request
-// is rejected, either because the circuit is OPEN or because the adaptive
-// inflight limit is already saturated.
+// ErrCircuitOpen is returned by [Levee.Start] and [Levee.Call] when a request is
+// rejected (the circuit is OPEN or the inflight limit is saturated).
 var ErrCircuitOpen = errors.New("circuit breaker is open")
 
 // Constants
@@ -85,9 +84,8 @@ const (
 	warmupConsecTrip     = 5 // consecutive failures that trip even during warmup (cold-start outage)
 )
 
-// Levee is a self-tuning circuit breaker and concurrency limiter. The zero value
-// is not usable; construct one with [NewLevee] or [RestoreState]. All methods are
-// safe for concurrent use.
+// Levee is a self-tuning circuit breaker and concurrency limiter. Construct one
+// with [NewLevee]; the zero value is unusable. All methods are concurrency-safe.
 type Levee struct {
 	mu  sync.Mutex
 	slo SLO
@@ -100,6 +98,7 @@ type Levee struct {
 
 	// Circuit State
 	state          State
+	capped         atomic.Bool // admission gate: false == uncapped; read lock-free by Start
 	stateEnteredAt time.Time
 
 	// EWMA error rate
@@ -111,8 +110,9 @@ type Levee struct {
 	// Consecutive failure tracking
 	consecFails int
 
-	// Inflight tracking
-	inflight      int64
+	// inflight is incremented lock-free (atomic); inflightLimit is the active cap,
+	// plain because only the mutex-guarded slow path touches it.
+	inflight      atomic.Int64
 	inflightLimit float64
 
 	// Capacity signals
@@ -167,12 +167,12 @@ func validateSLO(slo SLO) {
 	}
 }
 
-// NewLevee returns a Levee that defends the given [SLO], starting in the CLOSED
-// state. It panics if the SLO is invalid (SuccessRate not in (0, 1), or
-// Timeout <= 0), since that is a programming error rather than a runtime fault.
+// NewLevee returns a Levee defending the given [SLO], starting CLOSED. It panics on
+// an invalid SLO (SuccessRate not in (0, 1), or Timeout <= 0).
 func NewLevee(slo SLO) *Levee {
 	validateSLO(slo)
 	tripZ, recoverTh, consecTrip := deriveThresholds(slo)
+	// capped and inflightLimit default to the uncapped, admit-everything state.
 	return &Levee{
 		slo:              slo,
 		tripZ:            tripZ,
@@ -180,7 +180,6 @@ func NewLevee(slo SLO) *Levee {
 		consecFailTrip:   consecTrip,
 		cooldownDuration: slo.Timeout,
 		state:            CLOSED,
-		inflightLimit:    math.MaxFloat64,
 	}
 }
 
@@ -191,18 +190,22 @@ func (l *Levee) State() State {
 	return l.state
 }
 
-// Start requests admission for one call at time ts. If it returns a nil error the
-// call was admitted and the caller must report its outcome exactly once with
-// [Levee.Success] or [Levee.Fail]. If it returns [ErrCircuitOpen] the call was
-// rejected and must not be reported. ts is the caller's clock, letting the breaker
-// be driven from a real, simulated, or externally-sourced time.
+// Start requests admission at time ts. A nil error means admitted (report it once
+// via [Levee.Success] or [Levee.Fail]); [ErrCircuitOpen] means rejected, report nothing.
 func (l *Levee) Start(ts time.Time) (StateChange, error) {
+	// Lock-free fast path: an uncapped breaker (only possible while CLOSED) admits
+	// everything with just atomic accounting, never touching the mutex.
+	if !l.capped.Load() {
+		l.inflight.Add(1)
+		return StateChange{State: CLOSED}, nil
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	switch l.state {
 	case CLOSED:
-		if l.inflightLimit < math.MaxFloat64 {
+		if l.capped.Load() {
 			l.maybeRelaxLimit(ts)
 		}
 	case OPEN:
@@ -218,37 +221,36 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 			return StateChange{State: OPEN}, ErrCircuitOpen
 		}
 		// At min limit, allow only one probe per eval window.
-		if l.inflightLimit <= minInflightLimit && l.inflight == 0 {
+		if l.inflightLimit <= minInflightLimit && l.inflight.Load() == 0 {
 			if (l.evalSuccesses + l.evalFailures) > 0 {
 				return StateChange{State: l.state}, ErrCircuitOpen
 			}
 		}
 	}
 
-	if l.inflightLimit < math.MaxFloat64 && l.inflight >= int64(math.Ceil(l.inflightLimit)) {
+	if l.capped.Load() && l.inflight.Load() >= int64(math.Ceil(l.inflightLimit)) {
 		return StateChange{State: l.state}, ErrCircuitOpen
 	}
-	l.inflight++
+	l.inflight.Add(1)
 	return StateChange{State: l.state}, nil
 }
 
-// Success reports that an admitted call completed successfully at time ts after
-// taking the given duration. Call it exactly once per call that [Levee.Start]
-// admitted with a nil error.
+// Success reports that an admitted call succeeded at time ts after the given
+// duration. Call it exactly once per admission.
 func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.inflight--
+	l.inflight.Add(-1)
 	l.updateErrEWMA(ts, 0.0)
 	l.samples++
 	l.consecFails = 0
 	l.updateCapacityEstimate(ts, duration)
 
-	if l.state != OPEN && l.inflightLimit < math.MaxFloat64 {
+	if l.state != OPEN && l.capped.Load() {
 		l.evalSuccesses++
 		if l.state != CLOSED && ts.Sub(l.stateEnteredAt) >= l.effectiveRecoveryHoldoff() {
-			if l.errEWMA < l.recoverThreshold || l.inflightLimit > float64(l.inflight+1)*3.0 {
+			if l.errEWMA < l.recoverThreshold || l.inflightLimit > float64(l.inflight.Load()+1)*3.0 {
 				l.state = CLOSED
 				l.stateEnteredAt = ts
 				l.openStreak = 0
@@ -264,19 +266,18 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	return StateChange{State: l.state}
 }
 
-// Fail reports that an admitted call failed at time ts after taking the given
-// duration. Call it exactly once per admitted call. Sustained failures move the
-// breaker out of CLOSED toward THROTTLED and, if they persist, OPEN.
+// Fail reports that an admitted call failed at time ts after the given duration.
+// Call it exactly once per admission.
 func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.inflight--
+	l.inflight.Add(-1)
 	l.updateErrEWMA(ts, 1.0)
 	l.samples++
 	l.consecFails++
 
-	if l.state != OPEN && l.inflightLimit < math.MaxFloat64 {
+	if l.state != OPEN && l.capped.Load() {
 		l.evalFailures++
 	}
 	if l.state == CLOSED {
@@ -327,10 +328,11 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 }
 
 func (l *Levee) enterThrottled(ts time.Time) {
+	l.capped.Store(true)
 	l.state, l.stateEnteredAt = THROTTLED, ts
 	// Seed the limit from observed capacity
 	capacity := l.goodput * l.avgLatency
-	l.inflightLimit = max(max(capacity, float64(l.inflight))*0.5, minInflightLimit)
+	l.inflightLimit = max(max(capacity, float64(l.inflight.Load()))*0.5, minInflightLimit)
 	l.consecFails = 0
 	l.resetEval(ts)
 }
@@ -338,6 +340,7 @@ func (l *Levee) enterThrottled(ts time.Time) {
 func (l *Levee) enterHalfOpen(ts time.Time) {
 	l.state, l.stateEnteredAt = HALF_OPEN, ts
 	l.inflightLimit = minInflightLimit
+	l.capped.Store(true)
 	l.consecFails = 0
 	l.resetEval(ts)
 }
@@ -391,8 +394,8 @@ func (l *Levee) maybeRelaxLimit(ts time.Time) {
 		l.enterThrottled(ts)
 		return
 	}
-	if l.inflightLimit > float64(l.inflight+1)*3.0 {
-		l.inflightLimit = math.MaxFloat64
+	if l.inflightLimit > float64(l.inflight.Load()+1)*3.0 {
+		l.capped.Store(false)
 	} else {
 		l.inflightLimit *= 2.0
 	}
@@ -438,11 +441,8 @@ func (l *Levee) effectiveRecoveryHoldoff() time.Duration {
 	return max(ewmaHalfLife, l.baseEvalInterval()*2)
 }
 
-// Call is the in-band convenience wrapper: it admits a call, runs f if admitted,
-// and reports the outcome, timing f with the wall clock. If admission is rejected
-// it returns [ErrCircuitOpen] without running f. Otherwise it returns f's error
-// (if any). Use the explicit [Levee.Start]/[Levee.Success]/[Levee.Fail] API when
-// you need to control timing or run work out of band.
+// Call wraps a function: it admits, runs f (timed by the wall clock), and reports
+// the outcome. Rejected admission returns [ErrCircuitOpen] without running f.
 func (l *Levee) Call(f func() error) (StateChange, error) {
 	start := time.Now()
 	sc, err := l.Start(start)
@@ -455,65 +455,4 @@ func (l *Levee) Call(f func() error) (StateChange, error) {
 		return l.Fail(end, end.Sub(start)), callErr
 	}
 	return l.Success(end, end.Sub(start)), nil
-}
-
-// LeveeState is a serializable snapshot of a [Levee], produced by
-// [Levee.SaveState] and consumed by [RestoreState]. It carries the learned
-// signals (error EWMA, capacity estimate, inflight limit, circuit state) so a
-// restarted process can resume without re-learning from a cold start. The live
-// inflight count is intentionally not restored.
-type LeveeState struct {
-	SLO              SLO     `json:"slo"`
-	StateVal         uint8   `json:"state"`
-	StateEnteredAtNS int64   `json:"state_entered_at_ns"`
-	ErrEWMA          float64 `json:"err_ewma"`
-	ErrLastTSNS      int64   `json:"err_last_ts_ns"`
-	Initialized      bool    `json:"initialized"`
-	Samples          int64   `json:"samples"`
-	ConsecFails      int     `json:"consec_fails"`
-	Inflight         int64   `json:"inflight"`
-	InflightLimit    float64 `json:"inflight_limit"`
-	Goodput          float64 `json:"goodput"`
-	AvgLatency       float64 `json:"avg_latency"`
-	LastSuccessTSNS  int64   `json:"last_success_ts_ns"`
-	LastEvalTSNS     int64   `json:"last_eval_ts_ns"`
-	EvalSuccesses    int64   `json:"eval_successes"`
-	EvalFailures     int64   `json:"eval_failures"`
-	OpenStreak       int     `json:"open_streak"`
-}
-
-// SaveState returns a snapshot of the breaker suitable for serialization (for
-// example as JSON). The error is always nil today; it is part of the signature so
-// future encoding work can fail without a breaking API change.
-func (l *Levee) SaveState() (*LeveeState, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return &LeveeState{
-		SLO: l.slo, StateVal: uint8(l.state), StateEnteredAtNS: l.stateEnteredAt.UnixNano(),
-		ErrEWMA: l.errEWMA, ErrLastTSNS: l.errLastTS.UnixNano(), Initialized: l.initialized,
-		Samples: l.samples, ConsecFails: l.consecFails, Inflight: l.inflight,
-		InflightLimit: l.inflightLimit, Goodput: l.goodput, AvgLatency: l.avgLatency,
-		LastSuccessTSNS: l.lastSuccessTS.UnixNano(), LastEvalTSNS: l.lastEvalTS.UnixNano(),
-		EvalSuccesses: l.evalSuccesses, EvalFailures: l.evalFailures, OpenStreak: l.openStreak,
-	}, nil
-}
-
-// RestoreState rebuilds a Levee from a snapshot taken by [Levee.SaveState]. The
-// live inflight count is deliberately dropped (reset to zero): the calls it
-// represented did not survive the restart, so counting them would wedge admission.
-// It panics if s is nil or carries an invalid SLO.
-func RestoreState(s *LeveeState) *Levee {
-	if s == nil {
-		panic("levee: nil LeveeState")
-	}
-	validateSLO(s.SLO)
-	tripZ, recoverTh, consecTrip := deriveThresholds(s.SLO)
-	return &Levee{
-		slo: s.SLO, tripZ: tripZ, recoverThreshold: recoverTh, consecFailTrip: consecTrip,
-		cooldownDuration: s.SLO.Timeout, state: State(s.StateVal), stateEnteredAt: time.Unix(0, s.StateEnteredAtNS),
-		errEWMA: s.ErrEWMA, errLastTS: time.Unix(0, s.ErrLastTSNS), initialized: s.Initialized,
-		samples: s.Samples, consecFails: s.ConsecFails, inflightLimit: s.InflightLimit,
-		goodput: s.Goodput, avgLatency: s.AvgLatency, lastSuccessTS: time.Unix(0, s.LastSuccessTSNS),
-		lastEvalTS: time.Unix(0, s.LastEvalTSNS), evalSuccesses: s.EvalSuccesses, evalFailures: s.EvalFailures, openStreak: s.OpenStreak,
-	}
 }

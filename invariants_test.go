@@ -22,8 +22,8 @@ func checkInvariants(t *testing.T, l *Levee, outstanding int, step int) {
 	// The breaker's inflight counter must agree with the number of calls we have
 	// admitted but not yet completed. This subsumes "never negative" and
 	// "a rejected Start must not increment inflight".
-	if l.inflight != int64(outstanding) {
-		t.Fatalf("step %d: inflight = %d, but %d calls are outstanding", step, l.inflight, outstanding)
+	if l.inflight.Load() != int64(outstanding) {
+		t.Fatalf("step %d: inflight = %d, but %d calls are outstanding", step, l.inflight.Load(), outstanding)
 	}
 	// While admission is capped, the limit must never fall below the floor.
 	if (l.state == THROTTLED || l.state == HALF_OPEN) && l.inflightLimit < minInflightLimit {
@@ -115,16 +115,16 @@ func TestRejectionPreservesInflight(t *testing.T) {
 	rejected := 0
 	for i := range 1000 {
 		ts = ts.Add(time.Millisecond)
-		before := l.inflight
+		before := l.inflight.Load()
 		if _, err := l.Start(ts); err != nil {
 			rejected++
-			if l.inflight != before {
-				t.Fatalf("iter %d: rejected Start changed inflight: %d -> %d", i, before, l.inflight)
+			if l.inflight.Load() != before {
+				t.Fatalf("iter %d: rejected Start changed inflight: %d -> %d", i, before, l.inflight.Load())
 			}
 		} else {
 			// Admitted: complete it so we keep cycling against the limit.
-			if l.inflight != before+1 {
-				t.Fatalf("iter %d: admitted Start did not increment inflight: %d -> %d", i, before, l.inflight)
+			if l.inflight.Load() != before+1 {
+				t.Fatalf("iter %d: admitted Start did not increment inflight: %d -> %d", i, before, l.inflight.Load())
 			}
 			l.Fail(ts.Add(time.Millisecond), time.Millisecond)
 		}
