@@ -1,6 +1,6 @@
 # Levee Benchmarks
 
-Levee tunes itself -- these benchmarks prove it works. This directory holds two
+Levee tunes itself -- these benchmarks prove it works. This directory holds three
 complementary simulation suites that put self-tuning Levee head-to-head with
 carefully hand-tuned static circuit breakers.
 
@@ -13,7 +13,13 @@ carefully hand-tuned static circuit breakers.
   node crashes. Levee wins every load variation, by the widest margins under extreme
   overload.
 
-Both run on logical time, so results are deterministic and reproducible: no
+- **[Mesh benchmark](mesh_benchmark.md)** -- a 10-node service mesh where every node
+  runs Levee for both inbound and outbound admission, against a static rate limiter +
+  circuit breaker + concurrency limiter stack. Through a surge, deep-dependency
+  degradation, and a branch crash, Levee is the only candidate with zero node
+  crashes and a positive score.
+
+All suites run on logical time, so results are deterministic and reproducible: no
 wall-clock sleeps, no flakiness.
 
 ## Headline results

@@ -170,6 +170,16 @@ func (cb *StaticCB) Start(ts time.Time) (levee.StateChange, error) {
 	}
 }
 
+// Cancel releases an admission obtained from Start without recording an
+// outcome, e.g. when a chained limiter rejects the call after admission.
+func (cb *StaticCB) Cancel() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.internalState == staticHalfOpen {
+		atomic.AddInt32(&cb.halfOpenCalls, -1)
+	}
+}
+
 // Success processes a successful call result
 func (cb *StaticCB) Success(ts time.Time, duration time.Duration) levee.StateChange {
 	cb.mu.Lock()
