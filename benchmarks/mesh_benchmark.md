@@ -184,33 +184,33 @@ How each candidate fails, and how Levee does not:
   healthy traffic and re-admitting failing traffic (failures ~301k despite
   zero crashes).
 - **Levee** crashes nothing, admits 3.1x Static-Nominal's successful
-  traffic, and posts the only positive MeshDelta at both entries. It rides
-  the surge in THROTTLED while the autoscaler catches up, throttles into
-  the degraded db in phase C, and keeps payments- and db-facing roles out
-  of OPEN almost entirely. In steady phases it converges back to CLOSED.
+  traffic, and posts the only positive MeshDelta at both entries.
 
-Two mesh-mode behaviors worth knowing. First, because inbound Levee sees
-subtree outcomes, a deep failure (payments down) pushes entry-node inbound
-instances toward OPEN for part of the outage -- Levee defends the entry's
-SLO by shedding at the door, trading some healthy browse traffic for
-backpressure; the dwell table in the test output makes this visible per
-role. Second, the async callback edge (notify -> orders) parks OPEN/
-THROTTLED during stress, shedding optional work first -- callbacks never
-affect their parent's outcome. Note that per-replica instances each adapt
-on 1/R of the node's traffic, so high-replica nodes converge a little
-slower than a single shared instance would; Levee still wins with that
-handicap.
+How Levee wins is more important than the raw margin. During the surge, entry
+and downstream instances enter THROTTLED rather than flipping fully OPEN, so
+the mesh keeps capacity-matched work flowing while the autoscaler catches up.
+When db degrades, the db-facing roles throttle without forcing unrelated
+edges to stop, preserving sibling traffic that can still complete. When the
+payments branch collapses, failures surface through subtree outcomes at the
+entry nodes, so admission shifts toward the point of origin: requests that
+cannot complete are shed before they consume service time and queue space
+several hops downstream.
 
-Known model biases, called out for fairness:
+Two more mesh-mode behaviors make that work without coordination. The async
+callback edge (notify -> orders) parks OPEN/THROTTLED during stress, shedding
+optional work first because callbacks never affect their parent's outcome.
+And the server-side inbound instances provide a second line of defence under
+fan-in that does not depend on how many callers or replicas happen to be
+active. Per-replica instances each adapt on 1/R of a node's traffic, so
+high-replica nodes converge a little slower than a single shared instance
+would; Levee still wins with that handicap.
 
-- The HPA sees only admitted traffic, so a governor that sheds hard also
-  suppresses its own scale-up signal. This mirrors common autoscaler behavior,
-  but it also compounds any governor's scale-up suppression.
-- Static sizing constants (1.5x headroom, subtree-mean-latency inflight) are
-  judgment calls; the derivations live in `mesh/static.go` so reviewers can
-  dispute numbers rather than mechanism.
-- Scale-down is effectively disabled (600s delay vs 20-minute sim); the
-  scenario tests up-scaling lag only.
+## Model scope
+
+The scenario is about overload, degradation, crash recovery, and scale-up
+lag. Scale-down is effectively outside the run: the capacity controller uses a
+600s scale-down delay inside a 20-minute scenario, so replicas that arrive
+during an incident remain available through the settle windows.
 
 ## Run it
 
