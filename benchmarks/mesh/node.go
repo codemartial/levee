@@ -32,7 +32,7 @@ type nodeRuntime struct {
 	cc              *backend.CapacityController
 	workers         workerHeap
 	slotsPerReplica int
-	backlog         int // executing + queued; the concurrency metric
+	backlog         int // executing + queued; drives the buffer limit
 	profile         latencyProfile
 	gov             Governor
 
@@ -41,11 +41,8 @@ type nodeRuntime struct {
 	gen            uint64 // bumped on crash; stale completions carry old gen
 	govReplicas    int    // governor instance count, synced to replicas
 
-	// Metrics accumulators; downtime is tracked engine-side with end-clamping.
+	// Downtime is tracked engine-side with end-clamping.
 	crashCount int
-	peakConc   int
-	concSumNS  float64 // integral of backlog over time
-	lastConcNS int64
 }
 
 func newNodeRuntime(idx int, spec NodeSpec, gov Governor) *nodeRuntime {
@@ -129,18 +126,9 @@ func (n *nodeRuntime) admit(nowNS, serviceNS int64) int64 {
 	return done
 }
 
-// updateConc integrates backlog over time; call BEFORE changing backlog.
-func (n *nodeRuntime) updateConc(nowNS int64) {
-	if nowNS > n.lastConcNS {
-		n.concSumNS += float64(n.backlog) * float64(nowNS-n.lastConcNS)
-		n.lastConcNS = nowNS
-	}
-}
-
 // crash drops all in-flight and queued work and kills all governor
 // instances; upstreams learn only via timeouts.
 func (n *nodeRuntime) crash(nowNS int64) {
-	n.updateConc(nowNS)
 	n.crashed = true
 	n.crashedSinceNS = nowNS
 	n.gen++

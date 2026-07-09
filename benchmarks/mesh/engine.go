@@ -11,7 +11,7 @@ import (
 // Simulation constants shared across the mesh benchmark.
 const (
 	DefaultSeed     = uint64(20241225)
-	bufferSeconds   = 5 // queue limit = 5 seconds' worth of instantaneous capacity
+	bufferSeconds   = 3 // queue limit = 3 seconds' worth of instantaneous capacity
 	defaultHopMS    = 1.0
 	hopNS           = int64(1e6)
 	rootTimeoutNS   = int64(1500 * 1e6)
@@ -28,6 +28,7 @@ const (
 	saltEdgeBase = uint64(0xD6E8FEB86659FD93)
 	saltEdgeStep = uint64(0x2545F4914F6CDD1D)
 	saltChild    = uint64(0x9E3779B97F4A7C15)
+	saltEdgeRep  = uint64(0xC2B2AE3D27D4EB4F) // per-repetition salt for amplified edges
 )
 
 func splitmix64(x uint64) uint64 {
@@ -73,8 +74,8 @@ func (h eventHeap) Less(i, j int) bool {
 	}
 	return h[i].seq < h[j].seq
 }
-func (h eventHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *eventHeap) Push(x any) { *h = append(*h, x.(*event)) }
+func (h eventHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *eventHeap) Push(x any)   { *h = append(*h, x.(*event)) }
 func (h *eventHeap) Pop() any {
 	old := *h
 	n := len(old)
@@ -113,9 +114,11 @@ type call struct {
 // phaseFx is a phase precompiled to per-slot/per-node multiplier arrays.
 type phaseFx struct {
 	startNS, endNS int64
-	rate           []float64 // per entry slot
-	lat            []float64 // per node
-	err            []float64 // per node
+	rampNS         int64       // linear arrival ramp-in from 1.0 to rate[slot]
+	rate           []float64   // per entry slot
+	lat            []float64   // per node
+	err            []float64   // per node
+	edge           [][]float64 // per node, per edge index: calls-per-request multiplier
 }
 
 // Engine is a single-threaded discrete-event simulation of one candidate
@@ -153,12 +156,22 @@ func NewEngine(topo *Topology, cand Candidate, phases []Phase, slo levee.SLO, se
 			e.entryRNG = append(e.entryRNG, rand.New(rand.NewPCG(seed+uint64(slot)*7919, (seed>>32)+uint64(slot)+1)))
 		}
 	}
+	// Nodes and governor instances begin at design replicas (warm start).
+	// Skipped for test topologies whose steady state does not converge.
+	if steady, err := topo.SteadyStateRPS(); err == nil {
+		for i, spec := range topo.Nodes {
+			e.nodes[i].cc.WarmStart(designReplicas(spec, steady[spec.Name]), steady[spec.Name], time.Unix(0, 0))
+			e.nodes[i].resize(0)
+			e.nodes[i].syncGov(0)
+		}
+	}
 	e.arrivalSeq = make([]uint64, len(e.entries))
 	e.fx = make([]phaseFx, len(phases))
 	for p, ph := range phases {
 		fx := phaseFx{
 			startNS: int64(ph.StartS) * 1e9,
 			endNS:   int64(ph.EndS) * 1e9,
+			rampNS:  int64(ph.RampS) * 1e9,
 			rate:    make([]float64, len(e.entries)),
 			lat:     make([]float64, len(topo.Nodes)),
 			err:     make([]float64, len(topo.Nodes)),
@@ -169,12 +182,25 @@ func NewEngine(topo *Topology, cand Candidate, phases []Phase, slo levee.SLO, se
 				fx.rate[s] = m
 			}
 		}
+		fx.edge = make([][]float64, len(topo.Nodes))
+		matched := 0
 		for i, n := range topo.Nodes {
 			fx.lat[i] = 1.0
 			if m, ok := ph.LatencyMult[n.Name]; ok {
 				fx.lat[i] = m
 			}
 			fx.err[i] = ph.ExtraErrorRate[n.Name]
+			fx.edge[i] = make([]float64, len(n.Edges))
+			for j, edge := range n.Edges {
+				fx.edge[i][j] = 1.0
+				if m, ok := ph.EdgeCallMult[n.Name+"->"+edge.Callee]; ok {
+					fx.edge[i][j] = m
+					matched++
+				}
+			}
+		}
+		if matched != len(ph.EdgeCallMult) {
+			panic("phase " + ph.Name + ": EdgeCallMult key does not match any topology edge")
 		}
 		e.fx[p] = fx
 	}
@@ -185,7 +211,11 @@ func NewEngine(topo *Topology, cand Candidate, phases []Phase, slo levee.SLO, se
 func (e *Engine) rateMultAt(slot int, tNS int64) float64 {
 	for i := range e.fx {
 		if tNS >= e.fx[i].startNS && tNS < e.fx[i].endNS {
-			return e.fx[i].rate[slot]
+			m := e.fx[i].rate[slot]
+			if r := e.fx[i].rampNS; r > 0 && tNS < e.fx[i].startNS+r {
+				m = 1 + (m-1)*float64(tNS-e.fx[i].startNS)/float64(r)
+			}
+			return m
 		}
 	}
 	return 1.0
@@ -207,6 +237,15 @@ func (e *Engine) extraErrAt(node int, tNS int64) float64 {
 		}
 	}
 	return 0.0
+}
+
+func (e *Engine) edgeMultAt(node, edgeIdx int, tNS int64) float64 {
+	for i := range e.fx {
+		if tNS >= e.fx[i].startNS && tNS < e.fx[i].endNS {
+			return e.fx[i].edge[node][edgeIdx]
+		}
+	}
+	return 1.0
 }
 
 func (e *Engine) push(ev *event) {
@@ -329,11 +368,7 @@ func (e *Engine) deliver(c *call, t int64) {
 		e.metrics.recordAllowed(c.entry, int64(n.backlog+1))
 	}
 	n.cc.RecordRequest(time.Unix(0, t))
-	n.updateConc(t)
 	n.backlog++
-	if n.backlog > n.peakConc {
-		n.peakConc = n.backlog
-	}
 	if n.backlog >= n.bufferLimit() {
 		n.crash(t)
 		e.push(&event{atNS: t + crashRecoveryNS, kind: evCrashRecover, node: c.node})
@@ -353,7 +388,6 @@ func (e *Engine) handleComplete(c *call, gen uint64, t int64) {
 	if n.crashed || gen != n.gen {
 		return // work lost in a crash; occupancy was reset there
 	}
-	n.updateConc(t)
 	n.backlog--
 	if c.finished {
 		return
@@ -372,56 +406,62 @@ func (e *Engine) dispatchChildren(c *call, t int64) {
 	spec := e.topo.Nodes[c.node]
 	gov := e.nodes[c.node].gov
 	for i, edge := range spec.Edges {
-		if drawFloat(c.id, saltEdgeBase+uint64(i)*saltEdgeStep) >= edge.Prob {
-			continue
-		}
-		if c.hopBudget <= 1 {
-			if !edge.Async {
-				c.childFailed = true
-			}
-			continue
-		}
-		childID := splitmix64(c.id + uint64(i+1)*saltChild)
-		callee := e.topo.index[edge.Callee]
-		ts := time.Unix(0, t)
-		if edge.Async {
-			if gov.OutboundStart(c.govRep, i, ts) != nil {
-				continue // dropped callback; parent unaffected
-			}
-			a := &call{
-				id:              childID,
-				node:            callee,
-				deadlineNS:      t + rootTimeoutNS,
-				hopBudget:       c.hopBudget - 1,
-				entry:           -1,
-				asyncCallerNode: c.node,
-				asyncCallerEdge: i,
-				asyncCallerRep:  c.govRep,
-				asyncCallerGen:  c.admitGen,
-				dispatchNS:      t,
-			}
-			a.root = a
-			e.push(&event{atNS: a.deadlineNS, kind: evRootTimeout, c: a})
-			e.push(&event{atNS: t + hopNS, kind: evCallArrive, c: a})
-		} else {
-			if gov.OutboundStart(c.govRep, i, ts) != nil {
-				c.childFailed = true // local rejection = that call's failure
+		// Expected calls per request on this edge; above 1.0 only under an
+		// EdgeCallMult injection. Repetition 0 matches the un-amplified draw.
+		expected := edge.Prob * e.edgeMultAt(c.node, i, t)
+		for k := 0; float64(k) < expected; k++ {
+			p := expected - float64(k)
+			if p < 1 && drawFloat(c.id, saltEdgeBase+uint64(i)*saltEdgeStep+uint64(k)*saltEdgeRep) >= p {
 				continue
 			}
-			ch := &call{
-				id:              childID,
-				node:            callee,
-				parent:          c,
-				edgeIdx:         i,
-				root:            c.root,
-				deadlineNS:      c.deadlineNS,
-				hopBudget:       c.hopBudget - 1,
-				entry:           -1,
-				asyncCallerNode: -1,
-				dispatchNS:      t,
+			if c.hopBudget <= 1 {
+				if !edge.Async {
+					c.childFailed = true
+				}
+				continue
 			}
-			c.pendingChildren++
-			e.push(&event{atNS: t + hopNS, kind: evCallArrive, c: ch})
+			childID := splitmix64(c.id + uint64(i+1)*saltChild + uint64(k)*saltEdgeRep)
+			callee := e.topo.index[edge.Callee]
+			ts := time.Unix(0, t)
+			if edge.Async {
+				if gov.OutboundStart(c.govRep, i, ts) != nil {
+					continue // dropped callback; parent unaffected
+				}
+				a := &call{
+					id:              childID,
+					node:            callee,
+					deadlineNS:      t + rootTimeoutNS,
+					hopBudget:       c.hopBudget - 1,
+					entry:           -1,
+					asyncCallerNode: c.node,
+					asyncCallerEdge: i,
+					asyncCallerRep:  c.govRep,
+					asyncCallerGen:  c.admitGen,
+					dispatchNS:      t,
+				}
+				a.root = a
+				e.push(&event{atNS: a.deadlineNS, kind: evRootTimeout, c: a})
+				e.push(&event{atNS: t + hopNS, kind: evCallArrive, c: a})
+			} else {
+				if gov.OutboundStart(c.govRep, i, ts) != nil {
+					c.childFailed = true // local rejection = that call's failure
+					continue
+				}
+				ch := &call{
+					id:              childID,
+					node:            callee,
+					parent:          c,
+					edgeIdx:         i,
+					root:            c.root,
+					deadlineNS:      c.deadlineNS,
+					hopBudget:       c.hopBudget - 1,
+					entry:           -1,
+					asyncCallerNode: -1,
+					dispatchNS:      t,
+				}
+				c.pendingChildren++
+				e.push(&event{atNS: t + hopNS, kind: evCallArrive, c: ch})
+			}
 		}
 	}
 }
@@ -478,13 +518,12 @@ func (e *Engine) failTree(root *call, t int64) {
 	delete(e.liveByRoot, root)
 }
 
-// finalize closes open crash windows and metric integrals at sim end.
+// finalize closes open crash windows at sim end.
 func (e *Engine) finalize() {
 	for i, n := range e.nodes {
 		if n.crashed {
 			e.metrics.addDowntime(i, n.crashedSinceNS, e.endNS, e.endNS)
 		}
-		n.updateConc(e.endNS)
 	}
 	e.metrics.finalize(e.endNS)
 }

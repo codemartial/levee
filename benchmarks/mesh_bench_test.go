@@ -68,20 +68,18 @@ func runMeshBenchmark(t *testing.T, endS int) []meshResult {
 
 func printMeshResults(t *testing.T, results []meshResult, endS int) {
 	t.Helper()
-	sep := strings.Repeat("-", 152)
+	sep := strings.Repeat("-", 100)
 
 	t.Logf("Mesh benchmark: %d nodes, %d simulated seconds", len(results[0].m.Health), endS)
 	t.Log(sep)
-	t.Logf("%-15s | %9s | %9s | %9s | %9s | %10s | %7s | %7s | %7s | %8s | %8s | %9s | %8s",
-		"Candidate", "Allowed", "Blocked", "Success", "Failures", "MeshDelta",
-		"Closed%", "Throt%", "Open%", "Healthy%", "AvgCrash", "ConcRatio", "Wall")
+	t.Logf("%-15s | %9s | %9s | %9s | %9s | %10s | %8s",
+		"Candidate", "Allowed", "Blocked", "Success", "Failures", "MeshDelta", "Wall")
 	t.Log(sep)
 	for _, r := range results {
 		s := r.m.Mesh.Snapshot()
-		cl, th, op := r.m.StatePcts()
-		t.Logf("%-15s | %9d | %9d | %9d | %9d | %10.1f | %7.2f | %7.2f | %7.2f | %8.2f | %8.2f | %9.1f | %8s",
+		t.Logf("%-15s | %9d | %9d | %9d | %9d | %10.1f | %8s",
 			r.name, s.TotalAllowed, s.TotalBlocked, s.TotalSuccesses, s.TotalFailures, r.m.MeshDelta(),
-			cl, th, op, r.m.MeanHealthyPct(), r.m.AvgCrashes(), r.m.MaxConcRatio(), r.wall.Round(time.Millisecond))
+			r.wall.Round(time.Millisecond))
 	}
 	t.Log(sep)
 
@@ -94,13 +92,13 @@ func printMeshResults(t *testing.T, results []meshResult, endS int) {
 		t.Log("  " + line)
 	}
 
-	t.Log("Node crashes (candidate: node xN, healthy%):")
+	t.Log("Node crashes (candidate: node xN, downtime%):")
 	for _, r := range results {
 		line := ""
 		for _, h := range r.m.Health {
 			if h.Crashes > 0 {
-				healthy := 100 * (1 - float64(h.DowntimeNS)/float64(r.m.SimNS))
-				line += fmt.Sprintf(" %s x%d (%s%%)", h.Name, h.Crashes, formatFloat(healthy))
+				downtime := 100 * float64(h.DowntimeNS) / float64(r.m.SimNS)
+				line += fmt.Sprintf(" %s x%d (%s%%)", h.Name, h.Crashes, formatFloat(downtime))
 			}
 		}
 		if line == "" {
@@ -149,13 +147,11 @@ func printMeshResults(t *testing.T, results []meshResult, endS int) {
 
 	// CSV block for extraction.
 	t.Log("CSV:")
-	t.Log("Candidate,Allowed,Blocked,Successes,Failures,MeshDelta,ClosedPct,ThrottledPct,OpenPct,HealthyPct,AvgCrashes,MaxConcRatio")
+	t.Log("Candidate,Allowed,Blocked,Successes,Failures,MeshDelta")
 	for _, r := range results {
 		s := r.m.Mesh.Snapshot()
-		cl, th, op := r.m.StatePcts()
-		t.Logf("%s,%d,%d,%d,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f",
-			r.name, s.TotalAllowed, s.TotalBlocked, s.TotalSuccesses, s.TotalFailures, r.m.MeshDelta(),
-			cl, th, op, r.m.MeanHealthyPct(), r.m.AvgCrashes(), r.m.MaxConcRatio())
+		t.Logf("%s,%d,%d,%d,%d,%.1f",
+			r.name, s.TotalAllowed, s.TotalBlocked, s.TotalSuccesses, s.TotalFailures, r.m.MeshDelta())
 	}
 }
 
@@ -176,8 +172,6 @@ func compareMesh(t *testing.T, results []meshResult, assert bool) {
 		verdict = "WIN"
 	}
 	t.Logf("Levee vs Static-Peak MeshDelta: Levee=%.1f Static-Peak=%.1f Lead=%.1f %s", ld, pd, ld-pd, verdict)
-	t.Logf("Levee vs Static-Peak Healthy%%:  Levee=%.2f Static-Peak=%.2f", lev.m.MeanHealthyPct(), peak.m.MeanHealthyPct())
-	t.Logf("Levee vs Static-Peak ConcRatio: Levee=%.1f Static-Peak=%.1f", lev.m.MaxConcRatio(), peak.m.MaxConcRatio())
 	if assert && ld <= pd {
 		t.Errorf("Levee MeshDelta %.1f did not beat Static-Peak %.1f at the reference config", ld, pd)
 	}
@@ -187,7 +181,7 @@ func formatFloat(f float64) string {
 	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.1f", f), "0"), ".")
 }
 
-// TestMeshBenchmark runs the full 20-minute 5-phase mesh scenario.
+// TestMeshBenchmark runs the full 30-minute mesh scenario.
 func TestMeshBenchmark(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping full mesh benchmark in short mode")

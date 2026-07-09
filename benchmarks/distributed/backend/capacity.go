@@ -82,6 +82,16 @@ func NewCapacityController(config CapacityControllerConfig) *CapacityController 
 	}
 }
 
+// WarmStart puts the controller at steady state: replicas clamped to
+// [MinReplicas, MaxReplicas], RPS estimator seeded, cooldown anchored at `at`.
+func (c *CapacityController) WarmStart(replicas int, rps float64, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.currentReplicas = max(c.config.MinReplicas, min(c.config.MaxReplicas, replicas))
+	c.currentRPS = rps
+	c.lastScaleUpTime = at
+}
+
 // CurrentCapacity returns the current throughput capacity in RPS.
 func (c *CapacityController) CurrentCapacity() int {
 	c.mu.RLock()
@@ -228,7 +238,7 @@ func (c *CapacityController) ResetAfterCrash() {
 	c.pendingReplicas = 0
 	c.pendingReadyAt = time.Time{}
 	c.lastScaleUpTime = time.Time{}
-	// Keep currentRPS and utilizationHistory — HPA remembers pre-crash demand
+	// Keep currentRPS and utilizationHistory -- HPA remembers pre-crash demand
 }
 
 // Status returns the current autoscaler status for monitoring.

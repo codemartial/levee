@@ -15,13 +15,15 @@ import (
 // micro-bursts without admitting sustained overload.
 //
 // Per-replica outbound concurrency limiter on edge N->M, via Little's Law:
-//   perInstanceMaxInflight =
-//     ceil(headroom * steadyEdgeRPS * subtreeMeanLatencyS(M) / designReplicas(N))
+//   meanInflight = steadyEdgeRPS * subtreeMeanLatencyS(M) / designReplicas(N)
+//   perInstanceMaxInflight = ceil(max(headroom * mean, mean + 3*sqrt(mean)))
 // where steadyEdgeRPS = p_edge * steadyInboundRPS(N), designReplicas is the
 // replica count the topology needs at steady state, and the subtree mean is
 // the expected end-to-end latency of a call into M (local mean plus deepest
 // probability-weighted sync branch, see Topology.SubtreeMeanLatencyMS).
-// Floor of 2 so probing is never single-file.
+// The 3-sigma term covers Poisson burstiness, which dominates at the small
+// per-instance means these limits take. Floor of 2 so probing is never
+// single-file.
 //
 // Per-replica outbound breaker config reuses the existing static configs by
 // the per-instance traffic volume each breaker actually sees, matching the
@@ -127,7 +129,8 @@ func staticNodeSizing(topo *Topology, steady map[string]float64, nodeIdx int) st
 	for e, edge := range n.Edges {
 		edgeRPS := edge.Prob * steady[n.Name]
 		subtreeS := topo.SubtreeMeanLatencyMS(edge.Callee, defaultHopMS) / 1000.0
-		maxInflight := int(math.Ceil(staticHeadroom * edgeRPS * subtreeS / float64(replicas)))
+		mean := edgeRPS * subtreeS / float64(replicas)
+		maxInflight := int(math.Ceil(math.Max(staticHeadroom*mean, mean+3*math.Sqrt(mean))))
 		if maxInflight < 2 {
 			maxInflight = 2
 		}

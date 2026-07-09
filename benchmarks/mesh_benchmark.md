@@ -64,15 +64,19 @@ Each node is an elastic-capacity processor:
   `CapacityController` as the distributed benchmark: 70% target utilization,
   15s evaluation, 30s provisioning lag. Scale-up decisions are immediate but
   capacity arrives 30s late. The HPA only sees admitted traffic.
+- Nodes warm-start at their design replica count with the HPA's demand
+  estimator seeded, modeling a mesh already in steady operation.
 - Worker concurrency per replica is sized by Little's Law from the node's
   mean latency. Queue wait emerges from slot contention (FIFO).
-- The node buffers up to 5 seconds' worth of demand at instantaneous
-  capacity (5 * perReplicaRPS * replicas requests, executing + queued).
-  Hitting the buffer limit is an immediate CRASH, not a shed.
-- A crash drops all in-flight work. Recovery takes 120s; the node restarts
-  at MinReplicas while the HPA remembers pre-crash demand and re-scales.
-- While crashed, arriving calls sit unanswered and fail at their root
-  deadline. Upstreams observe only timeouts, never the crash.
+- The node buffers up to 3 seconds' worth of demand at instantaneous
+  capacity (3 * perReplicaRPS * replicas requests, executing + queued).
+  Hitting the buffer limit is an immediate CRASH (queue saturation kills
+  every instance in the deployment), not a shed.
+- A crash drops all in-flight work and starts 120s of downtime; the node
+  then restarts at MinReplicas while the HPA remembers pre-crash demand
+  and re-scales.
+- During downtime, arriving calls sit unanswered and fail at their root
+  deadline. Upstreams observe only timeouts, never the downtime itself.
 - Physical occupancy is decoupled from logical outcomes: work whose root has
   already timed out keeps its slot until scheduled completion (work
   amplification). Deadline propagation stops post-timeout child dispatch.
@@ -81,8 +85,9 @@ Each node is an elastic-capacity processor:
 
 Governors are horizontally replicated like the nodes they run on: each node
 replica is a separate process with its own in-process governor instances,
-and admission round-robins across them (the load balancer). Scale-up adds
-cold instances; a crash kills all instances and recovery starts fresh ones
+and admission round-robins across them (the load balancer). Instances start
+at the node's design replica count (warm start), scale-up adds cold
+instances, and a crash kills all instances; recovery starts fresh ones
 at MinReplicas. The request's admitting replica also makes that request's
 downstream calls through its own client-side instances. The one exception is
 the static inbound rate limiter, which stays single-per-node (distributed
@@ -96,52 +101,83 @@ rate limiting).
   down.
 - **Static-Nominal**: node-level inbound token bucket at 1.5x steady-state
   design RPS (burst = 1s of tokens); per replica and per edge a max-inflight
-  limiter at ceil(1.5 * edgeRPS * subtreeMeanLatency / designReplicas),
-  chained with the existing `StaticCB`. The breaker consults `Start` before
-  the limiter so its OPEN -> HALF_OPEN clock always advances; a limiter
-  rejection cancels the admission so probe slots are not leaked. Config
+  limiter at ceil(max(1.5 * m, m + 3 * sqrt(m))), where m = edgeRPS *
+  subtreeMeanLatency / designReplicas is the mean per-instance inflight and
+  the 3-sigma term covers Poisson burstiness (dominant at these small
+  means), chained with the distributed suite's `StaticCB`. The breaker
+  consults `Start` before the limiter so its OPEN -> HALF_OPEN clock always
+  advances; a limiter rejection cancels the admission so probe slots are
+  not leaked. Config
   selection follows the documented derivation ranges in `static_cb.go` by
   the per-instance volume each breaker actually sees: BAU up to 800 RPS,
   Peak above (at realistic per-pod volumes, every mesh edge gets BAU).
   Sizing derivations are in `mesh/static.go`. The rate limiter is
   outcome-blind.
 - **Static-Peak**: same formulas with the 4x surge folded into the sizing,
-  i.e. tuned generously enough to admit the whole surge.
+  i.e. tuned generously enough to admit the whole planned peak. The x8
+  overcapacity surge (phase F) is deliberately beyond what any operator
+  would provision static configs for; it is unplanned load for every
+  candidate.
 - **No-Gov**: admits everything.
 
-## Scenario (20 simulated minutes, 5 phases)
+## Scenario (30 simulated minutes)
 
 | Phase | Window | Injection | What it probes |
 |---|---|---|---|
 | A steady | 0-180s | none | convergence; no spurious throttling |
-| B surge | 180-330s | edge-api arrivals x4 | fan-out amplification vs 30s scale lag |
+| B surge | 180-330s | edge-api arrivals x4, 5s ramp | fan-out amplification vs 30s scale lag |
 | B settle | 330-420s | none | return toward steady |
 | C degrade | 420-570s | db: latency x4, +15% errors | fan-in backpressure without cascade |
 | C settle | 570-660s | none | recovery speed (3s memory half-life) |
 | D crash | 660-780s | payments: latency x8 | branch crash; 120s recovery shielding |
 | E recovery | 780-1200s | none | return to CLOSED, no flapping |
+| F overcap | 1200-1350s | edge-api arrivals x8, 5s ramp | sustained load beyond MaxReplicas capacity |
+| F settle | 1350-1440s | none | return toward steady |
+| G bugstorm | 1440-1590s | catalog->inventory calls x10 | interior code-bug surge invisible to entries |
+| H recovery | 1590-1800s | none | full-run recovery, no residual flapping |
 
-The phase-D injection collapses payments' effective throughput ~8x below its
-inbound rate; its queue saturates and it crashes within ~15s unless upstream
-governors shed load. Levee's ~3s EWMA half-life lets settle windows decay most
-short-lived memory, reducing phase carryover.
+The phase-D injection cuts payments' effective throughput ~8x below its
+inbound rate; its queue saturates and it crashes within ~15s unless
+upstream governors shed load. Levee's ~3s EWMA half-life lets settle windows
+decay most short-lived memory, reducing phase carryover.
+
+Phase F is qualitatively different from phase B: at x8, edge-api's inbound
+(2400 RPS) exceeds even its fully scaled capacity (16 replicas x 100 RPS),
+so no amount of autoscaling absorbs it; the mesh must shed most of the
+entry stream for 150 straight seconds or crash. Phase G models a shipped
+code bug (cache bypass plus retries): each catalog request makes ~10
+inventory calls instead of ~0.5, driving inventory to ~1370 RPS against its
+1200 RPS replica ceiling. The stressor originates mid-mesh, so entry
+governors can see it only through subtree outcomes.
+
+Both surge phases ramp linearly over 5 seconds rather than stepping
+instantaneously: an origin behind an edge network never sees a 0 ms step,
+because user arrivals and CDN/LB connection pools spread an onset over
+seconds. The ramp width interacts with the feedback physics. The earliest
+outcome signal a feedback governor can observe is a root timeout at 1.5 s,
+and at x8 the 5 s onset fills the 3 s entry buffer roughly a second after
+that first signal -- too late to shed inflow below capacity. Phase F is
+therefore beyond the entry's reaction window by construction: it measures
+what a governor does when preventing the entry crash is not possible, not
+whether it can prevent it.
+
+Injections are non-overlapping, so each phase attributes any regression to
+exactly one stressor. Compound-failure scenarios (surge during degradation)
+are out of scope.
 
 ## What is measured
 
-- **State dwell**: duration-weighted % of governor-role lifetime in
-  CLOSED / THROTTLED / OPEN(+HALF_OPEN). For the static stack, limiter
-  saturation is reported as THROTTLED and breaker-open as OPEN, so heavy
-  static shedding cannot masquerade as CLOSED.
+- **Per-role state dwell** (diagnostic): for each Levee governor role with
+  non-CLOSED time, the % of its lifetime spent THROTTLED and OPEN plus the
+  state-transition count. This shows where and how shedding happened, and
+  the transition counts are the flapping detector.
 - **Delta scores**: the suite-standard throughput-weighted epoch score,
   Delta = (SuccessScore - FailureScore) * Allowed / (Allowed + Blocked),
   computed per entry point on end-to-end outcomes and for the combined mesh
-  stream. Entry requests reaching a crashed entry node count as allowed
-  failures (nothing admitted or blocked them).
-- **Node health**: mean % healthy lifetime and average crashes per node.
-- **Concurrency amplification**: max over nodes of peak/avg backlog
-  (executing + queued). Note this ratio penalizes governors that keep
-  average backlog near zero; read it together with the dwell and health
-  columns.
+  stream. Entry requests arriving during entry-node downtime count as
+  allowed failures (nothing admitted or blocked them).
+- **Node crashes**: per-candidate crash counts and per-node downtime%,
+  reported as a diagnostic listing.
 
 ## Determinism and comparability
 
@@ -156,45 +192,68 @@ admission, and observed outcomes differ by candidate.
 ## Results (seed 20241225, full scenario)
 
 ```
-Candidate       |   Allowed |   Blocked |   Success |  Failures |  MeshDelta | Closed% |  Throt% |   Open% | Healthy% | AvgCrash | ConcRatio
-No-Gov          |    519805 |         0 |    216186 |    303619 |    -7819.3 |  100.00 |    0.00 |    0.00 |    95.00 |     0.50 |      82.1
-Levee           |    360233 |    159572 |    330511 |     29722 |     5848.1 |   84.99 |    6.86 |    8.16 |   100.00 |     0.00 |     112.2
-Static-Nominal  |    408302 |    111503 |    107211 |    301091 |    -4431.3 |   73.70 |    4.46 |   21.84 |   100.00 |     0.00 |      65.9
-Static-Peak     |    519805 |         0 |     95097 |    424708 |   -13368.2 |   76.22 |    2.17 |   21.61 |    98.00 |     0.20 |      82.1
+Candidate       |   Allowed |   Blocked |   Success |  Failures |  MeshDelta
+No-Gov          |   1018091 |         0 |    242983 |    775108 |   -25256.5
+Levee           |    822245 |    195846 |    416392 |    405853 |   -12251.0
+Static-Nominal  |    622450 |    395641 |    505943 |    116507 |     5005.3
+Static-Peak     |   1018091 |         0 |    273586 |    744505 |   -24643.3
 
-Crashes: No-Gov: edge-api x2, db x2, payments x1. Static-Peak: edge-api x2.
-         Levee and Static-Nominal: none.
+Crashes: No-Gov: edge-api x7, inventory x2, db x2, payments x1.
+         Static-Peak: edge-api x7. Levee: edge-api x2 (overcap),
+         inventory x1 (bugstorm). Static-Nominal: none.
 ```
 
-How each candidate fails, and how Levee does not:
+How each candidate fares:
 
-- **No-Gov** crashes edge-api twice in the surge, db twice under load and
-  degradation, and payments in phase D. Every crash is a 120s outage plus a
-  timeout storm at the entries.
-- **Static-Peak** is sized to admit the surge, so the surge crashes edge-api
-  exactly like No-Gov: a rate limiter tuned for the peak does not prevent the
-  entry-node queue from saturating before autoscaling catches up. Its
-  per-replica breakers then spend over a fifth of governor lifetime OPEN
-  across the incident phases, converting a 15% error rate into 100% blocking
-  on tripped edges.
-- **Static-Nominal** never crashes anything -- by clamping the mesh to 1.5x
-  steady state, forfeiting most of the surge. In phase C its breakers do
-  trip on the degraded db, but in this scenario the binary breaker
-  overcorrects: OPEN 22% of governor lifetime, oscillating between blocking
-  healthy traffic and re-admitting failing traffic (failures ~301k despite
-  zero crashes).
-- **Levee** crashes nothing, admits 3.1x Static-Nominal's successful
-  traffic, and posts the only positive MeshDelta at both entries.
+- **No-Gov** crashes twelve times: edge-api twice in the surge and twice
+  in the overcap, db twice under degradation, payments in phase D, and
+  inventory twice in the bugstorm. It also exposes a recovery trap: a
+  crashed entry restarts at MinReplicas into full unshed traffic, refills
+  its 3s buffer before re-scaled capacity arrives (30s provisioning lag),
+  and crashes again -- three more edge-api crashes ride that loop after
+  the overcap ends, at plain steady load, for 44% entry downtime.
+- **Static-Peak** is sized to admit the whole planned x4 peak, so both
+  surges pour straight into the entry queue and it matches No-Gov's seven
+  edge-api crashes. A rate limiter tuned for the peak does not prevent
+  queue saturation while autoscaling lags; it only prevents shedding.
+- **Static-Nominal** never crashes anything by clamping the mesh to 1.5x
+  steady state, forfeiting both surges wholesale -- including phase-B
+  traffic the mesh demonstrably had capacity to serve. The clamp makes it
+  the only candidate with a positive MeshDelta: against an onset faster
+  than feedback, a pre-installed hard cap is the only thing that keeps
+  the entry up.
+- **Levee** wins every phase that feedback can decide: it serves the full
+  planned surge with no crash and no clamp (B), throttles around the
+  degraded db (C), sheds the dying payments branch at the entries (D),
+  and holds inventory to one bugstorm crash where No-Gov takes two (G).
+  Phase F is what drives its aggregate negative: the 5s onset outruns the
+  entry's signal window, edge-api crashes twice (13.3% entry downtime),
+  and 240s of outage at the highest-volume entry scores as a stream of
+  allowed failures. It still beats every non-clamped candidate by over
+  12k MeshDelta, and once the unplanned load passes its entry recovers
+  and stays up: shedding holds inflow off the refilling buffer, where
+  No-Gov keeps crash-looping at plain steady load.
 
-How Levee wins is more important than the raw margin. During the surge, entry
-and downstream instances enter THROTTLED rather than flipping fully OPEN, so
-the mesh keeps capacity-matched work flowing while the autoscaler catches up.
-When db degrades, the db-facing roles throttle without forcing unrelated
-edges to stop, preserving sibling traffic that can still complete. When the
-payments branch collapses, failures surface through subtree outcomes at the
-entry nodes, so admission shifts toward the point of origin: requests that
-cannot complete are shed before they consume service time and queue space
-several hops downstream.
+Phase F's outcome is signal-window physics, not tuning. edge-api's first
+hint of the overcap is a root timeout 1.5s after the onset; by then the
+5s ramp has the 3s buffer well into filling, and it saturates about a
+second later -- before shedding can cut inflow below capacity. A feedback
+governor cannot prevent a crash it cannot yet observe. Static-Nominal
+holds the entry because its token bucket does not need to observe
+anything; the same blindness is why it forfeits the servable phase-B
+surge wholesale.
+
+Where Levee's adaptivity shows is in the phases that require judgment
+rather than a fixed cap. During the planned surge, entry and downstream
+instances enter THROTTLED rather than flipping fully OPEN, keeping
+capacity-matched work flowing while the autoscaler catches up. When db
+degrades, the db-facing roles throttle without forcing unrelated edges to
+stop, preserving sibling traffic that can still complete. When the
+payments branch crashes, failures surface through subtree outcomes at the
+entry nodes, so admission shifts toward the point of origin. And in the
+bugstorm, catalog's amplified inventory calls are shed at the
+catalog->inventory edge, holding inventory to a single crash under an
+injection that fells it twice without governance.
 
 Two more mesh-mode behaviors make that work without coordination. The async
 callback edge (notify -> orders) parks OPEN/THROTTLED during stress, shedding
@@ -203,21 +262,29 @@ And the server-side inbound instances provide a second line of defence under
 fan-in that does not depend on how many callers or replicas happen to be
 active. Per-replica instances each adapt on 1/R of a node's traffic, so
 high-replica nodes converge a little slower than a single shared instance
-would; Levee still wins with that handicap.
+would.
 
 ## Model scope
 
-The scenario is about overload, degradation, crash recovery, and scale-up
-lag. Scale-down is effectively outside the run: the capacity controller uses a
-600s scale-down delay inside a 20-minute scenario, so replicas that arrive
-during an incident remain available through the settle windows.
+The scenario is about overload, degradation, crash recovery, and
+scale-up lag. Scale-down plays a minor role: the capacity controller uses a
+600s scale-down delay, so replicas that arrive during an incident remain
+available through the following settle windows, though capacity added early
+in the run may begin draining in the back half of the 30-minute timeline.
+
+Async edges model best-effort RPC callbacks (webhook-style): a rejected
+dispatch is silently dropped and a callback lives or dies within one root
+timeout. Durable-queue notification paths, which convert overload into
+delay instead of loss, are out of scope. Governors see async calls exactly
+as they see sync calls -- same admission decisions, same Success/Fail
+feedback -- only the parent's indifference to the outcome differs.
 
 ## Run it
 
 From the `benchmarks/` directory:
 
 ```
-# Full 5-phase scenario, ~2s wall per candidate
+# Full 30-minute scenario, a few seconds wall per candidate
 go test -v -run '^TestMeshBenchmark$' -timeout 10m
 
 # Phases A+B only, for quick iteration

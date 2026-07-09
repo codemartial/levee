@@ -1,8 +1,6 @@
 package mesh
 
 import (
-	"math"
-
 	"github.com/codemartial/levee"
 	"github.com/codemartial/levee/benchmarks/distributed/api"
 	"github.com/codemartial/levee/benchmarks/distributed/app"
@@ -15,13 +13,6 @@ type NodeHealthStat struct {
 	DowntimeNS int64
 }
 
-// ConcStat is per-node concurrency (backlog = executing + queued).
-type ConcStat struct {
-	Name string
-	Peak int
-	Avg  float64
-}
-
 // MeshMetrics aggregates one candidate run. Entry scorers reuse the
 // distributed suite's epoch scoring so Deltas are comparable across suites.
 type MeshMetrics struct {
@@ -30,7 +21,6 @@ type MeshMetrics struct {
 	Mesh       *app.CBMetrics
 	Roles      []*RoleTracker
 	Health     []NodeHealthStat
-	Conc       []ConcStat
 	SimNS      int64
 
 	engine *Engine
@@ -41,7 +31,6 @@ func newMeshMetrics(e *Engine) *MeshMetrics {
 		Entry:  make(map[string]*app.CBMetrics),
 		Mesh:   &app.CBMetrics{},
 		Health: make([]NodeHealthStat, len(e.nodes)),
-		Conc:   make([]ConcStat, len(e.nodes)),
 		engine: e,
 	}
 	for _, ni := range e.entries {
@@ -51,7 +40,6 @@ func newMeshMetrics(e *Engine) *MeshMetrics {
 	}
 	for i, n := range e.topo.Nodes {
 		m.Health[i].Name = n.Name
-		m.Conc[i].Name = n.Name
 	}
 	return m
 }
@@ -90,7 +78,7 @@ func (m *MeshMetrics) addDowntime(node int, sinceNS, untilNS, endNS int64) {
 	}
 }
 
-// finalize flushes scorers, trackers, and per-node integrals.
+// finalize flushes scorers, trackers, and per-node counters.
 func (m *MeshMetrics) finalize(endNS int64) {
 	m.SimNS = endNS
 	m.Mesh.Finalize()
@@ -99,14 +87,6 @@ func (m *MeshMetrics) finalize(endNS int64) {
 	}
 	for i, n := range m.engine.nodes {
 		m.Health[i].Crashes = n.crashCount
-		m.Conc[i].Peak = n.peakConc
-		span := endNS
-		if n.lastConcNS > span {
-			span = n.lastConcNS
-		}
-		if span > 0 {
-			m.Conc[i].Avg = n.concSumNS / float64(span)
-		}
 		for _, rt := range n.gov.Roles() {
 			rt.Flush(endNS)
 			m.Roles = append(m.Roles, rt)
@@ -134,23 +114,6 @@ func (m *MeshMetrics) EntryDelta(name string) float64 {
 	return Delta(m.Entry[name].Snapshot())
 }
 
-// StatePcts returns duration-weighted percentages over all governor roles.
-func (m *MeshMetrics) StatePcts() (closed, throttled, open float64) {
-	var dur [numBuckets]int64
-	var total int64
-	for _, rt := range m.Roles {
-		for b := 0; b < numBuckets; b++ {
-			dur[b] += rt.DurNS[b]
-			total += rt.DurNS[b]
-		}
-	}
-	if total == 0 {
-		return 100, 0, 0
-	}
-	pct := func(b int) float64 { return 100 * float64(dur[b]) / float64(total) }
-	return pct(bucketClosed), pct(bucketThrottled), pct(bucketOpen)
-}
-
 // MeanHealthyPct is the mean over nodes of percent lifetime not crashed.
 func (m *MeshMetrics) MeanHealthyPct() float64 {
 	if len(m.Health) == 0 || m.SimNS == 0 {
@@ -161,28 +124,4 @@ func (m *MeshMetrics) MeanHealthyPct() float64 {
 		sum += 100 * (1 - float64(h.DowntimeNS)/float64(m.SimNS))
 	}
 	return sum / float64(len(m.Health))
-}
-
-// AvgCrashes is the mean crash count per node.
-func (m *MeshMetrics) AvgCrashes() float64 {
-	if len(m.Health) == 0 {
-		return 0
-	}
-	total := 0
-	for _, h := range m.Health {
-		total += h.Crashes
-	}
-	return float64(total) / float64(len(m.Health))
-}
-
-// MaxConcRatio is max over nodes of peak/avg concurrency; a burstiness and
-// concurrency-amplification indicator.
-func (m *MeshMetrics) MaxConcRatio() float64 {
-	ratio := 0.0
-	for _, c := range m.Conc {
-		if c.Avg > 0 {
-			ratio = math.Max(ratio, float64(c.Peak)/c.Avg)
-		}
-	}
-	return ratio
 }

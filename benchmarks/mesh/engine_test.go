@@ -168,7 +168,7 @@ func TestParallelFanoutFinishInvariant(t *testing.T) {
 func TestTimeoutIsOnlyCrashSignal(t *testing.T) {
 	topo := NewTopology([]NodeSpec{
 		ampleNode("a", 20, EdgeSpec{Callee: "b", Prob: 1.0}),
-		// Slow and tiny: service rate ~4/s against ~20 RPS, buffer 10 -> crash.
+		// Slow and tiny: service rate ~4/s against ~20 RPS, buffer 6 -> crash.
 		{Name: "b", PerReplicaRPS: 2, MinReplicas: 1, MaxReplicas: 1, P50MS: 500, P99MS: 900},
 	})
 	var rec []spyEvent
@@ -217,9 +217,15 @@ func TestTimeoutDoesNotFreeCapacity(t *testing.T) {
 			s.TotalSuccesses, s.TotalFailures, s.TotalAllowed)
 	}
 	// Occupancy outlives the logical timeout: work drains well past sim end.
-	if eng.nodes[0].lastConcNS < eng.endNS+2e9 {
+	var lastBusyNS int64
+	for _, slotFreeNS := range eng.nodes[0].workers {
+		if slotFreeNS > lastBusyNS {
+			lastBusyNS = slotFreeNS
+		}
+	}
+	if lastBusyNS < eng.endNS+2e9 {
 		t.Errorf("a's occupancy ended at %.2fs; timed-out work should have held slots past %.2fs",
-			float64(eng.nodes[0].lastConcNS)/1e9, float64(eng.endNS+2e9)/1e9)
+			float64(lastBusyNS)/1e9, float64(eng.endNS+2e9)/1e9)
 	}
 	// Deadline propagation: no children dispatched after the root timed out.
 	if got := countSpy(rec, "b", "in-start"); got != 0 {
@@ -246,9 +252,42 @@ func TestAsyncCycleTTL(t *testing.T) {
 	}
 }
 
+func TestEdgeCallAmplification(t *testing.T) {
+	topo := NewTopology([]NodeSpec{
+		ampleNode("a", 20, EdgeSpec{Callee: "b", Prob: 0.5}),
+		ampleNode("b", 0),
+	})
+	var rec []spyEvent
+	// Prob 0.5 amplified x5 = 2.5 expected calls per request: 2 always + 1 coin flip.
+	phases := []Phase{{Name: "bug", StartS: 0, EndS: 60,
+		EdgeCallMult: map[string]float64{"a->b": 5}}}
+	m := NewEngine(topo, newSpyCandidate(&rec), phases, testSLO, DefaultSeed).Run(5)
+
+	roots := int(m.Mesh.Snapshot().TotalAllowed)
+	if roots == 0 {
+		t.Fatal("no roots")
+	}
+	ratio := float64(countSpy(rec, "a", "out-start")) / float64(roots)
+	if ratio < 2.2 || ratio > 2.8 {
+		t.Errorf("amplified calls per root: got %.2f want ~2.5", ratio)
+	}
+}
+
+func TestEdgeCallMultUnknownKeyPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("unknown EdgeCallMult key should panic at engine construction")
+		}
+	}()
+	topo := NewTopology([]NodeSpec{ampleNode("a", 20)})
+	phases := []Phase{{Name: "typo", StartS: 0, EndS: 60,
+		EdgeCallMult: map[string]float64{"a->nosuch": 5}}}
+	NewEngine(topo, NewNoGovCandidate(), phases, testSLO, DefaultSeed)
+}
+
 func TestCrashOnSaturationAndRecovery(t *testing.T) {
 	topo := NewTopology([]NodeSpec{
-		// Buffer = 5*10*1 = 50 against ~100 RPS inflow with slow service.
+		// Buffer = 3*10*1 = 30 against ~100 RPS inflow with slow service.
 		{Name: "frail", EntryRPS: 100, PerReplicaRPS: 10, MinReplicas: 1, MaxReplicas: 4, P50MS: 400, P99MS: 800},
 	})
 	eng := NewEngine(topo, NewNoGovCandidate(), nil, testSLO, DefaultSeed)
@@ -263,8 +302,8 @@ func TestCrashOnSaturationAndRecovery(t *testing.T) {
 		t.Errorf("conservation through crash: %d + %d != %d", s.TotalSuccesses, s.TotalFailures, s.TotalAllowed)
 	}
 	downS := float64(m.Health[0].DowntimeNS) / 1e9
-	if downS < 98 || downS > 100 {
-		t.Errorf("downtime %.1fs; crash should occur within ~2s and last through sim end", downS)
+	if downS < 96 || downS > 100 {
+		t.Errorf("downtime %.1fs; crash should occur within ~4s and last through sim end", downS)
 	}
 	if m.MeanHealthyPct() > 5 {
 		t.Errorf("healthy pct %.1f%% too high for a node crashed almost all run", m.MeanHealthyPct())
