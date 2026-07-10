@@ -198,8 +198,14 @@ func NewPrescientMetrics() *PrescientMetrics {
 	}
 }
 
-// effectiveState returns the state for categorization purposes
+// effectiveState returns the state for categorization purposes. THROTTLED and
+// HALF_OPEN count as OPEN: throttling is an act of detection, and collapsing
+// OPEN <-> HALF_OPEN probe cycles keeps one sustained incident from producing
+// a stream of late-detection classifications.
 func effectiveState(s levee.State) levee.State {
+	if s == levee.THROTTLED || s == levee.HALF_OPEN {
+		return levee.OPEN
+	}
 	return s
 }
 

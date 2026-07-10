@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Added
+
+- Proactive surge protection: a CLOSED (uncapped) breaker now trips to
+  THROTTLED on congestion, before any failure evidence exists. The mechanism
+  is a spring. While uncapped the breaker publishes a stretch onset -- an
+  upper bound on the 1e-8 Poisson tail of healthy inflight around its
+  Little's-law operating point (goodput x latency) -- and inflight beyond it
+  loads a strain integral at a rate proportional to the fractional stretch.
+  Proof of health relaxes it: completions prove capacity at completion rate
+  x pre-surge latency (Little's law again), raising the base the stretch is
+  measured against; a spent strain budget (one evaluation interval at unit
+  stretch) trips, seeded at the proven capacity rather than the failure
+  path's half-of-observed. Urgency scales continuously with spike size --
+  time to trip is budget/stretch -- with no fixed confirmation window,
+  latency multiplier, or hold timers. Capacity proven past the EWMA
+  estimates persists as an excess decaying at the goodput half-life, whether
+  the proof came from an armed window or from a throttled span that served
+  its standing load at a healthy error rate, so recovery never re-trips on
+  demand it has already demonstrated is servable. Strain survives a surge
+  trip and relaxes only during calm uncapped time, so a re-flood right after
+  recovery re-trips instantly. This closes the arrival-flood gap where queue
+  saturation outruns the first outcome signal: in the mesh benchmark's
+  overcap phase (8x load beyond max autoscaled capacity, 5s onset) the entry
+  sheds within ~100ms of onset and never crashes, flipping the mesh result
+  from -12251 to +8587 MeshDelta (best of field). The admission fast path
+  stays lock-free at one extra atomic load (~4% on `BenchmarkThroughput`);
+  the surge state fits in a 304-byte Levee struct. See EVOLUTION.md sections
+  3.8 and 3.9.
+
 ### Engineering hardening
 
 - Continuous integration on GitHub Actions: build, `go vet`, race-enabled tests,

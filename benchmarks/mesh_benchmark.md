@@ -157,9 +157,12 @@ seconds. The ramp width interacts with the feedback physics. The earliest
 outcome signal a feedback governor can observe is a root timeout at 1.5 s,
 and at x8 the 5 s onset fills the 3 s entry buffer roughly a second after
 that first signal -- too late to shed inflow below capacity. Phase F is
-therefore beyond the entry's reaction window by construction: it measures
-what a governor does when preventing the entry crash is not possible, not
-whether it can prevent it.
+therefore beyond the reaction window of outcome feedback by construction:
+a governor that waits for failure evidence cannot prevent the entry crash.
+Admission-side congestion signals (inflight climbing past the healthy
+operating point) are available within the first few hundred milliseconds
+of the onset, so in practice the phase separates governors by which signal
+they act on.
 
 Injections are non-overlapping, so each phase attributes any regression to
 exactly one stressor. Compound-failure scenarios (surge during degradation)
@@ -194,13 +197,15 @@ admission, and observed outcomes differ by candidate.
 ```
 Candidate       |   Allowed |   Blocked |   Success |  Failures |  MeshDelta
 No-Gov          |   1018091 |         0 |    242983 |    775108 |   -25256.5
-Levee           |    822245 |    195846 |    416392 |    405853 |   -12251.0
+Levee           |    639035 |    379056 |    592268 |     46767 |     8587.3
 Static-Nominal  |    622450 |    395641 |    505943 |    116507 |     5005.3
 Static-Peak     |   1018091 |         0 |    273586 |    744505 |   -24643.3
 
 Crashes: No-Gov: edge-api x7, inventory x2, db x2, payments x1.
-         Static-Peak: edge-api x7. Levee: edge-api x2 (overcap),
-         inventory x1 (bugstorm). Static-Nominal: none.
+         Static-Peak: edge-api x7. Levee: none. Static-Nominal: none.
+
+Per-entry Delta: Levee edge-api=8103.2 admin-api=670.4;
+                 Static-Nominal edge-api=4534.8 admin-api=643.5.
 ```
 
 How each candidate fares:
@@ -218,30 +223,40 @@ How each candidate fares:
   queue saturation while autoscaling lags; it only prevents shedding.
 - **Static-Nominal** never crashes anything by clamping the mesh to 1.5x
   steady state, forfeiting both surges wholesale -- including phase-B
-  traffic the mesh demonstrably had capacity to serve. The clamp makes it
-  the only candidate with a positive MeshDelta: against an onset faster
-  than feedback, a pre-installed hard cap is the only thing that keeps
-  the entry up.
-- **Levee** wins every phase that feedback can decide: it serves the full
-  planned surge with no crash and no clamp (B), throttles around the
-  degraded db (C), sheds the dying payments branch at the entries (D),
-  and holds inventory to one bugstorm crash where No-Gov takes two (G).
-  Phase F is what drives its aggregate negative: the 5s onset outruns the
-  entry's signal window, edge-api crashes twice (13.3% entry downtime),
-  and 240s of outage at the highest-volume entry scores as a stream of
-  allowed failures. It still beats every non-clamped candidate by over
-  12k MeshDelta, and once the unplanned load passes its entry recovers
-  and stays up: shedding holds inflow off the refilling buffer, where
-  No-Gov keeps crash-looping at plain steady load.
+  traffic the mesh demonstrably had capacity to serve. The clamp keeps
+  its score positive, but it trails Levee on successes and MeshDelta
+  alike: blind pre-provisioning buys crash immunity at the price of every
+  servable surge it refuses.
+- **Levee** posts the top MeshDelta, the most successes, and zero
+  crashes. It wins every phase that feedback can decide: it serves the
+  full planned surge with no crash and no clamp (B), throttles around the
+  degraded db (C), and sheds the dying payments branch at the entries
+  (D). In the two phases built to outrun outcome feedback it trips on
+  congestion instead: the overcap flood (F) and the bugstorm's amplified
+  inventory traffic (G) are both shed before the first timeout can
+  report, so edge-api and inventory stay up through injections that
+  crash them under every non-clamped alternative.
 
-Phase F's outcome is signal-window physics, not tuning. edge-api's first
-hint of the overcap is a root timeout 1.5s after the onset; by then the
-5s ramp has the 3s buffer well into filling, and it saturates about a
-second later -- before shedding can cut inflow below capacity. A feedback
-governor cannot prevent a crash it cannot yet observe. Static-Nominal
-holds the entry because its token bucket does not need to observe
-anything; the same blindness is why it forfeits the servable phase-B
-surge wholesale.
+Phase F is decided by which signal a governor acts on. The first outcome
+signal -- a root timeout at 1.5s -- arrives about a second before the
+entry buffer saturates: too late, as No-Gov's and Static-Peak's seven
+edge-api crashes attest. Levee does not wait for outcomes. While
+uncapped it publishes a stretch onset just past the statistical noise
+of its Little's-law healthy operating point (goodput x latency); the
+x8 flood crosses that within ~100ms of onset and starts loading the
+surge spring, at a rate proportional to how far past health the flood
+stretches. Completions could relax the spring by proving the new
+concurrency healthy (completion rate x pre-surge latency, Little's law
+again), but a real flood proves nothing -- its completions show rate
+pinned at capacity -- so the strain budget is spent in a fraction of
+an evaluation window and admission snaps to the proven capacity. The
+unservable load is shed as Blocked instead of queueing into a crash,
+and the autoscaler keeps scaling on the admitted stream. Under
+sustained overcap, the strain stays loaded across each trip, so
+recovery probes that re-breach re-trip immediately and spill only a
+bounded burst. Static-Nominal survives the
+same phase by never observing anything; that same blindness is why it
+forfeits the servable phase-B surge wholesale.
 
 Where Levee's adaptivity shows is in the phases that require judgment
 rather than a fixed cap. During the planned surge, entry and downstream
@@ -252,8 +267,9 @@ stop, preserving sibling traffic that can still complete. When the
 payments branch crashes, failures surface through subtree outcomes at the
 entry nodes, so admission shifts toward the point of origin. And in the
 bugstorm, catalog's amplified inventory calls are shed at the
-catalog->inventory edge, holding inventory to a single crash under an
-injection that fells it twice without governance.
+catalog->inventory edge while inventory's own inbound instances trip on
+the congestion, keeping it up under an injection that fells it twice
+without governance.
 
 Two more mesh-mode behaviors make that work without coordination. The async
 callback edge (notify -> orders) parks OPEN/THROTTLED during stress, shedding

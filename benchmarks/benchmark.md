@@ -27,7 +27,8 @@ This lets us compute exactly how each CB deviates from ideal behavior.
 
 ### State Transition Classifications
 
-Each CB state change is classified relative to Prescient:
+Each CB state change is classified relative to Prescient. For classification,
+THROTTLED and HALF_OPEN count as open: throttling is an act of detection.
 
 | Classification | Meaning |
 |----------------|---------|
@@ -96,9 +97,9 @@ The benchmark produces a comparative summary:
 Candidate       |    Blocked |    Allowed | Flap | FalseAlarm | LateDetect |   BadTraffic | LostBusiness | TotalPenalty
 ----------------------------------------------------------------------------------------------------------------------------------
 Prescient       |     773832 |   55751328 |    0 |          0 |          0 |            0 |            0 |            0
-Levee           |    3989544 |   52535616 |    1 |          3 |          0 |         1679 |         4435 |         6114
-Static-Peak     |    3737675 |   52787485 |    4 |          0 |          1 |        24363 |         5623 |        29986
-Static-BAU      |    4249310 |   52275850 |   35 |          8 |          0 |        13032 |        29844 |        42875
+Levee           |    4084069 |   52441091 |    4 |          1 |          0 |         3449 |        11728 |        15177
+Static-Peak     |    3737675 |   52787485 |    4 |          0 |          1 |        24431 |         5636 |        30067
+Static-BAU      |    4249310 |   52275850 |   35 |          8 |          0 |        13201 |        29892 |        43093
 ```
 
 ## The Candidates
@@ -128,9 +129,15 @@ Static-BAU      |    4249310 |   52275850 |   35 |          8 |          0 |    
 
 The results illustrate the **sensitivity vs. specificity trade-off** that static configurations fail at.
 
-- **Levee**: Low flapping and false alarms. No late detection.
-  Lowest BadTraffic (13x lower than Static-Peak, 7x lower than Static-BAU).
-  Lowest TotalPenalty at 6,114 — almost 5x better than Static-Peak, ~ 7x better than Static-BAU.
+- **Levee**: Lowest TotalPenalty at ~15.2k -- 2x better than Static-Peak,
+  ~2.8x better than Static-BAU. Lowest BadTraffic (7x lower than
+  Static-Peak, ~3.8x lower than Static-BAU), no late detections, minimal
+  flapping, and a single false alarm. The elevated LostBusiness (~11.7k)
+  is the open-loop cost of surge detection: proactive congestion trips on
+  healthy floods that the failure-scoring oracle would allow. That trade
+  buys the crash prevention shown in the closed-loop
+  [distributed](distributed_benchmark.md) and [mesh](mesh_benchmark.md)
+  suites, which this open-loop benchmark cannot capture.
 - **Static-Peak**: Conservative (low LostBusiness, minimal flapping)
   but slow to detect (high BadTraffic at ~ 24k)
 - **Static-BAU**: The most likely configuration is also the worst
@@ -138,7 +145,7 @@ The results illustrate the **sensitivity vs. specificity trade-off** that static
 
 ## Limitations
 
-This benchmark is *open-loop*: circuit breaker actions do not influence the state of the upstream caller or the downstream dependency. This specifically fails to capture the benefits of Levee's concurrency limiting. The [distributed benchmark](distributed_benchmark.md) addresses this with a closed-loop simulation where CB decisions affect backend load, autoscaling, and crash behaviour — revealing that Levee's concurrency control (1,913 max concurrent vs 7,000+ for static CBs) prevents backend crashes that this benchmark cannot capture.
+This benchmark is *open-loop*: circuit breaker actions do not influence the state of the upstream caller or the downstream dependency. This specifically fails to capture the benefits of Levee's concurrency limiting. The [distributed benchmark](distributed_benchmark.md) addresses this with a closed-loop simulation where CB decisions affect backend load, autoscaling, and crash behaviour -- revealing that Levee's concurrency control (1,156 max concurrent vs 5,000-7,000+ for static CBs) prevents backend crashes that this benchmark cannot capture.
 
 As with all things automated, explainability and predictability are
 inversely proportional to the decision-making capacity of the

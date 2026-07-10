@@ -13,28 +13,33 @@ carefully hand-tuned static circuit breakers.
   node crashes. Levee wins every load variation, by the widest margins under extreme
   overload.
 
-- **[Mesh benchmark](mesh_benchmark.md)** -- a 10-node service mesh with up to
-  227 live Levee instances, where every replica runs Levee for inbound and
+- **[Mesh benchmark](mesh_benchmark.md)** -- a 10-node service mesh with hundreds
+  of live Levee instances, where every replica runs Levee for inbound and
   per-edge outbound admission against a static rate limiter + circuit breaker +
-  concurrency limiter stack. Through a surge, deep-dependency degradation, and a
-  branch crash, Levee is the only candidate with zero node crashes and a
-  positive score.
+  concurrency limiter stack. Through a planned surge, deep-dependency
+  degradation, a branch crash, an arrival flood beyond maximum autoscaled
+  capacity, and an interior call-amplification bug storm, Levee posts the top
+  score with zero node crashes.
 
-All suites run on logical time, so results are deterministic and reproducible: no
-wall-clock sleeps, no flakiness.
+The closed-loop suites (distributed and mesh) run on logical time with fixed
+seeds, so their results are bit-reproducible. The open-loop suite's decision
+counts are seeded and reproducible too.
 
 ## Headline results
 
 ### Mesh suite
 
-In the 10-node mesh scenario, where up to 227 Levee instances operate without
-shared state:
+In the 10-node, 30-minute mesh scenario, where hundreds of Levee instances
+operate without shared state:
 
-- **Only positive mesh score, with zero node crashes**: Levee posts +5,848
-  MeshDelta; Static-Nominal avoids crashes but scores -4,431, while No-Gov and
-  Static-Peak crash nodes.
-- **3.1x the successful traffic of the crash-free static stack**: 330,511
-  successful entry requests for Levee versus 107,211 for Static-Nominal.
+- **Top mesh score, most successes, zero node crashes**: Levee posts +8,587
+  MeshDelta with 592,268 successful entry requests; the pre-provisioned
+  Static-Nominal clamp survives too but forfeits both surges (+5,005, 505,943
+  successes), while No-Gov and Static-Peak crash the entry seven times each.
+- **Sheds arrival floods before the first failure exists**: the overcap phase
+  drives 8x load past maximum autoscaled capacity with an onset faster than
+  outcome feedback; Levee's surge trip fires on congestion (inflight vs its
+  Little's-law healthy point) within ~100ms and keeps the entry up.
 - **Origin-side protection emerges from mesh operation**: because inbound
   Levee instances record subtree outcomes, failures several hops down push
   entry points to shed work before downstream service time and queue space are
@@ -46,11 +51,13 @@ Full tables and methodology in [mesh_benchmark.md](mesh_benchmark.md).
 
 Across a simulated 28-hour Cyber Monday, versus carefully hand-tuned static breakers:
 
-- **Wins 20/20** configurations tested -- every load variation, SLO, and queue depth.
-- **Zero backend crashes** in the reference run, where the best-tuned static breaker
-  crashed the backend 50 times -- and up to **10x fewer crashes** at the most
-  crash-prone queue depth (8 vs 85).
-- **Up to 67% more throughput** admitted under extreme overload, where a binary
+- **Wins 21/21** recorded configurations across all suites -- every load
+  variation, SLO, and queue depth, plus the isolated, cooperative, prescient,
+  and mesh runs.
+- **Zero backend crashes** in the reference run and at every queue depth up to
+  1.4x, where the best-tuned static breaker crashed the backend 50-65 times --
+  and **9x fewer crashes** at the most crash-prone depth (9 vs 85).
+- **Up to 61% more throughput** admitted under extreme overload, where a binary
   open/close cannot match admission to capacity.
 
 Full tables and methodology in [distributed_benchmark.md](distributed_benchmark.md).

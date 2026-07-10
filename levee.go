@@ -82,7 +82,15 @@ const (
 	openErrThreshold     = 0.5
 	maxOpenBackoff       = 4
 	warmupConsecTrip     = 5 // consecutive failures that trip even during warmup (cold-start outage)
+
+	// healthyTailProb is the shared "effectively never under health" rarity: it
+	// sizes both the consecutive-failure trip and the surge onset quantile.
+	healthyTailProb = 1e-8
 )
+
+// surgeOnsetZ is the one-sided normal quantile at healthyTailProb, used by
+// surgeOnset to bound the Poisson tail of healthy inflight.
+var surgeOnsetZ = invNormCDF(1 - healthyTailProb)
 
 // Levee is a self-tuning circuit breaker and concurrency limiter. Construct one
 // with [NewLevee]; the zero value is unusable. All methods are concurrency-safe.
@@ -99,13 +107,13 @@ type Levee struct {
 	// Circuit State
 	state          State
 	capped         atomic.Bool // admission gate: false == uncapped; read lock-free by Start
+	surgeArmed     bool        // surge spring loaded; proof window start/count live in lastEvalTS/evalSuccesses
 	stateEnteredAt time.Time
 
-	// EWMA error rate
-	errEWMA     float64
-	errLastTS   time.Time
-	initialized bool
-	samples     int64
+	// EWMA error rate; errLastTS.IsZero() means no sample seen yet
+	errEWMA   float64
+	errLastTS time.Time
+	samples   int64
 
 	// Consecutive failure tracking
 	consecFails int
@@ -120,7 +128,20 @@ type Levee struct {
 	avgLatency    float64
 	lastSuccessTS time.Time
 
-	// Evaluation counters
+	// Surge spring: proactive trip out of uncapped CLOSED when inflight
+	// stretches past the published onset. Strain integrates the stretch over
+	// time and relaxes under proof of health (see surgeTick). The proof window
+	// borrows the eval fields below: the eval window runs only while capped,
+	// arming happens only while uncapped-CLOSED, and every capped transition
+	// disarms and resets eval, so the two never coexist.
+	surgeLimit    atomic.Int64 // published stretch onset; 0 = disarmed; read lock-free by Start
+	surgeLatSnap  float64      // avgLatency snapshot taken when armed, before queueing pollutes it
+	surgeStrain   float64      // integrated stretch-seconds; trips at surgeStrainBudget
+	surgeStrainTS time.Time    // last strain integration point; frozen across capped spans
+	surgeProven   float64      // capacity proven past the EWMA estimate; decays at goodputHalfLife
+
+	// Evaluation window: capped-limit adjustment while capped, surge
+	// confirmation while armed (see surge invariant above).
 	lastEvalTS    time.Time
 	evalSuccesses int64
 	evalFailures  int64
@@ -131,7 +152,7 @@ type Levee struct {
 
 func deriveThresholds(slo SLO) (tripZ, recoverTh float64, consecTrip int) {
 	sloErr := 1.0 - slo.SuccessRate
-	consecTrip = int(math.Ceil(math.Log(1e-8) / math.Log(sloErr)))
+	consecTrip = int(math.Ceil(math.Log(healthyTailProb) / math.Log(sloErr)))
 	recoverTh = sloErr
 	if sloErr < 0.095 {
 		recoverTh = 0.10
@@ -196,7 +217,10 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	// Lock-free fast path: an uncapped breaker (only possible while CLOSED) admits
 	// everything with just atomic accounting, never touching the mutex.
 	if !l.capped.Load() {
-		l.inflight.Add(1)
+		n := l.inflight.Add(1)
+		if lim := l.surgeLimit.Load(); lim > 0 && n > lim {
+			return l.surgeCheck(ts)
+		}
 		return StateChange{State: CLOSED}, nil
 	}
 
@@ -246,6 +270,7 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	l.samples++
 	l.consecFails = 0
 	l.updateCapacityEstimate(ts, duration)
+	l.surgeOnCompletion(ts)
 
 	if l.state != OPEN && l.capped.Load() {
 		l.evalSuccesses++
@@ -276,6 +301,7 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 	l.updateErrEWMA(ts, 1.0)
 	l.samples++
 	l.consecFails++
+	l.surgeOnCompletion(ts)
 
 	if l.state != OPEN && l.capped.Load() {
 		l.evalFailures++
@@ -295,8 +321,8 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 }
 
 func (l *Levee) updateErrEWMA(ts time.Time, sample float64) {
-	if !l.initialized {
-		l.errEWMA, l.errLastTS, l.initialized = sample, ts, true
+	if l.errLastTS.IsZero() {
+		l.errEWMA, l.errLastTS = sample, ts
 		return
 	}
 	dt := ts.Sub(l.errLastTS).Seconds()
@@ -305,6 +331,7 @@ func (l *Levee) updateErrEWMA(ts time.Time, sample float64) {
 }
 
 func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
+	prevTS := l.lastSuccessTS
 	durSec := duration.Seconds()
 	if l.avgLatency == 0 {
 		l.avgLatency = durSec
@@ -325,16 +352,170 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 		}
 	}
 	l.lastSuccessTS = ts
+
+	if l.surgeArmed {
+		// Armed: the published onset is frozen so the queue-polluted estimates
+		// cannot chase the surge; completions feed the proof of health instead.
+		// The first completion anchors the proof-rate span (see surgeProvenCap).
+		if l.evalSuccesses == 0 {
+			l.lastEvalTS = ts
+		}
+		l.evalSuccesses++
+	} else if !l.capped.Load() {
+		if l.surgeProven > 0 && !prevTS.IsZero() {
+			l.surgeProven *= math.Exp2(-ts.Sub(prevTS).Seconds() / goodputHalfLife.Seconds())
+			if l.surgeProven < 0.5 {
+				l.surgeProven = 0
+			}
+		}
+		l.publishSurgeLimit()
+	}
 }
 
-func (l *Levee) enterThrottled(ts time.Time) {
+// surgeCheck runs when an uncapped admission finds inflight beyond the published
+// onset. The request is already admitted; this only loads the spring: strain
+// accumulates until proof of health relaxes it or the strain budget trips.
+func (l *Levee) surgeCheck(ts time.Time) (StateChange, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.state != CLOSED || l.capped.Load() {
+		return StateChange{State: l.state}, nil
+	}
+	lim := l.surgeLimit.Load()
+	if lim == 0 || l.inflight.Load() <= lim {
+		return StateChange{State: CLOSED}, nil
+	}
+	if !l.surgeArmed {
+		// Arm: anchor latency before queueing pollutes it, and relax leftover
+		// strain for the calm unarmed time since the spring was last active.
+		l.surgeArmed, l.surgeLatSnap = true, l.avgLatency
+		l.surgeStrain = max(l.surgeStrain-max(ts.Sub(l.surgeStrainTS).Seconds(), 0), 0)
+		l.surgeStrainTS = ts
+		l.resetEval(ts)
+	}
+	if l.surgeTick(ts) {
+		l.enterSurgeThrottled(ts)
+	}
+	return StateChange{State: l.state}, nil
+}
+
+// surgeOnCompletion advances the armed spring on a completion; failures pass
+// time without adding proof, successes may relax or rebase instead.
+func (l *Levee) surgeOnCompletion(ts time.Time) {
+	if l.surgeArmed && l.surgeTick(ts) {
+		l.enterSurgeThrottled(ts)
+	}
+}
+
+// surgeTick integrates the spring. Stretch is the fractional excess of inflight
+// over the largest base the window's proof supports; positive stretch loads
+// strain, proof or drain relaxes it, and a spent budget reports a trip. The
+// stretch-proportional load is what makes urgency scale with spike size: time
+// to trip is budget/stretch, with no fixed window or latency multiplier.
+func (l *Levee) surgeTick(ts time.Time) (trip bool) {
+	base := float64(l.surgeLimit.Load())
+	if pc := l.surgeProvenCap(ts); pc > 0 {
+		base = max(base, surgeOnset(pc))
+	}
+	stretch := float64(l.inflight.Load())/base - 1
+	if dt := ts.Sub(l.surgeStrainTS).Seconds(); dt > 0 {
+		l.surgeStrain = max(l.surgeStrain+stretch*dt, 0)
+		l.surgeStrainTS = ts
+	}
+	if l.surgeStrain >= l.surgeStrainBudget() {
+		return true
+	}
+	if stretch <= 0 && l.surgeStrain == 0 {
+		l.surgeDisarm(ts)
+	}
+	return false
+}
+
+// surgeProvenCap is the concurrency this window's completions prove healthy:
+// completion rate times the pre-surge latency (Little's law). Rate collapse and
+// latency inflation both keep it low; absorbing the new regime raises it. The
+// rate spans first counted completion to now, so k completions cover k-1 gaps.
+func (l *Levee) surgeProvenCap(ts time.Time) float64 {
+	if l.evalSuccesses < targetSamplesPerEval {
+		return 0
+	}
+	elapsed := ts.Sub(l.lastEvalTS).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(l.evalSuccesses-1) / elapsed * l.surgeLatSnap
+}
+
+// surgeStrainBudget is the strain that trips: one eval interval at unit
+// stretch, anchored to the pre-surge latency.
+func (l *Levee) surgeStrainBudget() float64 {
+	return evalIntervalFor(l.surgeLatSnap).Seconds()
+}
+
+// surgeDisarm ends an armed window whose stretch fully relaxed. Capacity
+// proven beyond the current EWMA estimate is kept as a decaying excess so the
+// published onset covers the new regime while the estimates catch up.
+func (l *Levee) surgeDisarm(ts time.Time) {
+	// Only raise: a short window proving less than an earlier proof must not
+	// collapse the onset under a still-standing regime (decay handles shrink).
+	if excess := l.surgeProvenCap(ts) - l.goodput*l.avgLatency; excess > l.surgeProven {
+		l.surgeProven = excess
+	}
+	l.surgeArmed = false
+	l.publishSurgeLimit()
+}
+
+// surgeOnset maps a capacity estimate to the inflight level where stretch
+// begins: an upper bound on the healthyTailProb Poisson quantile, so healthy
+// fluctuation essentially never loads the spring.
+func surgeOnset(c float64) float64 {
+	return c + surgeOnsetZ*(math.Sqrt(c)+surgeOnsetZ/4)
+}
+
+// publishSurgeLimit precomputes the lock-free stretch onset from the capacity
+// estimate plus any decaying proven excess, disarmed until warmup establishes
+// an estimate.
+func (l *Levee) publishSurgeLimit() {
+	if l.samples < warmupSamples || l.goodput <= 0 || l.avgLatency <= 0 {
+		l.surgeLimit.Store(0)
+		return
+	}
+	lim := surgeOnset(l.goodput*l.avgLatency + l.surgeProven)
+	const maxSurgeLimit = float64(int64(1) << 40)
+	if math.IsNaN(lim) || lim > maxSurgeLimit {
+		lim = maxSurgeLimit
+	}
+	l.surgeLimit.Store(int64(math.Ceil(lim)))
+}
+
+func (l *Levee) throttleTo(ts time.Time, limit float64) {
 	l.capped.Store(true)
 	l.state, l.stateEnteredAt = THROTTLED, ts
-	// Seed the limit from observed capacity
-	capacity := l.goodput * l.avgLatency
-	l.inflightLimit = max(max(capacity, float64(l.inflight.Load()))*0.5, minInflightLimit)
+	l.inflightLimit = max(limit, minInflightLimit)
 	l.consecFails = 0
+	l.surgeArmed = false
+	l.surgeLimit.Store(0) // stretch onset is meaningless while capped
 	l.resetEval(ts)
+}
+
+// enterThrottled is the failure-evidence trip: seed at half the observed
+// operating point (the inflight term protects cold/low-signal callers).
+func (l *Levee) enterThrottled(ts time.Time) {
+	capacity := l.goodput * l.avgLatency
+	l.throttleTo(ts, max(capacity, float64(l.inflight.Load()))*0.5)
+}
+
+// enterSurgeThrottled is the proactive surge trip: the service is healthy and
+// demand is the problem, so hold at the larger of the pre-surge capacity and
+// the window's proven capacity -- never the ballooned inflight.
+func (l *Levee) enterSurgeThrottled(ts time.Time) {
+	seed := max(l.goodput*l.surgeLatSnap, l.surgeProvenCap(ts))
+	budget := l.surgeStrainBudget()
+	l.throttleTo(ts, seed)
+	// The spring stays loaded through the trip: a re-stretch right after
+	// recovery re-trips instantly; only calm uncapped time relaxes it.
+	l.surgeStrain, l.surgeStrainTS = budget, ts
 }
 
 func (l *Levee) enterHalfOpen(ts time.Time) {
@@ -342,6 +523,8 @@ func (l *Levee) enterHalfOpen(ts time.Time) {
 	l.inflightLimit = minInflightLimit
 	l.capped.Store(true)
 	l.consecFails = 0
+	l.surgeArmed = false
+	l.surgeLimit.Store(0)
 	l.resetEval(ts)
 }
 
@@ -396,6 +579,15 @@ func (l *Levee) maybeRelaxLimit(ts time.Time) {
 	}
 	if l.inflightLimit > float64(l.inflight.Load()+1)*3.0 {
 		l.capped.Store(false)
+		// The capped span served the standing inflight at a healthy error rate;
+		// that is proof of health too, so the fresh onset must clear it. Without
+		// this the lagging EWMAs re-breach on the next admission and the
+		// trip-recover churn hides real demand from upstream autoscaling.
+		if excess := float64(l.inflight.Load()) - l.goodput*l.avgLatency; excess > l.surgeProven {
+			l.surgeProven = excess
+		}
+		l.surgeStrainTS = ts  // the capped span held the spring; relaxation resumes now
+		l.publishSurgeLimit() // re-arm the fast path with a fresh anchor
 	} else {
 		l.inflightLimit *= 2.0
 	}
@@ -429,12 +621,16 @@ func (l *Levee) maybeEvaluateLimit(ts time.Time) {
 	l.resetEval(ts)
 }
 
-func (l *Levee) baseEvalInterval() time.Duration {
-	if l.avgLatency <= 0 {
+func evalIntervalFor(latency float64) time.Duration {
+	if latency <= 0 {
 		return minEvalInterval
 	}
-	adaptive := time.Duration(l.avgLatency * float64(targetSamplesPerEval) * float64(time.Second))
+	adaptive := time.Duration(latency * float64(targetSamplesPerEval) * float64(time.Second))
 	return min(max(adaptive, minEvalInterval), maxEvalInterval)
+}
+
+func (l *Levee) baseEvalInterval() time.Duration {
+	return evalIntervalFor(l.avgLatency)
 }
 
 func (l *Levee) effectiveRecoveryHoldoff() time.Duration {

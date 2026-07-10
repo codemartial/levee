@@ -11,8 +11,8 @@
 Levee keeps more of your business flowing under dynamic conditions than any other circuit-breaker and rate-limiter combination.
 
 
-- 248 bytes memory overhead (yes, under a quarter of a kB)
-- multi-million request processing capacity
+- 304 bytes memory overhead (yes, barely a third of a kB)
+- multi-million requests/second processing capacity
 
 ## What is Levee?
 

@@ -14,6 +14,11 @@
 //     exponentially across repeated trips.
 //   - HALF_OPEN: probing recovery after OPEN at the minimum inflight limit.
 //
+// A CLOSED breaker trips to THROTTLED on statistical failure evidence, or
+// proactively on congestion: inflight ballooning far past the healthy
+// operating point while completion latency inflates, which catches arrival
+// floods before the first failure can report.
+//
 // # Usage
 //
 // The in-band API wraps a function call:
