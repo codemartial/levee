@@ -19,26 +19,20 @@ type meshResult struct {
 	wall time.Duration
 }
 
-// meshCandidates builds the four competitors. Static-Nominal is sized from
-// steady-state design RPS; Static-Peak folds the surge into its sizing.
+// meshCandidates builds the five competitors. The static candidates deploy
+// breakers only, limiters only, or both, all sized from the provisioning
+// profile alone (see mesh/static.go).
 func meshCandidates(t *testing.T, topo *mesh.Topology) []mesh.Candidate {
 	t.Helper()
 	if err := topo.Validate(); err != nil {
 		t.Fatalf("topology: %v", err)
 	}
-	steady, err := topo.SteadyStateRPS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	steadyPeak, err := mesh.SurgeSteadyRPS(topo, "edge-api", mesh.SurgeMult)
-	if err != nil {
-		t.Fatal(err)
-	}
 	return []mesh.Candidate{
 		mesh.NewNoGovCandidate(),
+		mesh.NewStaticCandidate("Static-Breaker", mesh.StaticBreaker),
+		mesh.NewStaticCandidate("Static-Limiter", mesh.StaticLimiter),
+		mesh.NewStaticCandidate("Static-Full", mesh.StaticBreaker|mesh.StaticLimiter),
 		mesh.NewLeveeCandidate(),
-		mesh.NewStaticCandidate("Static-Nominal", steady),
-		mesh.NewStaticCandidate("Static-Peak", steadyPeak),
 	}
 }
 
@@ -157,23 +151,27 @@ func printMeshResults(t *testing.T, results []meshResult, endS int) {
 
 func compareMesh(t *testing.T, results []meshResult, assert bool) {
 	t.Helper()
-	var lev, peak *meshResult
+	var lev, best *meshResult
 	for i := range results {
-		switch results[i].name {
-		case "Levee":
-			lev = &results[i]
-		case "Static-Peak":
-			peak = &results[i]
+		r := &results[i]
+		switch {
+		case r.name == "Levee":
+			lev = r
+		case strings.HasPrefix(r.name, "Static-"):
+			if best == nil || r.m.MeshDelta() > best.m.MeshDelta() {
+				best = r
+			}
 		}
 	}
-	ld, pd := lev.m.MeshDelta(), peak.m.MeshDelta()
+	ld, bd := lev.m.MeshDelta(), best.m.MeshDelta()
 	verdict := "LOSS"
-	if ld > pd {
+	if ld > bd {
 		verdict = "WIN"
 	}
-	t.Logf("Levee vs Static-Peak MeshDelta: Levee=%.1f Static-Peak=%.1f Lead=%.1f %s", ld, pd, ld-pd, verdict)
-	if assert && ld <= pd {
-		t.Errorf("Levee MeshDelta %.1f did not beat Static-Peak %.1f at the reference config", ld, pd)
+	t.Logf("Levee vs best static (%s) MeshDelta: Levee=%.1f %s=%.1f Lead=%.1f %s",
+		best.name, ld, best.name, bd, ld-bd, verdict)
+	if assert && ld <= bd {
+		t.Errorf("Levee MeshDelta %.1f did not beat %s %.1f at the reference config", ld, best.name, bd)
 	}
 }
 

@@ -77,30 +77,61 @@ func TestConcurrencyLimiter(t *testing.T) {
 
 func TestStaticSizing(t *testing.T) {
 	topo := StorefrontTopology()
-	steady, err := topo.SteadyStateRPS()
-	if err != nil {
-		t.Fatal(err)
-	}
-	g := newStaticGovernor(topo.NodeIndex("edge-api"), topo, steady)
-	if g.bucket.ratePerSec != 450 { // 1.5 * 300
-		t.Errorf("edge-api inbound rate: got %v want 450", g.bucket.ratePerSec)
+	g := newStaticGovernor(topo.NodeIndex("edge-api"), topo, StaticBreaker|StaticLimiter)
+	if got := g.instances[0].inBucket.ratePerSec; got != 85 { // 0.85 * 100 per replica
+		t.Errorf("edge-api per-replica inbound rate: got %v want 85", got)
 	}
 	if len(g.instances) != topo.Nodes[topo.NodeIndex("edge-api")].MinReplicas {
 		t.Errorf("static governor should start with MinReplicas instances, got %d", len(g.instances))
 	}
 	for i, spec := range topo.Nodes {
-		s := staticNodeSizing(topo, steady, i)
+		br := staticNodeSizing(topo, i, StaticBreaker)
+		full := staticNodeSizing(topo, i, StaticBreaker|StaticLimiter)
+		if br.inboundRate > float64(spec.PerReplicaRPS) {
+			t.Errorf("node %s: per-replica inbound rate %.1f above replica capacity %d", spec.Name, br.inboundRate, spec.PerReplicaRPS)
+		}
 		for e, edge := range spec.Edges {
-			if s.edgeMaxInflight[e] < 2 {
-				t.Errorf("edge %s->%s: maxInflight %d below floor", spec.Name, edge.Callee, s.edgeMaxInflight[e])
+			if br.edgeMaxInflight[e] < 2 {
+				t.Errorf("edge %s->%s: maxInflight %d below floor", spec.Name, edge.Callee, br.edgeMaxInflight[e])
 			}
-			// Per-instance edge volumes are far below 800 RPS, so every
-			// breaker gets the BAU config per the static_cb.go derivations.
-			if s.edgeCBConfig[e].FailureThreshold != benchmarks.StaticBAUConfig.FailureThreshold {
+			// Standalone: per-instance edge volumes are bounded by
+			// PerReplicaRPS, far below 800 RPS, so every breaker gets the
+			// BAU config per the static_cb.go derivations.
+			if br.edgeCBConfig[e].FailureThreshold != benchmarks.StaticBAUConfig.FailureThreshold {
 				t.Errorf("edge %s->%s: expected BAU config at per-instance volume", spec.Name, edge.Callee)
 			}
-			t.Logf("edge %-22s perInstanceMaxInflight=%3d cbFailureThreshold=%d",
-				spec.Name+"->"+edge.Callee, s.edgeMaxInflight[e], s.edgeCBConfig[e].FailureThreshold)
+			// Chained: sync edges narrow to dead-edge detection; async
+			// edges keep BAU (dropped callbacks never fail the parent).
+			want := deadEdgeCBConfig.FailureThreshold
+			if edge.Async {
+				want = benchmarks.StaticBAUConfig.FailureThreshold
+			}
+			if full.edgeCBConfig[e].FailureThreshold != want {
+				t.Errorf("edge %s->%s: chained FailureThreshold got %d want %d",
+					spec.Name, edge.Callee, full.edgeCBConfig[e].FailureThreshold, want)
+			}
+			t.Logf("edge %-22s perInstanceMaxInflight=%3d cbFailureThreshold standalone=%d chained=%d",
+				spec.Name+"->"+edge.Callee, br.edgeMaxInflight[e],
+				br.edgeCBConfig[e].FailureThreshold, full.edgeCBConfig[e].FailureThreshold)
 		}
+	}
+}
+
+func TestStaticParts(t *testing.T) {
+	topo := StorefrontTopology()
+	node := topo.NodeIndex("edge-api")
+	br := newStaticGovernor(node, topo, StaticBreaker)
+	if br.instances[0].inBucket != nil {
+		t.Error("breaker-only governor should have no inbound bucket")
+	}
+	if br.instances[0].outCB == nil || br.instances[0].outLim != nil {
+		t.Error("breaker-only governor should have breakers and no limiters")
+	}
+	lim := newStaticGovernor(node, topo, StaticLimiter)
+	if lim.instances[0].inBucket == nil {
+		t.Error("limiter-only governor should have an inbound bucket")
+	}
+	if lim.instances[0].outCB != nil || lim.instances[0].outLim == nil {
+		t.Error("limiter-only governor should have limiters and no breakers")
 	}
 }

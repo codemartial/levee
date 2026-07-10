@@ -15,11 +15,12 @@ carefully hand-tuned static circuit breakers.
 
 - **[Mesh benchmark](mesh_benchmark.md)** -- a 10-node service mesh with hundreds
   of live Levee instances, where every replica runs Levee for inbound and
-  per-edge outbound admission against a static rate limiter + circuit breaker +
-  concurrency limiter stack. Through a planned surge, deep-dependency
-  degradation, a branch crash, an arrival flood beyond maximum autoscaled
-  capacity, and an interior call-amplification bug storm, Levee posts the top
-  score with zero node crashes.
+  per-edge outbound admission against capacity-sized static stacks: circuit
+  breakers only, rate + concurrency limiters only, and the two combined.
+  Through a planned surge, deep-dependency degradation, a branch crash, an
+  arrival flood beyond maximum autoscaled capacity, and an interior
+  call-amplification bug storm, Levee posts the top score with zero node
+  crashes.
 
 The closed-loop suites (distributed and mesh) run on logical time with fixed
 seeds, so their results are bit-reproducible. The open-loop suite's decision
@@ -32,10 +33,15 @@ counts are seeded and reproducible too.
 In the 10-node, 30-minute mesh scenario, where hundreds of Levee instances
 operate without shared state:
 
-- **Top mesh score, most successes, zero node crashes**: Levee posts +8,587
-  MeshDelta with 592,268 successful entry requests; the pre-provisioned
-  Static-Nominal clamp survives too but forfeits both surges (+5,005, 505,943
-  successes), while No-Gov and Static-Peak crash the entry seven times each.
+- **Top mesh score, fewest failures, zero node crashes**: Levee posts +8,587
+  MeshDelta against +8,142 for the strongest static stack (per-replica rate
+  limiters + max-inflight caps, which also survives crash-free). The margin
+  is failure discrimination: capacity-priced admission keeps feeding
+  degraded subtrees, ending with 1.6x Levee's failures; Levee converts
+  admitted work at 92.7% vs 88.7%. Breakers fare worse: alone they crash
+  the entry seven times (no inbound protection), and stacked on limiters
+  they only subtract -- even retuned to trip solely on dead edges, the
+  combined stack converges to limiter-only from below (+7,930).
 - **Sheds arrival floods before the first failure exists**: the overcap phase
   drives 8x load past maximum autoscaled capacity with an onset faster than
   outcome feedback; Levee's surge trip fires on congestion (inflight vs its

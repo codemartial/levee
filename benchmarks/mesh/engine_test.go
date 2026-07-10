@@ -409,17 +409,13 @@ func TestLeveeGovernorScalesInstances(t *testing.T) {
 
 func TestCrossCandidateComparability(t *testing.T) {
 	topo := StorefrontTopology()
-	steady, err := topo.SteadyStateRPS()
-	if err != nil {
-		t.Fatal(err)
-	}
 	arrivals := func(c Candidate) int64 {
 		s := NewEngine(topo, c, nil, testSLO, DefaultSeed).Run(30).Mesh.Snapshot()
 		return s.TotalAllowed + s.TotalBlocked
 	}
 	noGov := arrivals(NewNoGovCandidate())
 	lev := arrivals(NewLeveeCandidate())
-	static := arrivals(NewStaticCandidate("Static", steady))
+	static := arrivals(NewStaticCandidate("Static", StaticBreaker|StaticLimiter))
 	if noGov != lev || noGov != static {
 		t.Errorf("entry arrivals must be candidate-independent: no-gov %d, levee %d, static %d", noGov, lev, static)
 	}

@@ -7,11 +7,11 @@ than a conventional static stack?
 
 Every node replica runs its own in-process Levee instances: one for inbound
 admission and one per outbound edge, scaling horizontally with the node. The
-competitor stack is a conventional hand-configured guardrail setup: a
-node-level static token-bucket rate limiter inbound, plus per-replica static
-circuit breakers chained with static max-inflight concurrency limiters per
-outbound edge. A no-governor control run shows what the mesh does with no
-protection at all.
+competitors are conventional hand-configured guardrail stacks in three
+combinations -- per-edge static circuit breakers only, static rate +
+max-inflight limiters only, and both chained -- each sized from the node's
+provisioning profile the way a careful operator would size them. A
+no-governor control run shows what the mesh does with no protection at all.
 
 ## Topology: "Storefront" (10 nodes)
 
@@ -89,9 +89,7 @@ and admission round-robins across them (the load balancer). Instances start
 at the node's design replica count (warm start), scale-up adds cold
 instances, and a crash kills all instances; recovery starts fresh ones
 at MinReplicas. The request's admitting replica also makes that request's
-downstream calls through its own client-side instances. The one exception is
-the static inbound rate limiter, which stays single-per-node (distributed
-rate limiting).
+downstream calls through its own client-side instances.
 
 - **Levee**: per replica, one instance inbound + one per outbound edge, all
   with the same SLO (90% success, 1500 ms), matching the distributed suite.
@@ -99,26 +97,50 @@ rate limiting).
   its immediate sync downstream calls (by transitivity, the subtree
   outcome). This is what lets an entry node throttle for trouble three hops
   down.
-- **Static-Nominal**: node-level inbound token bucket at 1.5x steady-state
-  design RPS (burst = 1s of tokens); per replica and per edge a max-inflight
-  limiter at ceil(max(1.5 * m, m + 3 * sqrt(m))), where m = edgeRPS *
-  subtreeMeanLatency / designReplicas is the mean per-instance inflight and
-  the 3-sigma term covers Poisson burstiness (dominant at these small
-  means), chained with the distributed suite's `StaticCB`. The breaker
-  consults `Start` before the limiter so its OPEN -> HALF_OPEN clock always
-  advances; a limiter rejection cancels the admission so probe slots are
-  not leaked. Config
-  selection follows the documented derivation ranges in `static_cb.go` by
-  the per-instance volume each breaker actually sees: BAU up to 800 RPS,
-  Peak above (at realistic per-pod volumes, every mesh edge gets BAU).
-  Sizing derivations are in `mesh/static.go`. The rate limiter is
-  outcome-blind.
-- **Static-Peak**: same formulas with the 4x surge folded into the sizing,
-  i.e. tuned generously enough to admit the whole planned peak. The x8
-  overcapacity surge (phase F) is deliberately beyond what any operator
-  would provision static configs for; it is unplanned load for every
-  candidate.
+- **Static candidates**: tuned from the provisioning profile alone --
+  initial scale and max capacity, plus the safety margins an operator would
+  bake in. No scenario foreknowledge: no entry rates, no surge multipliers,
+  no solved steady-state traffic. Sizing derivations are in
+  `mesh/static.go`. Three combinations run:
+  - **Static-Breaker**: per replica and per edge, the distributed suite's
+    `StaticCB`. Config selection follows the documented derivation ranges
+    in `static_cb.go` by the per-instance volume each breaker can see,
+    which is bounded by the replica's own service ceiling: BAU up to 800
+    RPS, Peak above (at per-replica ceilings of <= 200 RPS, every mesh
+    edge gets BAU). Client-side only; no inbound protection.
+  - **Static-Limiter**: per-replica inbound token bucket at 85% of the
+    replica's service ceiling (0.85 * PerReplicaRPS, burst = 1s of
+    tokens) -- local rate limiting, the standard per-pod deployment.
+    Aggregate admission is replicas * 85% of replica capacity, so it
+    tracks the live fleet: tight while the autoscaler lags, wide once
+    capacity has actually arrived, never past what the current fleet can
+    serve. Plus per replica and per edge a max-inflight limiter at
+    ceil(max(1.5 * m, m + 3 * sqrt(m))), where m = p_edge *
+    PerReplicaRPS * subtreeMeanLatency is the mean inflight of a replica
+    driving the edge at its own service ceiling and the 3-sigma term
+    covers Poisson burstiness (dominant at these small means). Both are
+    outcome-blind.
+  - **Static-Full**: both of the above, chained. The breaker consults
+    `Start` before the limiter so its OPEN -> HALF_OPEN clock always
+    advances; a limiter rejection cancels the admission so probe slots
+    are not leaked. Chaining retunes the breakers on interaction
+    principles: the limiter already bounds every congestion mode, and
+    tripping a sync edge fails the parent outright while serving it at
+    any success rate s > 0 gives the parent chance s -- so sync-edge
+    breakers narrow to dead-edge detection (trip on 20 consecutive
+    failures: needs >= 2.1M calls at any partial failure rate p <= 0.5,
+    ~20-80 calls at p >= 0.9). Async edges keep the aggressive BAU
+    config, because a dropped callback never fails its parent and false
+    trips only shed optional work.
 - **No-Gov**: admits everything.
+
+Because the per-replica limits track the live fleet, the static limiter
+stack has an answer for both surges on paper: the servable x4 surge
+(phase B) passes progressively as autoscaling delivers replicas, and the
+x8 overcap flood (phase F), unservable at any scale, is clipped at
+whatever the current fleet can serve. What no static limit can know is
+whether the work it admits will complete -- that distinction only
+appears in outcomes, and it decides the degradation phases.
 
 ## Scenario (30 simulated minutes)
 
@@ -197,15 +219,17 @@ admission, and observed outcomes differ by candidate.
 ```
 Candidate       |   Allowed |   Blocked |   Success |  Failures |  MeshDelta
 No-Gov          |   1018091 |         0 |    242983 |    775108 |   -25256.5
+Static-Breaker  |   1018091 |         0 |    274045 |    744046 |   -24511.7
+Static-Limiter  |    675086 |    343005 |    599082 |     76004 |     8141.9
+Static-Full     |    675086 |    343005 |    596854 |     78232 |     7929.6
 Levee           |    639035 |    379056 |    592268 |     46767 |     8587.3
-Static-Nominal  |    622450 |    395641 |    505943 |    116507 |     5005.3
-Static-Peak     |   1018091 |         0 |    273586 |    744505 |   -24643.3
 
 Crashes: No-Gov: edge-api x7, inventory x2, db x2, payments x1.
-         Static-Peak: edge-api x7. Levee: none. Static-Nominal: none.
+         Static-Breaker: edge-api x7, inventory x2.
+         Static-Limiter: none. Static-Full: none. Levee: none.
 
 Per-entry Delta: Levee edge-api=8103.2 admin-api=670.4;
-                 Static-Nominal edge-api=4534.8 admin-api=643.5.
+                 Static-Limiter edge-api=7591.1 admin-api=715.2.
 ```
 
 How each candidate fares:
@@ -217,46 +241,82 @@ How each candidate fares:
   its 3s buffer before re-scaled capacity arrives (30s provisioning lag),
   and crashes again -- three more edge-api crashes ride that loop after
   the overcap ends, at plain steady load, for 44% entry downtime.
-- **Static-Peak** is sized to admit the whole planned x4 peak, so both
-  surges pour straight into the entry queue and it matches No-Gov's seven
-  edge-api crashes. A rate limiter tuned for the peak does not prevent
-  queue saturation while autoscaling lags; it only prevents shedding.
-- **Static-Nominal** never crashes anything by clamping the mesh to 1.5x
-  steady state, forfeiting both surges wholesale -- including phase-B
-  traffic the mesh demonstrably had capacity to serve. The clamp keeps
-  its score positive, but it trails Levee on successes and MeshDelta
-  alike: blind pre-provisioning buys crash immunity at the price of every
-  servable surge it refuses.
-- **Levee** posts the top MeshDelta, the most successes, and zero
+- **Static-Breaker** repeats all seven of No-Gov's edge-api crashes --
+  client-side breakers provide no inbound protection, so both surges
+  saturate the entry queue unopposed. Where failures do appear on
+  outbound edges it helps: breakers on the db- and payments-facing edges
+  trip during the degradation and branch-crash phases, avoiding No-Gov's
+  db and payments crashes. The bugstorm still fells inventory twice,
+  because the amplified catalog->inventory calls mostly succeed until
+  the moment the queue saturates -- a consecutive-failure counter cannot
+  see success-dominated overload coming. With the entry down 44% of the
+  run, none of that moves the score.
+- **Static-Limiter** is the genuine competitor: zero crashes anywhere,
+  the most raw successes of any candidate (599,082, edging out Levee's
+  592,268), and a MeshDelta within 5.5% of Levee's. Per-replica buckets
+  shed inflow to live capacity through both surges -- serving the x4
+  surge progressively as autoscaling delivers replicas -- and the
+  max-inflight caps bind when a callee's latency inflates (C, D) or
+  calls-per-request multiply (G). Its one blind spot is the whole gap:
+  it prices volume, not viability. During the degradation phases it
+  keeps admitting its capacity's worth of traffic into subtrees where
+  that work goes to die, finishing with 1.6x Levee's failures (76,004
+  vs 46,767) -- and under throughput-weighted scoring, that failure gap
+  is the entire lead Levee keeps.
+- **Static-Full** shows that in a chained stack the breaker's optimum is
+  to approach inertness. With BAU breakers on sync edges it loses 2,298
+  MeshDelta to limiter-only: the inflight caps already bound every
+  overload the breakers could catch, and a tripped sync-edge breaker
+  fails the parent request outright, so each 10s OPEN window during the
+  degradation phases converts traffic the limiter would have served --
+  degraded but mostly completing -- into guaranteed failures. Retuning
+  the breakers for the chained role (sync edges as dead-edge detectors,
+  async edges aggressive) recovers 91% of that: the dead-edge config
+  stays fully closed through the db degradation and the payments crash,
+  and the async notify->orders breaker parks OPEN through stress
+  windows, shedding only optional callbacks. The residual -212 comes
+  from the one place the dead-edge heuristic still misfires: during the
+  overcap flood, catalog's own inbound buckets reject edge-api's
+  admitted overflow in sustained bursts, and a consecutive-failure
+  counter cannot tell that rejection storm from a dead edge. Even
+  retuned on pure interaction principles, the breaker adds nothing the
+  limiter does not already bound -- Static-Full converges to
+  Static-Limiter from below.
+- **Levee** posts the top MeshDelta, the fewest failures, and zero
   crashes. It wins every phase that feedback can decide: it serves the
   full planned surge with no crash and no clamp (B), throttles around the
   degraded db (C), and sheds the dying payments branch at the entries
   (D). In the two phases built to outrun outcome feedback it trips on
   congestion instead: the overcap flood (F) and the bugstorm's amplified
   inventory traffic (G) are both shed before the first timeout can
-  report, so edge-api and inventory stay up through injections that
-  crash them under every non-clamped alternative.
+  report. Against the strongest static it converts admitted work at
+  92.7% vs 88.7% -- feedback spends the same admission budget on
+  requests that can actually complete.
 
 Phase F is decided by which signal a governor acts on. The first outcome
 signal -- a root timeout at 1.5s -- arrives about a second before the
-entry buffer saturates: too late, as No-Gov's and Static-Peak's seven
-edge-api crashes attest. Levee does not wait for outcomes. While
-uncapped it publishes a stretch onset just past the statistical noise
-of its Little's-law healthy operating point (goodput x latency); the
-x8 flood crosses that within ~100ms of onset and starts loading the
-surge spring, at a rate proportional to how far past health the flood
-stretches. Completions could relax the spring by proving the new
-concurrency healthy (completion rate x pre-surge latency, Little's law
-again), but a real flood proves nothing -- its completions show rate
-pinned at capacity -- so the strain budget is spent in a fraction of
-an evaluation window and admission snaps to the proven capacity. The
+entry buffer saturates: too late, as the seven edge-api crashes of
+No-Gov and Static-Breaker attest. The limiter stacks survive it by
+arithmetic: per-replica buckets clip the flood at what the live fleet
+serves, no signal required. Levee survives it by feedback that outruns
+outcomes. While uncapped it publishes a stretch onset just past the
+statistical noise of its Little's-law healthy operating point (goodput
+x latency); the x8 flood crosses that within ~100ms of onset and starts
+loading the surge spring, at a rate proportional to how far past health
+the flood stretches. Completions could relax the spring by proving the
+new concurrency healthy (completion rate x pre-surge latency, Little's
+law again), but a real flood proves nothing -- its completions show
+rate pinned at capacity -- so the strain budget is spent in a fraction
+of an evaluation window and admission snaps to the proven capacity. The
 unservable load is shed as Blocked instead of queueing into a crash,
 and the autoscaler keeps scaling on the admitted stream. Under
 sustained overcap, the strain stays loaded across each trip, so
 recovery probes that re-breach re-trip immediately and spill only a
-bounded burst. Static-Nominal survives the
-same phase by never observing anything; that same blindness is why it
-forfeits the servable phase-B surge wholesale.
+bounded burst. Where the static arithmetic and the feedback part ways
+is the degradation phases: a bucket sized to capacity keeps admitting
+full volume into a subtree that can no longer complete it, while
+subtree outcomes pull Levee's admission down to what remains viable.
+That difference -- 29,237 failures -- is the margin.
 
 Where Levee's adaptivity shows is in the phases that require judgment
 rather than a fixed cap. During the planned surge, entry and downstream

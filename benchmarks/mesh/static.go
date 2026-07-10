@@ -2,37 +2,76 @@ package mesh
 
 import (
 	"math"
+	"time"
 
 	"github.com/codemartial/levee/benchmarks"
 )
 
-// Static sizing derivations (no scenario foreknowledge, design numbers only):
+// Static sizing derivations. The operator's only load expectations are the
+// provisioning profile itself -- initial scale and max capacity -- plus the
+// safety margins they would bake in. No scenario foreknowledge: no entry
+// rates, no surge multipliers, no solved steady-state traffic.
 //
-// Inbound token bucket at node N (one per node -- distributed rate limiting):
-//   rate = headroom * steadyInboundRPS(N)
-// A common rule of thumb provisions admission limits ~50% above design load,
-// so headroom = 1.5. burst = 1 second of tokens, absorbing Poisson
-// micro-bursts without admitting sustained overload.
+// Inbound token bucket, one per replica (local rate limiting, the standard
+// per-pod deployment):
+//   rate = healthyCapFrac * PerReplicaRPS
+// Each replica admits what it can serve inside its healthy envelope (the
+// same 85% ceiling Topology.Validate enforces), so aggregate admission
+// tracks the live replica count: it protects the queue while the
+// autoscaler lags and widens as capacity actually arrives, up to
+// healthyCapFrac * MaxReplicas * PerReplicaRPS at full scale. Demand above
+// that is unservable no matter what arrives, so the limit derives from
+// capacity, not from a load forecast. 85% rather than the autoscaler's 70%
+// target keeps admitted utilization able to exceed target, so throttled
+// surges still generate scale-up signals. burst = 1 second of tokens,
+// absorbing Poisson micro-bursts without admitting sustained overload.
 //
 // Per-replica outbound concurrency limiter on edge N->M, via Little's Law:
-//   meanInflight = steadyEdgeRPS * subtreeMeanLatencyS(M) / designReplicas(N)
+//   mean = p_edge * PerReplicaRPS * subtreeMeanLatencyS(M)
 //   perInstanceMaxInflight = ceil(max(headroom * mean, mean + 3*sqrt(mean)))
-// where steadyEdgeRPS = p_edge * steadyInboundRPS(N), designReplicas is the
-// replica count the topology needs at steady state, and the subtree mean is
-// the expected end-to-end latency of a call into M (local mean plus deepest
-// probability-weighted sync branch, see Topology.SubtreeMeanLatencyMS).
-// The 3-sigma term covers Poisson burstiness, which dominates at the small
-// per-instance means these limits take. Floor of 2 so probing is never
-// single-file.
+// A replica cannot drive an edge faster than its own service ceiling
+// PerReplicaRPS, so p_edge * PerReplicaRPS bounds the per-instance edge rate
+// and the subtree mean is the expected end-to-end latency of a call into M
+// (local mean plus deepest probability-weighted sync branch, see
+// Topology.SubtreeMeanLatencyMS). At healthy latency the cap sits well clear
+// of normal inflight; it binds when callee latency inflates or calls per
+// request multiply. The 3-sigma term covers Poisson burstiness, which
+// dominates at the small per-instance means these limits take. Floor of 2 so
+// probing is never single-file.
 //
-// Per-replica outbound breaker config reuses the existing static configs by
-// the per-instance traffic volume each breaker actually sees, matching the
-// documented derivation ranges in static_cb.go: BAU for <= 800 RPS,
-// Peak above 800 RPS.
+// Per-replica outbound breaker config depends on what else is deployed.
+// Standalone (breaker-only), the breaker is the sole protection, so it must
+// also do congestion duty: configs follow the documented derivation ranges
+// in static_cb.go by the per-instance volume each breaker can see, bounded
+// by the replica's service ceiling -- BAU for <= 800 RPS, Peak above. At
+// this topology's per-replica ceilings (<= 200 RPS) every edge lands on
+// BAU.
+//
+// Chained behind the concurrency limiter, the breaker's job narrows to the
+// one case the limiter cannot express: a dependency that is down rather
+// than slow. Tripping a sync edge fails the parent request outright, while
+// serving it at success rate s still gives the parent chance s, so a
+// chained sync-edge breaker pays off only when s is near zero. Sizing from
+// E[n] = 1/(p^T * (1-p)), calls until T consecutive failures at failure
+// rate p: at T=20, any partial degradation (p <= 0.5) needs >= 2.1M calls
+// to trip (never, at per-replica volumes), while a dead edge (p >= 0.9)
+// trips within ~20-80 calls, i.e. seconds. Async edges keep the aggressive
+// BAU config even when chained: a dropped callback never fails its parent,
+// so false trips only shed optional work.
 const (
-	staticHeadroom    = 1.5
-	peakConfigMinRPS  = 800.0
+	staticHeadroom   = 1.5
+	healthyCapFrac   = 0.85
+	peakConfigMinRPS = 800.0
 )
+
+// deadEdgeCBConfig is the chained-stack sync-edge breaker: inert at any
+// partial failure rate, cuts an effectively dead edge within seconds.
+var deadEdgeCBConfig = benchmarks.StaticCBConfig{
+	FailureThreshold: 20,
+	SuccessThreshold: 3,
+	HalfOpenTimeout:  10 * time.Second,
+	HalfOpenMaxCalls: 1,
+}
 
 // TokenBucket is a fixed-rate inbound limiter on synthetic time.
 type TokenBucket struct {
@@ -116,56 +155,45 @@ func designReplicas(spec NodeSpec, rps float64) int {
 	return r
 }
 
-// staticNodeSizing derives all static limits for one node from the topology
-// design numbers in steady.
-func staticNodeSizing(topo *Topology, steady map[string]float64, nodeIdx int) staticSizing {
+// staticNodeSizing derives all static limits for one node from its
+// provisioning profile. Breaker configs depend on parts: chained behind
+// limiters, sync-edge breakers narrow to dead-edge detection.
+func staticNodeSizing(topo *Topology, nodeIdx int, parts StaticParts) staticSizing {
 	n := topo.Nodes[nodeIdx]
-	replicas := designReplicas(n, steady[n.Name])
+	chained := parts&StaticBreaker != 0 && parts&StaticLimiter != 0
 	s := staticSizing{
-		inboundRate:     staticHeadroom * steady[n.Name],
+		inboundRate:     healthyCapFrac * float64(n.PerReplicaRPS),
 		edgeMaxInflight: make([]int, len(n.Edges)),
 		edgeCBConfig:    make([]benchmarks.StaticCBConfig, len(n.Edges)),
 	}
 	for e, edge := range n.Edges {
-		edgeRPS := edge.Prob * steady[n.Name]
+		edgeRPS := edge.Prob * float64(n.PerReplicaRPS)
 		subtreeS := topo.SubtreeMeanLatencyMS(edge.Callee, defaultHopMS) / 1000.0
-		mean := edgeRPS * subtreeS / float64(replicas)
+		mean := edgeRPS * subtreeS
 		maxInflight := int(math.Ceil(math.Max(staticHeadroom*mean, mean+3*math.Sqrt(mean))))
 		if maxInflight < 2 {
 			maxInflight = 2
 		}
 		s.edgeMaxInflight[e] = maxInflight
-		s.edgeCBConfig[e] = benchmarks.StaticBAUConfig
-		if edgeRPS/float64(replicas) > peakConfigMinRPS {
+		switch {
+		case chained && !edge.Async:
+			s.edgeCBConfig[e] = deadEdgeCBConfig
+		case edgeRPS > peakConfigMinRPS:
 			s.edgeCBConfig[e] = benchmarks.StaticPeakConfig
+		default:
+			s.edgeCBConfig[e] = benchmarks.StaticBAUConfig
 		}
 	}
 	return s
 }
 
-func newStaticGovernor(nodeIdx int, topo *Topology, steady map[string]float64) *staticGovernor {
+func newStaticGovernor(nodeIdx int, topo *Topology, parts StaticParts) *staticGovernor {
 	n := topo.Nodes[nodeIdx]
-	sizing := staticNodeSizing(topo, steady, nodeIdx)
 	g := &staticGovernor{
-		spec:      n,
-		sizing:    sizing,
-		bucket:    NewTokenBucket(sizing.inboundRate, sizing.inboundRate),
-		inTracker: &RoleTracker{Name: "in:" + n.Name},
+		spec:   n,
+		sizing: staticNodeSizing(topo, nodeIdx, parts),
+		parts:  parts,
 	}
-	g.all = append(g.all, g.inTracker)
 	g.Resize(n.MinReplicas, 0)
 	return g
-}
-
-// SurgeSteadyRPS returns the steady-state map with an entry node's rate
-// scaled, for sizing the Peak static variant against the surge phase.
-func SurgeSteadyRPS(topo *Topology, entryName string, mult float64) (map[string]float64, error) {
-	scaled := make([]NodeSpec, len(topo.Nodes))
-	copy(scaled, topo.Nodes)
-	for i := range scaled {
-		if scaled[i].Name == entryName {
-			scaled[i].EntryRPS *= mult
-		}
-	}
-	return NewTopology(scaled).SteadyStateRPS()
 }

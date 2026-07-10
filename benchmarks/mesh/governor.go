@@ -206,32 +206,45 @@ func (g *leveeGovernor) OutboundDone(rep, edge int, ts time.Time, d time.Duratio
 
 func (g *leveeGovernor) Roles() []*RoleTracker { return g.all }
 
-// staticInstance is one replica's process-local breaker + limiter set.
+// StaticParts selects which mechanisms a static candidate deploys.
+type StaticParts uint8
+
+const (
+	// StaticBreaker: per-replica circuit breakers on outbound edges.
+	StaticBreaker StaticParts = 1 << iota
+	// StaticLimiter: node-level inbound token bucket plus per-replica
+	// max-inflight limiters on outbound edges (outcome-blind flow control).
+	StaticLimiter
+)
+
+// staticInstance is one replica's process-local bucket + breaker + limiter
+// set. Fields are nil for parts the candidate does not deploy.
 type staticInstance struct {
+	inBucket *TokenBucket
 	outCB    []*benchmarks.StaticCB
 	outLim   []*ConcurrencyLimiter
-	trackers []*RoleTracker // per edge
+	trackers []*RoleTracker // 0 = inbound, 1+e = edge e
 }
 
-// staticGovernor: a single node-level token bucket (distributed rate
-// limiting), with per-replica breaker + concurrency-limiter instances.
+// staticGovernor: per replica, an inbound token bucket (local rate
+// limiting) plus breaker + concurrency-limiter instances per outbound edge.
 type staticGovernor struct {
 	spec      NodeSpec
 	sizing    staticSizing
-	bucket    *TokenBucket
-	inTracker *RoleTracker
+	parts     StaticParts
 	instances []*staticInstance
 	all       []*RoleTracker
 	rr        int
 }
 
-// NewStaticCandidate sizes limits from the given steady-state RPS map; see
-// static.go for the sizing derivations.
-func NewStaticCandidate(name string, steady map[string]float64) Candidate {
+// NewStaticCandidate builds a static candidate deploying the given parts,
+// sized from each node's provisioning profile; see static.go for the
+// sizing derivations.
+func NewStaticCandidate(name string, parts StaticParts) Candidate {
 	return Candidate{
 		Name: name,
 		New: func(nodeIdx int, topo *Topology, slo levee.SLO) Governor {
-			return newStaticGovernor(nodeIdx, topo, steady)
+			return newStaticGovernor(nodeIdx, topo, parts)
 		},
 	}
 }
@@ -246,14 +259,24 @@ func (g *staticGovernor) Resize(replicas int, tsNS int64) {
 	}
 	for len(g.instances) < replicas {
 		inst := &staticInstance{
-			outCB:    make([]*benchmarks.StaticCB, len(g.spec.Edges)),
-			outLim:   make([]*ConcurrencyLimiter, len(g.spec.Edges)),
-			trackers: make([]*RoleTracker, len(g.spec.Edges)),
+			trackers: make([]*RoleTracker, 1+len(g.spec.Edges)),
+		}
+		inst.trackers[0] = &RoleTracker{Name: "in:" + g.spec.Name}
+		if g.parts&StaticBreaker != 0 {
+			inst.outCB = make([]*benchmarks.StaticCB, len(g.spec.Edges))
+		}
+		if g.parts&StaticLimiter != 0 {
+			inst.inBucket = NewTokenBucket(g.sizing.inboundRate, g.sizing.inboundRate)
+			inst.outLim = make([]*ConcurrencyLimiter, len(g.spec.Edges))
 		}
 		for e, edge := range g.spec.Edges {
-			inst.outCB[e] = benchmarks.NewStaticCB(g.sizing.edgeCBConfig[e])
-			inst.outLim[e] = NewConcurrencyLimiter(g.sizing.edgeMaxInflight[e])
-			inst.trackers[e] = &RoleTracker{Name: "out:" + g.spec.Name + "->" + edge.Callee}
+			if inst.outCB != nil {
+				inst.outCB[e] = benchmarks.NewStaticCB(g.sizing.edgeCBConfig[e])
+			}
+			if inst.outLim != nil {
+				inst.outLim[e] = NewConcurrencyLimiter(g.sizing.edgeMaxInflight[e])
+			}
+			inst.trackers[1+e] = &RoleTracker{Name: "out:" + g.spec.Name + "->" + edge.Callee}
 		}
 		g.all = append(g.all, inst.trackers...)
 		g.instances = append(g.instances, inst)
@@ -269,8 +292,14 @@ func (g *staticGovernor) InboundStart(ts time.Time) (int, error) {
 	}
 	rep := g.rr
 	g.rr = (g.rr + 1) % len(g.instances)
-	ok := g.bucket.Allow(ts.UnixNano())
-	g.observeInbound(ts.UnixNano())
+	inst := g.instances[rep]
+	tsNS := ts.UnixNano()
+	if inst.inBucket == nil {
+		inst.trackers[0].Observe(bucketClosed, tsNS)
+		return rep, nil
+	}
+	ok := inst.inBucket.Allow(tsNS)
+	g.observeInbound(inst, tsNS)
 	if !ok {
 		return rep, levee.ErrCircuitOpen
 	}
@@ -278,16 +307,19 @@ func (g *staticGovernor) InboundStart(ts time.Time) (int, error) {
 }
 
 func (g *staticGovernor) InboundDone(rep int, ts time.Time, d time.Duration, ok bool) {
-	g.observeInbound(ts.UnixNano())
+	if rep < 0 || rep >= len(g.instances) {
+		return
+	}
+	g.observeInbound(g.instances[rep], ts.UnixNano())
 }
 
 // observeInbound reports THROTTLED while the bucket cannot admit a request.
-func (g *staticGovernor) observeInbound(tsNS int64) {
+func (g *staticGovernor) observeInbound(inst *staticInstance, tsNS int64) {
 	b := bucketClosed
-	if g.bucket.Saturated(tsNS) {
+	if inst.inBucket != nil && inst.inBucket.Saturated(tsNS) {
 		b = bucketThrottled
 	}
-	g.inTracker.Observe(b, tsNS)
+	inst.trackers[0].Observe(b, tsNS)
 }
 
 // OutboundStart consults the breaker first so it can advance its OPEN ->
@@ -299,12 +331,16 @@ func (g *staticGovernor) OutboundStart(rep, edge int, ts time.Time) error {
 	}
 	inst := g.instances[rep]
 	tsNS := ts.UnixNano()
-	if _, err := inst.outCB[edge].Start(ts); err != nil {
-		g.observeOutbound(inst, edge, tsNS)
-		return err
+	if inst.outCB != nil {
+		if _, err := inst.outCB[edge].Start(ts); err != nil {
+			g.observeOutbound(inst, edge, tsNS)
+			return err
+		}
 	}
-	if !inst.outLim[edge].TryAcquire() {
-		inst.outCB[edge].Cancel()
+	if inst.outLim != nil && !inst.outLim[edge].TryAcquire() {
+		if inst.outCB != nil {
+			inst.outCB[edge].Cancel()
+		}
 		g.observeOutbound(inst, edge, tsNS)
 		return levee.ErrCircuitOpen
 	}
@@ -317,11 +353,15 @@ func (g *staticGovernor) OutboundDone(rep, edge int, ts time.Time, d time.Durati
 		return
 	}
 	inst := g.instances[rep]
-	inst.outLim[edge].Release()
-	if ok {
-		inst.outCB[edge].Success(ts, d)
-	} else {
-		inst.outCB[edge].Fail(ts, d)
+	if inst.outLim != nil {
+		inst.outLim[edge].Release()
+	}
+	if inst.outCB != nil {
+		if ok {
+			inst.outCB[edge].Success(ts, d)
+		} else {
+			inst.outCB[edge].Fail(ts, d)
+		}
 	}
 	g.observeOutbound(inst, edge, ts.UnixNano())
 }
@@ -329,12 +369,12 @@ func (g *staticGovernor) OutboundDone(rep, edge int, ts time.Time, d time.Durati
 // observeOutbound precedence: breaker OPEN, else limiter saturation, else CLOSED.
 func (g *staticGovernor) observeOutbound(inst *staticInstance, edge int, tsNS int64) {
 	b := bucketClosed
-	if inst.outCB[edge].State() == levee.OPEN {
+	if inst.outCB != nil && inst.outCB[edge].State() == levee.OPEN {
 		b = bucketOpen
-	} else if inst.outLim[edge].Saturated() {
+	} else if inst.outLim != nil && inst.outLim[edge].Saturated() {
 		b = bucketThrottled
 	}
-	inst.trackers[edge].Observe(b, tsNS)
+	inst.trackers[1+edge].Observe(b, tsNS)
 }
 
 func (g *staticGovernor) Roles() []*RoleTracker { return g.all }
