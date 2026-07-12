@@ -53,17 +53,101 @@ func (s State) String() string {
 	}
 }
 
-// Trigger describes why a state change happened. It is reserved for future use:
-// it is currently always nil, and callers must not depend on it being set.
-type Trigger error
+// Trigger describes why a state change happened.
+type Trigger uint8
+
+const (
+	// TriggerNone means the call did not cause a state transition.
+	TriggerNone Trigger = iota
+	// TriggerFailureRate means statistical failure evidence exceeded the SLO's
+	// error budget and caused throttling.
+	TriggerFailureRate
+	// TriggerConsecutiveFailures means a run of failures caused throttling.
+	TriggerConsecutiveFailures
+	// TriggerSurge means proactive surge strain caused throttling.
+	TriggerSurge
+	// TriggerMinLimitFailureRate means failures remained excessive at the
+	// minimum inflight limit, causing the circuit to open.
+	TriggerMinLimitFailureRate
+	// TriggerCooldownExpired means the open cooldown elapsed and a recovery
+	// probe moved the circuit to half-open.
+	TriggerCooldownExpired
+	// TriggerRecovered means healthy evidence moved a limited circuit back to
+	// closed.
+	TriggerRecovered
+)
+
+// String returns the trigger's name, e.g. "FAILURE_RATE".
+func (t Trigger) String() string {
+	switch t {
+	case TriggerNone:
+		return "NONE"
+	case TriggerFailureRate:
+		return "FAILURE_RATE"
+	case TriggerConsecutiveFailures:
+		return "CONSECUTIVE_FAILURES"
+	case TriggerSurge:
+		return "SURGE"
+	case TriggerMinLimitFailureRate:
+		return "MIN_LIMIT_FAILURE_RATE"
+	case TriggerCooldownExpired:
+		return "COOLDOWN_EXPIRED"
+	case TriggerRecovered:
+		return "RECOVERED"
+	default:
+		return "Trigger(" + strconv.Itoa(int(t)) + ")"
+	}
+}
 
 // StateChange is returned by every admission and completion call to report the
 // circuit state observed after the call.
 type StateChange struct {
 	// State is the circuit state after the call.
 	State State
-	// Trigger is reserved for future use and is currently always nil.
+	// Trigger describes a state transition caused by this call. It is
+	// [TriggerNone] when the call did not cause a transition.
 	Trigger Trigger
+}
+
+// Snapshot is a read-only point-in-time view of a Levee's controller signals.
+// It is intended for diagnostics and metrics, not persistence or tuning.
+type Snapshot struct {
+	// State is the current circuit state.
+	State State
+	// Trigger is the most recent non-zero transition trigger.
+	Trigger Trigger
+	// Inflight is the number of admitted calls not yet completed.
+	Inflight int64
+	// Capped reports whether an inflight admission limit is active.
+	Capped bool
+	// Limit is the effective integer admission limit when Capped is true, and
+	// zero when admission is uncapped.
+	Limit int64
+	// EstimatedCapacity is the estimated healthy concurrency: goodput times
+	// average latency.
+	EstimatedCapacity float64
+	// ErrorRate is the current error-rate EWMA.
+	ErrorRate float64
+	// ErrorLowerBound is the Wilson lower confidence bound used for tripping.
+	ErrorLowerBound float64
+	// Surge contains the proactive surge controller's diagnostic state.
+	Surge SurgeSnapshot
+}
+
+// SurgeSnapshot is a read-only view of proactive surge protection.
+type SurgeSnapshot struct {
+	// Armed reports whether excess inflight is currently loading the surge
+	// spring.
+	Armed bool
+	// Onset is the published inflight level beyond which surge strain begins to
+	// accumulate, or zero while surge protection is unpublished.
+	Onset int64
+	// Strain is current surge strain divided by its trip budget. It may exceed
+	// one while remembered strain is carried through recovery.
+	Strain float64
+	// ProvenExcess is healthy concurrency proven beyond the lagging EWMA
+	// capacity estimate.
+	ProvenExcess float64
 }
 
 // ErrCircuitOpen is returned by [Levee.Start] and [Levee.Call] when a request is
@@ -106,6 +190,7 @@ type Levee struct {
 
 	// Circuit State
 	state          State
+	lastTrigger    Trigger     // most recent state transition; diagnostics only
 	capped         atomic.Bool // admission gate: false == uncapped; read lock-free by Start
 	surgeArmed     bool        // surge spring loaded; proof window start/count live in lastEvalTS/evalSuccesses
 	stateEnteredAt time.Time
@@ -211,6 +296,58 @@ func (l *Levee) State() State {
 	return l.state
 }
 
+// Snapshot returns a read-only point-in-time view of the controller. It takes
+// the controller mutex because it is a diagnostic path; healthy admission is
+// unaffected. Under concurrent traffic, Inflight may change immediately after
+// the snapshot is returned.
+func (l *Levee) Snapshot() Snapshot {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	capped := l.capped.Load()
+	var limit int64
+	if capped {
+		limit = int64(math.Ceil(l.inflightLimit))
+	}
+	budget := l.surgeStrainBudget()
+	strain := 0.0
+	if budget > 0 {
+		strain = l.surgeStrain / budget
+	}
+	return Snapshot{
+		State:             l.state,
+		Trigger:           l.lastTrigger,
+		Inflight:          l.inflight.Load(),
+		Capped:            capped,
+		Limit:             limit,
+		EstimatedCapacity: l.goodput * l.avgLatency,
+		ErrorRate:         l.errEWMA,
+		ErrorLowerBound:   l.errLowerBound(),
+		Surge: SurgeSnapshot{
+			Armed:        l.surgeArmed,
+			Onset:        l.surgeLimit.Load(),
+			Strain:       strain,
+			ProvenExcess: l.surgeProven,
+		},
+	}
+}
+
+// transition records an actual state transition and its diagnostic cause.
+func (l *Levee) transition(state State, trigger Trigger, ts time.Time) {
+	l.state = state
+	l.stateEnteredAt = ts
+	l.lastTrigger = trigger
+}
+
+// stateChange reports a trigger only when this public call changed state.
+func (l *Levee) stateChange(previous State) StateChange {
+	change := StateChange{State: l.state}
+	if l.state != previous {
+		change.Trigger = l.lastTrigger
+	}
+	return change
+}
+
 // Start requests admission at time ts. A nil error means admitted (report it once
 // via [Levee.Success] or [Levee.Fail]); [ErrCircuitOpen] means rejected, report nothing.
 func (l *Levee) Start(ts time.Time) (StateChange, error) {
@@ -226,6 +363,7 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	previous := l.state
 
 	switch l.state {
 	case CLOSED:
@@ -235,28 +373,28 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	case OPEN:
 		shift := min(l.openStreak, maxOpenBackoff) - 1
 		if ts.Sub(l.stateEnteredAt) < (l.cooldownDuration << shift) {
-			return StateChange{State: OPEN}, ErrCircuitOpen
+			return l.stateChange(previous), ErrCircuitOpen
 		}
 		l.enterHalfOpen(ts)
 		fallthrough
 	case HALF_OPEN, THROTTLED:
 		l.maybeEvaluateLimit(ts)
 		if l.state == OPEN {
-			return StateChange{State: OPEN}, ErrCircuitOpen
+			return l.stateChange(previous), ErrCircuitOpen
 		}
 		// At min limit, allow only one probe per eval window.
 		if l.inflightLimit <= minInflightLimit && l.inflight.Load() == 0 {
 			if (l.evalSuccesses + l.evalFailures) > 0 {
-				return StateChange{State: l.state}, ErrCircuitOpen
+				return l.stateChange(previous), ErrCircuitOpen
 			}
 		}
 	}
 
 	if l.capped.Load() && l.inflight.Load() >= int64(math.Ceil(l.inflightLimit)) {
-		return StateChange{State: l.state}, ErrCircuitOpen
+		return l.stateChange(previous), ErrCircuitOpen
 	}
 	l.inflight.Add(1)
-	return StateChange{State: l.state}, nil
+	return l.stateChange(previous), nil
 }
 
 // Success reports that an admitted call succeeded at time ts after the given
@@ -264,6 +402,7 @@ func (l *Levee) Start(ts time.Time) (StateChange, error) {
 func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	previous := l.state
 
 	l.inflight.Add(-1)
 	l.updateErrEWMA(ts, 0.0)
@@ -276,8 +415,7 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 		l.evalSuccesses++
 		if l.state != CLOSED && ts.Sub(l.stateEnteredAt) >= l.effectiveRecoveryHoldoff() {
 			if l.errEWMA < l.recoverThreshold || l.inflightLimit > float64(l.inflight.Load()+1)*3.0 {
-				l.state = CLOSED
-				l.stateEnteredAt = ts
+				l.transition(CLOSED, TriggerRecovered, ts)
 				l.openStreak = 0
 				l.resetEval(ts)
 				// restart warmup if we tripped during warmup
@@ -288,7 +426,7 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 			}
 		}
 	}
-	return StateChange{State: l.state}
+	return l.stateChange(previous)
 }
 
 // Fail reports that an admitted call failed at time ts after the given duration.
@@ -296,6 +434,7 @@ func (l *Levee) Success(ts time.Time, duration time.Duration) StateChange {
 func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	previous := l.state
 
 	l.inflight.Add(-1)
 	l.updateErrEWMA(ts, 1.0)
@@ -313,11 +452,13 @@ func (l *Levee) Fail(ts time.Time, duration time.Duration) StateChange {
 			consecThresh = warmupConsecTrip
 		}
 		sloErr := 1.0 - l.slo.SuccessRate
-		if (l.samples >= warmupSamples && l.errLowerBound() > sloErr) || l.consecFails >= consecThresh {
-			l.enterThrottled(ts)
+		if l.samples >= warmupSamples && l.errLowerBound() > sloErr {
+			l.enterThrottled(ts, TriggerFailureRate)
+		} else if l.consecFails >= consecThresh {
+			l.enterThrottled(ts, TriggerConsecutiveFailures)
 		}
 	}
-	return StateChange{State: l.state}
+	return l.stateChange(previous)
 }
 
 func (l *Levee) updateErrEWMA(ts time.Time, sample float64) {
@@ -378,9 +519,10 @@ func (l *Levee) updateCapacityEstimate(ts time.Time, duration time.Duration) {
 func (l *Levee) surgeCheck(ts time.Time) (StateChange, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	previous := l.state
 
 	if l.state != CLOSED || l.capped.Load() {
-		return StateChange{State: l.state}, nil
+		return l.stateChange(previous), nil
 	}
 	lim := l.surgeLimit.Load()
 	if lim == 0 || l.inflight.Load() <= lim {
@@ -397,7 +539,7 @@ func (l *Levee) surgeCheck(ts time.Time) (StateChange, error) {
 	if l.surgeTick(ts) {
 		l.enterSurgeThrottled(ts)
 	}
-	return StateChange{State: l.state}, nil
+	return l.stateChange(previous), nil
 }
 
 // surgeOnCompletion advances the armed spring on a completion; failures pass
@@ -489,9 +631,9 @@ func (l *Levee) publishSurgeLimit() {
 	l.surgeLimit.Store(int64(math.Ceil(lim)))
 }
 
-func (l *Levee) throttleTo(ts time.Time, limit float64) {
+func (l *Levee) throttleTo(ts time.Time, limit float64, trigger Trigger) {
 	l.capped.Store(true)
-	l.state, l.stateEnteredAt = THROTTLED, ts
+	l.transition(THROTTLED, trigger, ts)
 	l.inflightLimit = max(limit, minInflightLimit)
 	l.consecFails = 0
 	l.surgeArmed = false
@@ -501,9 +643,9 @@ func (l *Levee) throttleTo(ts time.Time, limit float64) {
 
 // enterThrottled is the failure-evidence trip: seed at half the observed
 // operating point (the inflight term protects cold/low-signal callers).
-func (l *Levee) enterThrottled(ts time.Time) {
+func (l *Levee) enterThrottled(ts time.Time, trigger Trigger) {
 	capacity := l.goodput * l.avgLatency
-	l.throttleTo(ts, max(capacity, float64(l.inflight.Load()))*0.5)
+	l.throttleTo(ts, max(capacity, float64(l.inflight.Load()))*0.5, trigger)
 }
 
 // enterSurgeThrottled is the proactive surge trip: the service is healthy and
@@ -512,14 +654,14 @@ func (l *Levee) enterThrottled(ts time.Time) {
 func (l *Levee) enterSurgeThrottled(ts time.Time) {
 	seed := max(l.goodput*l.surgeLatSnap, l.surgeProvenCap(ts))
 	budget := l.surgeStrainBudget()
-	l.throttleTo(ts, seed)
+	l.throttleTo(ts, seed, TriggerSurge)
 	// The spring stays loaded through the trip: a re-stretch right after
 	// recovery re-trips instantly; only calm uncapped time relaxes it.
 	l.surgeStrain, l.surgeStrainTS = budget, ts
 }
 
 func (l *Levee) enterHalfOpen(ts time.Time) {
-	l.state, l.stateEnteredAt = HALF_OPEN, ts
+	l.transition(HALF_OPEN, TriggerCooldownExpired, ts)
 	l.inflightLimit = minInflightLimit
 	l.capped.Store(true)
 	l.consecFails = 0
@@ -574,7 +716,7 @@ func (l *Levee) maybeRelaxLimit(ts time.Time) {
 	}
 	total := l.evalSuccesses + l.evalFailures
 	if total > 0 && (float64(l.evalFailures)/float64(total)) > l.recoverThreshold {
-		l.enterThrottled(ts)
+		l.enterThrottled(ts, TriggerFailureRate)
 		return
 	}
 	if l.inflightLimit > float64(l.inflight.Load()+1)*3.0 {
@@ -609,7 +751,8 @@ func (l *Levee) maybeEvaluateLimit(ts time.Time) {
 		errRate := float64(l.evalFailures) / float64(total)
 		if errRate > openErrThreshold && l.inflightLimit <= minInflightLimit {
 			l.openStreak++
-			l.state, l.stateEnteredAt, l.consecFails = OPEN, ts, 0
+			l.transition(OPEN, TriggerMinLimitFailureRate, ts)
+			l.consecFails = 0
 			return
 		}
 		if errRate > l.recoverThreshold {

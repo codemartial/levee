@@ -929,8 +929,8 @@ func writeUnifiedRawLog(unified *UnifiedBenchmarkResult) {
 	for i, t := range unified.AllRawTransitions {
 		elapsed := t.Timestamp.Sub(unified.StartTime)
 		triggerStr := "<none>"
-		if t.Trigger != nil {
-			triggerStr = t.Trigger.Error()
+		if t.Trigger != levee.TriggerNone {
+			triggerStr = t.Trigger.String()
 		}
 		fmt.Fprintf(f, "[%4d] %12v | %-12s | %s -> %s | Prescient=%s | %s\n",
 			i+1, elapsed, t.CBName, stateString(t.FromState), stateString(t.ToState),
@@ -1050,11 +1050,11 @@ func writeUnifiedClassifiedLog(unified *UnifiedBenchmarkResult) {
 		fmt.Fprintf(f, "%s\n", row)
 
 		// Print trigger on next line if available
-		if t.Trigger != nil {
+		if t.Trigger != levee.TriggerNone {
 			triggerRow := fmt.Sprintf("%-*s | %-*s", tsWidth, "", stateWidth, "")
 			for _, name := range unified.CBNames {
 				if name == t.CBName {
-					triggerStr := t.Trigger.Error()
+					triggerStr := t.Trigger.String()
 					if len(triggerStr) > stateWidth {
 						triggerStr = triggerStr[:stateWidth]
 					}

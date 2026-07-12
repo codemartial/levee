@@ -1,8 +1,18 @@
 # Changelog
 
-## Unreleased
+## v0.4.0
 
 ### Added
+
+- Go diagnostic observability: state transitions now report a concrete trigger
+  (statistical failure evidence, consecutive failures, proactive surge strain,
+  excessive failures at the minimum limit, cooldown expiry, or healthy
+  recovery). `Levee.Snapshot` exposes the current state, most recent trigger,
+  inflight count, effective admission cap, capacity and error estimates, and
+  proactive surge status without adding controller knobs or hot-path work. The
+  zero trigger is now `TriggerNone` rather than `nil`; the field had previously
+  been reserved with instructions not to depend on it. The README now presents
+  `Call` as the canonical integration API.
 
 - Proactive surge protection: a CLOSED (uncapped) breaker now trips to
   THROTTLED on congestion, before any failure evidence exists. The mechanism

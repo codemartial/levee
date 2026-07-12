@@ -3,12 +3,12 @@
 ## Supported versions
 
 Levee is pre-1.0. Security fixes are made on the latest released minor version
-(currently the 0.3.x line). Please upgrade to the latest tag before reporting.
+(currently the 0.4.x line). Please upgrade to the latest tag before reporting.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.3.x   | Yes       |
-| < 0.3   | No        |
+| 0.4.x   | Yes       |
+| < 0.4   | No        |
 
 ## Reporting a vulnerability
 

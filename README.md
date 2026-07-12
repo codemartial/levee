@@ -44,7 +44,7 @@ Levee is also painstakingly designed to consume a fixed, small amount of memory,
 
 ## How to use Levee?
 
-### Basic, in-band usage:
+### Usage
 
 ```go
 package main
@@ -80,55 +80,23 @@ func main() {
 }
 ```
 
-### Advanced, out-of-band usage:
-
-Levee can be called out-of-band so you can better organise your
-code and just call Levee at the start and end of your tasks. You can
-even control the timing, e.g. for stream processors that work on
-event-time or ingestion-time. Here's an example:
+`StateChange.Trigger` is `TriggerNone` unless that call causes a state transition.
+For operational diagnostics and metrics, `Snapshot` exposes the current state,
+the most recent transition cause, the active admission cap, capacity and error
+estimates, and proactive surge status:
 
 ```go
-package main
-
-import (
-	"fmt"
-	"time"
-
-	"github.com/codemartial/levee"
-)
-
-func main() {
-	slo := levee.SLO{
-		SuccessRate: 0.95,
-		Timeout:     time.Millisecond * 100,
-	}
-
-	l := levee.NewLevee(slo)
-
-	// Check circuit state before starting the task
-	start := time.Now()
-	stateChange, err := l.Start(start)
-	if err != nil {
-		fmt.Println("Circuit is open, request rejected")
-		return
-	}
-
-	// Perform the actual task
-	taskErr := callUpstreamService()
-	end := time.Now()
-	duration := end.Sub(start)
-
-	// Report the outcome
-	if taskErr != nil {
-		stateChange = l.Fail(end, duration)
-	} else {
-		stateChange = l.Success(end, duration)
-	}
-
-	fmt.Printf("Circuit state: %v\n", stateChange.State)
-}
+s := l.Snapshot()
+fmt.Printf("state=%s trigger=%s inflight=%d capped=%t limit=%d "+
+	"capacity=%.2f error=%.4f error_lower_bound=%.4f "+
+	"surge_armed=%t surge_strain=%.2f\n",
+	s.State, s.Trigger, s.Inflight, s.Capped, s.Limit,
+	s.EstimatedCapacity, s.ErrorRate, s.ErrorLowerBound,
+	s.Surge.Armed, s.Surge.Strain)
 ```
 
+Snapshots are read-only observations, not configuration knobs or persistent
+state. Floating-point estimates may evolve between releases.
 
 ## Benchmarks
 
@@ -146,4 +114,3 @@ Run with (from the `benchmarks/` directory):
 ```
 go test -v -run TestDistributedBenchmarkFirstIncident -timeout 15m
 ```
-

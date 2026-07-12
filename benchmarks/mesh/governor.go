@@ -34,8 +34,8 @@ type Candidate struct {
 }
 
 // RoleTracker accumulates time-in-state for one governor role instance.
-// StateChange.State is just the post-call state (Trigger is always nil), so
-// transitions are derived by comparing against the previously seen state.
+// Transitions are derived by comparing StateChange.State against the previously
+// seen state so this tracker also works for candidates without Levee triggers.
 type RoleTracker struct {
 	Name        string
 	DurNS       [numBuckets]int64

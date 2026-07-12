@@ -21,7 +21,7 @@
 //
 // # Usage
 //
-// The in-band API wraps a function call:
+// The canonical API wraps a function call:
 //
 //	l := levee.NewLevee(levee.SLO{SuccessRate: 0.95, Timeout: 100 * time.Millisecond})
 //	_, err := l.Call(func() error { return callDownstream() })
@@ -29,9 +29,13 @@
 //		// shed load: the breaker rejected the call without running it
 //	}
 //
-// The out-of-band API ([Levee.Start], [Levee.Success], [Levee.Fail]) lets the
-// caller control timing, for example to drive the breaker from a simulated clock
-// or to instrument work that does not fit a single function call.
+// # Observability
+//
+// Every call returns a [StateChange]. Its [StateChange.Trigger] explains a state
+// transition caused by that call. [Levee.Snapshot] provides the current state,
+// most recent transition trigger, admission cap, capacity and error estimates,
+// and proactive surge status for diagnostics and metrics. Snapshot values are
+// read-only signals, not tuning knobs or persistent state.
 //
 // All methods are safe for concurrent use by multiple goroutines. The breaker
 // runs no background goroutines and allocates nothing on the hot path.

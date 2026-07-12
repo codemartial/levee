@@ -8,7 +8,7 @@ import (
 	"github.com/codemartial/levee"
 )
 
-// The in-band API wraps a single function call. If the breaker is shedding load
+// Call wraps a single function call. If the breaker is shedding load
 // it returns ErrCircuitOpen without ever invoking the function.
 func ExampleLevee_Call() {
 	l := levee.NewLevee(levee.SLO{SuccessRate: 0.95, Timeout: 100 * time.Millisecond})
@@ -28,19 +28,10 @@ func ExampleLevee_Call() {
 	// Output: ok: CLOSED
 }
 
-// The out-of-band API lets the caller control timing, for example to drive the
-// breaker from a simulated clock or to instrument work that does not fit a single
-// function call. Report each admitted call exactly once with Success or Fail.
-func ExampleLevee_Start() {
+// Snapshot exposes read-only controller signals for diagnostics and metrics.
+func ExampleLevee_Snapshot() {
 	l := levee.NewLevee(levee.SLO{SuccessRate: 0.95, Timeout: 100 * time.Millisecond})
-
-	now := time.Unix(0, 0)
-	if _, err := l.Start(now); err != nil {
-		fmt.Println("rejected:", err)
-		return
-	}
-	// ... perform the protected work, which took 10ms and succeeded ...
-	sc := l.Success(now.Add(10*time.Millisecond), 10*time.Millisecond)
-	fmt.Println(sc.State)
-	// Output: CLOSED
+	s := l.Snapshot()
+	fmt.Println(s.State, s.Trigger, s.Inflight, s.Capped, s.Limit)
+	// Output: CLOSED NONE 0 false 0
 }
