@@ -404,21 +404,19 @@ func TestFastPathConcurrentAccounting(t *testing.T) {
 		workers = 32
 		iters   = 2000
 	)
+	// Keep time fixed so this test isolates concurrent admission accounting.
+	ts := time.Unix(0, 0)
 	var wg sync.WaitGroup
-	for w := range workers {
-		wg.Add(1)
-		go func(seed int) {
-			defer wg.Done()
-			ts := time.Unix(int64(seed), 0)
+	for range workers {
+		wg.Go(func() {
 			for range iters {
-				ts = ts.Add(time.Microsecond)
 				if _, err := l.Start(ts); err != nil {
 					t.Errorf("healthy CLOSED breaker rejected: %v", err)
 					return
 				}
 				l.Success(ts, time.Millisecond)
 			}
-		}(w)
+		})
 	}
 	wg.Wait()
 
@@ -1015,7 +1013,7 @@ func TestTransitionTriggers(t *testing.T) {
 	t.Run("consecutive failures", func(t *testing.T) {
 		l := NewLevee(SLO{SuccessRate: 0.99, Timeout: time.Second})
 		downstreamErr := errors.New("downstream failed")
-		for i := 0; i < 20; i++ {
+		for range 20 {
 			sc, err := l.Call(func() error { return downstreamErr })
 			if !errors.Is(err, downstreamErr) {
 				t.Fatalf("Call error = %v, want downstream error", err)
@@ -1046,7 +1044,7 @@ func TestTransitionTriggers(t *testing.T) {
 		}
 
 		// Alternate outcomes so consecutive failures cannot be the cause.
-		for i := 0; i < 5000; i++ {
+		for range 5000 {
 			ts = ts.Add(10 * time.Millisecond)
 			if _, err := l.Start(ts); err != nil {
 				t.Fatalf("failure Start: %v", err)

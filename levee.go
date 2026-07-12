@@ -350,6 +350,8 @@ func (l *Levee) stateChange(previous State) StateChange {
 
 // Start requests admission at time ts. A nil error means admitted (report it once
 // via [Levee.Success] or [Levee.Fail]); [ErrCircuitOpen] means rejected, report nothing.
+// It is the caller's responsibility to ensure that timestamps are coherent, e.g. from
+// the clock on the machine that these calls are being made. See [Levee.Call], for example.
 func (l *Levee) Start(ts time.Time) (StateChange, error) {
 	// Lock-free fast path: an uncapped breaker (only possible while CLOSED) admits
 	// everything with just atomic accounting, never touching the mutex.
