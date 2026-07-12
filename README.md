@@ -80,37 +80,23 @@ func main() {
 }
 ```
 
-`StateChange.Trigger` is `TriggerNone` unless that call causes a state transition.
-For operational diagnostics and metrics, `Snapshot` exposes the current state,
-the most recent transition cause, the active admission cap, capacity and error
-estimates, and proactive surge status:
-
-```go
-s := l.Snapshot()
-fmt.Printf("state=%s trigger=%s inflight=%d capped=%t limit=%d "+
-	"capacity=%.2f error=%.4f error_lower_bound=%.4f "+
-	"surge_armed=%t surge_strain=%.2f\n",
-	s.State, s.Trigger, s.Inflight, s.Capped, s.Limit,
-	s.EstimatedCapacity, s.ErrorRate, s.ErrorLowerBound,
-	s.Surge.Armed, s.Surge.Strain)
-```
-
-Snapshots are read-only observations, not configuration knobs or persistent
-state. Floating-point estimates may evolve between releases.
-
 ## Benchmarks
 
-Levee is validated in a closed-loop distributed simulation where circuit-breaker
-decisions shape backend load, autoscaling, and queue backpressure. Across seven
-traffic and error-rate variations, Levee beats a meticulously tuned static breaker
-in every one, with its widest margins under extreme overload: where a binary
-open/close cannot keep up, Levee's concurrency control matches admission to
-available capacity.
+The flagship benchmark is a deterministic 30-minute simulation of a
+10-node service mesh. Hundreds of independent Levee instances govern
+inbound traffic and service-to-service calls through surges,
+dependency degradation, crashes, an arrival flood, and call
+amplification.
 
-See [benchmarks/](benchmarks/) for the full methodology and results.
+In the reference run, Levee records the top MeshDelta (+8,587), the
+fewest failures (46,767), and zero node crashes vs. the strongest
+static setup, combining per-replica rate and concurrency limits,
+scores +8,142 with 76,004 failures and zero crashes. See the [mesh
+benchmark](benchmarks/mesh_benchmark.md) for the full results and
+methodology.
 
-Run with (from the `benchmarks/` directory):
+Run it from the `benchmarks/` directory:
 
 ```
-go test -v -run TestDistributedBenchmarkFirstIncident -timeout 15m
+go test -v -run 'TestMeshBenchmark$'
 ```
