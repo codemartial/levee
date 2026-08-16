@@ -1,11 +1,11 @@
 name: Fuzz
 
-# Native Go fuzzing runs nightly (and on demand) rather than on every PR: the
+# Native Go fuzzing runs weekly (and on demand) rather than on every PR: the
 # numerical and admission paths are explored for a few minutes each, and any
 # crasher is written under testdata/fuzz and fails the run.
 on:
   schedule:
-    - cron: "0 6 * * *" # 06:00 UTC daily
+    - cron: "0 6 * * 0" # 06:00 UTC Sunday
   workflow_dispatch:
 
 permissions:

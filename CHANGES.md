@@ -45,7 +45,7 @@
 
 - Continuous integration on GitHub Actions: build, `go vet`, race-enabled tests,
   and coverage, run on both amd64 and arm64 to catch architecture-specific bugs.
-- golangci-lint and govulncheck wired into CI; a nightly job fuzzes the admission
+- golangci-lint and govulncheck wired into CI; a weekly job fuzzes the admission
   and numeric paths.
 - Native Go fuzz tests (`FuzzAdmission`, `FuzzInvNormCDF`, `FuzzWilson`),
   reference-value tests for the numeric core, and state-machine invariant tests.
